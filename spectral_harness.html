@@ -145,6 +145,19 @@ function makeLinePath(xs, ys, xScale, yScale) {
   return xs.map((x,i) => `${i===0?'M':'L'} ${xScale(x)} ${yScale(ys[i])}`).join(' ');
 }
 
+// Spread out direct-end labels that would otherwise land on top of each other.
+// Takes [{key, y}] sorted by nothing in particular, returns the same items with
+// y nudged apart so consecutive labels keep a minimum vertical gap.
+function declutterLabels(items, minGap) {
+  const sorted = [...items].sort((a,b) => a.y - b.y);
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i].y - sorted[i-1].y < minGap) {
+      sorted[i].y = sorted[i-1].y + minGap;
+    }
+  }
+  return sorted;
+}
+
 // ---- Chart 1: full spectrum overlay, log-x from 20Hz to 22050Hz ----
 function fullSpectrumChart(freqs, series, labels) {
   const W = 900, H = 300, ML = 42, MR = 16, MT = 14, MB = 32;
@@ -176,11 +189,12 @@ function fullSpectrumChart(freqs, series, labels) {
     svg += `<path d="${path}" fill="none" stroke="${COLORS[key]}" stroke-width="1.6" opacity="${key==='human'?0.55:0.9}"/>`;
   });
 
-  // direct label at the right edge for each series
-  order.forEach(key => {
-    if (!series[key]) return;
-    const lastY = series[key][series[key].length-1];
-    svg += `<text class="direct-label" x="${W-MR+4}" y="${yScale(lastY)+3}" fill="${COLORS[key]}">${labels[key]}</text>`;
+  // direct label at the right edge for each series, de-collided so they never stack
+  const labelItems = order.filter(key => series[key]).map(key => ({
+    key, y: yScale(series[key][series[key].length-1])
+  }));
+  declutterLabels(labelItems, 13).forEach(({key,y}) => {
+    svg += `<text class="direct-label" x="${W-MR+4}" y="${y+3}" fill="${COLORS[key]}">${labels[key]}</text>`;
   });
 
   svg += `</svg>`;
@@ -222,10 +236,11 @@ function zoomChart(freqs, series, labels, cutoffMark) {
     const path = makeLinePath(freqs, series[key], xScale, yScale);
     svg += `<path d="${path}" fill="none" stroke="${COLORS[key]}" stroke-width="2" opacity="${key==='human'?0.6:0.95}"/>`;
   });
-  order.forEach(key => {
-    if (!series[key]) return;
-    const lastY = series[key][series[key].length-1];
-    svg += `<text class="direct-label" x="${W-MR+6}" y="${yScale(lastY)+3}" fill="${COLORS[key]}">${labels[key]}</text>`;
+  const labelItems1 = order.filter(key => series[key]).map(key => ({
+    key, y: yScale(series[key][series[key].length-1])
+  }));
+  declutterLabels(labelItems1, 13).forEach(({key,y}) => {
+    svg += `<text class="direct-label" x="${W-MR+6}" y="${y+3}" fill="${COLORS[key]}">${labels[key]}</text>`;
   });
 
   svg += `</svg>`;
@@ -262,10 +277,11 @@ function timeVaryingChart(series, labels, nSegs, durationLabel) {
       svg += `<circle cx="${xScale(i)}" cy="${yScale(v)}" r="3" fill="${COLORS[key]}"/>`;
     });
   });
-  order.forEach(key => {
-    if (!series[key]) return;
-    const lastY = series[key][series[key].length-1];
-    svg += `<text class="direct-label" x="${W-MR+6}" y="${yScale(lastY)+3}" fill="${COLORS[key]}">${labels[key]}</text>`;
+  const labelItems2 = order.filter(key => series[key]).map(key => ({
+    key, y: yScale(series[key][series[key].length-1])
+  }));
+  declutterLabels(labelItems2, 13).forEach(({key,y}) => {
+    svg += `<text class="direct-label" x="${W-MR+6}" y="${y+3}" fill="${COLORS[key]}">${labels[key]}</text>`;
   });
 
   svg += `</svg>`;
