@@ -51,6 +51,7 @@
     audioCtx: null,
     waveData: null,
     outputFormat: "same",
+    mp3Mode: "vbr0",
   };
 
   // ---------- output format switch ----------
@@ -58,6 +59,14 @@
     btn.addEventListener("click", () => {
       state.outputFormat = btn.dataset.format;
       document.querySelectorAll("#formatSwitch button").forEach(b => b.classList.toggle("active", b === btn));
+      $("mp3ModeRow").classList.toggle("hidden", btn.dataset.format !== "mp3");
+    });
+  });
+
+  document.querySelectorAll("#mp3ModeSwitch button").forEach(btn => {
+    btn.addEventListener("click", () => {
+      state.mp3Mode = btn.dataset.mp3mode;
+      document.querySelectorAll("#mp3ModeSwitch button").forEach(b => b.classList.toggle("active", b === btn));
     });
   });
 
@@ -309,6 +318,7 @@
         tools: Array.from(state.selected), options: {},
         output_name: outputName || undefined,
         output_format: state.outputFormat,
+        mp3_mode: state.mp3Mode,
       }),
     });
     const data = await res.json();

@@ -336,6 +336,7 @@ canvas#spectrumCanvas {
   font-size: 12px; font-weight: 600; cursor: pointer;
 }
 .format-switch button.active { background: var(--accent); color: #0c1210; border-color: var(--accent); }
+.mp3-mode-row { margin-top: 10px; }
 .format-switch button:not(.active):hover { border-color: var(--accent-dim); color: var(--text); }
 
 .run-bar { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-top: 1px solid var(--rack-line); }
@@ -541,8 +542,16 @@ footer {
           <div class="format-switch" id="formatSwitch">
             <button data-format="same" class="active">Same as source</button>
             <button data-format="wav">WAV</button>
-            <button data-format="mp3">MP3 (highest quality)</button>
+            <button data-format="mp3">MP3</button>
             <button data-format="flac">FLAC</button>
+          </div>
+
+          <div id="mp3ModeRow" class="mp3-mode-row hidden">
+            <div class="chain-group-label">MP3 quality</div>
+            <div class="format-switch" id="mp3ModeSwitch">
+              <button data-mp3mode="vbr0" class="active">VBR-0 (~245kbps, transparent)</button>
+              <button data-mp3mode="cbr320">CBR 320kbps (max bitrate)</button>
+            </div>
           </div>
         </div>
         <div class="run-bar">

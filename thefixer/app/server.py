@@ -97,7 +97,7 @@ def resolve_output_format(requested_format, original_upload_path):
     return "wav"
 
 
-def encode_final_output(audio, sr, out_format, dest_path_no_ext):
+def encode_final_output(audio, sr, out_format, dest_path_no_ext, mp3_mode="vbr0"):
     """Write the final processed audio to disk in the requested format, with
     ALL container/ID3 metadata stripped regardless of format (WAV via
     soundfile carries none by default; MP3/FLAC are explicitly stripped via
@@ -105,10 +105,13 @@ def encode_final_output(audio, sr, out_format, dest_path_no_ext):
     reintroduces a title/artist/comment field). Returns the actual path
     written (with the correct extension for the chosen format).
 
-    MP3 is encoded at the highest quality libmpx3lame offers (-q:a 0,
-    VBR ~245kbps average) since "highest bitrate" for a VBR-capable modern
-    encoder means the top quality setting, not a fixed high constant
-    bitrate that can waste space on simple passages."""
+    mp3_mode selects between two different meanings of "highest quality":
+    - "vbr0" (default): libmp3lame -q:a 0, LAME's highest VBR quality tier
+      (~245kbps average). Considered transparent/near-lossless by most
+      listeners, and doesn't waste bits on simple passages.
+    - "cbr320": a flat 320kbps on every frame regardless of content - what
+      most people mean literally by "highest bitrate MP3."
+    """
     ext = OUTPUT_FORMAT_EXTENSIONS.get(out_format, ".wav")
     final_path = Path(f"{dest_path_no_ext}{ext}")
 
@@ -123,8 +126,12 @@ def encode_final_output(audio, sr, out_format, dest_path_no_ext):
     save_stereo(tmp_wav, audio, sr)
     try:
         if out_format == "mp3":
+            if mp3_mode == "cbr320":
+                mp3_args = ["-b:a", "320k"]
+            else:
+                mp3_args = ["-q:a", "0"]
             cmd = ["ffmpeg", "-v", "quiet", "-y", "-i", str(tmp_wav),
-                   "-map_metadata", "-1", "-codec:a", "libmp3lame", "-q:a", "0",
+                   "-map_metadata", "-1", "-codec:a", "libmp3lame", *mp3_args,
                    str(final_path)]
         elif out_format == "flac":
             cmd = ["ffmpeg", "-v", "quiet", "-y", "-i", str(tmp_wav),
@@ -336,7 +343,7 @@ TOOL_LABELS = {
 }
 
 
-def run_pipeline(job_id, file_id, tools, options, output_name=None, output_format="same"):
+def run_pipeline(job_id, file_id, tools, options, output_name=None, output_format="same", mp3_mode="vbr0"):
     try:
         path = _find_upload_path(file_id)
         if path is None:
@@ -467,7 +474,7 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
 
         resolved_format = resolve_output_format(output_format, path)
         job_log(job_id, f"saving output file (format: {resolved_format})")
-        out_path = encode_final_output(audio, sr, resolved_format, OUTPUT_DIR / out_id)
+        out_path = encode_final_output(audio, sr, resolved_format, OUTPUT_DIR / out_id, mp3_mode=mp3_mode)
 
         orig_path = OUTPUT_DIR / f"{out_id}_orig.wav"
         save_stereo(orig_path, original_audio, sr)
@@ -518,6 +525,7 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
             "out_id": out_id,
             "output_name": final_output_name,
             "output_format": resolved_format,
+            "mp3_mode": mp3_mode if resolved_format == "mp3" else None,
             "output_ext": out_path.suffix,
             "steps": steps,
             "scores_before": scores_before,
@@ -557,6 +565,9 @@ def process(file_id):
     output_format = body.get("output_format", "same")
     if output_format not in ("same", "wav", "mp3", "flac"):
         return jsonify({"error": f"invalid output_format: {output_format!r} (expected same/wav/mp3/flac)"}), 400
+    mp3_mode = body.get("mp3_mode", "vbr0")
+    if mp3_mode not in ("vbr0", "cbr320"):
+        return jsonify({"error": f"invalid mp3_mode: {mp3_mode!r} (expected vbr0/cbr320)"}), 400
 
     job_id = uuid.uuid4().hex
     with JOBS_LOCK:
@@ -565,7 +576,7 @@ def process(file_id):
             "current_step_idx": None, "total_steps": None, "current_step_name": None, "sub_progress": None,
         }
 
-    thread = threading.Thread(target=run_pipeline, args=(job_id, file_id, tools, options, output_name, output_format), daemon=True)
+    thread = threading.Thread(target=run_pipeline, args=(job_id, file_id, tools, options, output_name, output_format, mp3_mode), daemon=True)
     thread.start()
 
     return jsonify({"job_id": job_id})
