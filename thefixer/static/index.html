@@ -1,0 +1,697 @@
+<!doctype html>
+<title>The Fixer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+:root {
+  --bg: #14161a;
+  --panel: #1c1f26;
+  --panel-raised: #232732;
+  --rack-line: #2b303b;
+  --text: #e8eaed;
+  --text-dim: #8b91a0;
+  --text-faint: #565c6b;
+  --accent: #5ec9a8;
+  --accent-dim: #3d8a72;
+  --accent-glow: rgba(94, 201, 168, 0.25);
+  --warn: #e8a33d;
+  --crit: #e0544f;
+  --good: #5ec9a8;
+  --input-bg: #101215;
+  --focus: #7fd9ba;
+}
+:root[data-theme="light"] {
+  --bg: #eef0f2;
+  --panel: #ffffff;
+  --panel-raised: #f7f8fa;
+  --rack-line: #dadfe5;
+  --text: #191c20;
+  --text-dim: #565f6b;
+  --text-faint: #9099a4;
+  --accent: #1f8f6f;
+  --accent-dim: #16694f;
+  --accent-glow: rgba(31, 143, 111, 0.15);
+  --warn: #b3711a;
+  --crit: #c23c37;
+  --good: #1f8f6f;
+  --input-bg: #ffffff;
+  --focus: #16694f;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #eef0f2;
+    --panel: #ffffff;
+    --panel-raised: #f7f8fa;
+    --rack-line: #dadfe5;
+    --text: #191c20;
+    --text-dim: #565f6b;
+    --text-faint: #9099a4;
+    --accent: #1f8f6f;
+    --accent-dim: #16694f;
+    --accent-glow: rgba(31, 143, 111, 0.15);
+    --warn: #b3711a;
+    --crit: #c23c37;
+    --good: #1f8f6f;
+    --input-bg: #ffffff;
+    --focus: #16694f;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, "Inter", "Segoe UI", sans-serif;
+  overflow-x: hidden;
+}
+body { min-height: 100vh; }
+
+.mono {
+  font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Header / transport strip ---------- */
+header {
+  display: flex; align-items: center; gap: 20px;
+  padding: 14px 24px;
+  background: linear-gradient(180deg, var(--panel-raised), var(--panel));
+  border-bottom: 1px solid var(--rack-line);
+  position: sticky; top: 0; z-index: 50;
+}
+.brand {
+  display: flex; align-items: baseline; gap: 8px;
+  font-family: "Helvetica Neue", Arial, sans-serif;
+  font-weight: 800;
+  font-size: 19px;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+}
+.brand .the { font-weight: 400; color: var(--text-dim); font-size: 14px; letter-spacing: 0.02em; }
+.brand .mark { color: var(--accent); }
+.tagline {
+  font-size: 11px; color: var(--text-faint);
+  letter-spacing: 0.08em; text-transform: uppercase;
+  border-left: 1px solid var(--rack-line);
+  padding-left: 20px;
+  display: none;
+}
+@media (min-width: 760px) { .tagline { display: block; } }
+
+.spacer { flex: 1; }
+
+.theme-toggle {
+  width: 34px; height: 34px; border-radius: 8px;
+  border: 1px solid var(--rack-line); background: var(--panel-raised);
+  color: var(--text-dim); cursor: pointer; font-size: 15px;
+  display: flex; align-items: center; justify-content: center;
+}
+.theme-toggle:hover { color: var(--accent); border-color: var(--accent-dim); }
+
+.docs-btn {
+  height: 34px; padding: 0 14px; border-radius: 8px;
+  border: 1px solid var(--rack-line); background: var(--panel-raised);
+  color: var(--text-dim); cursor: pointer; font-size: 13px; font-weight: 600;
+}
+.docs-btn:hover { color: var(--accent); border-color: var(--accent-dim); }
+
+/* ---------- Docs overlay ---------- */
+.docs-overlay {
+  display: none; position: fixed; inset: 0; z-index: 100;
+  background: rgba(0,0,0,0.55); backdrop-filter: blur(2px);
+  align-items: center; justify-content: center; padding: 24px;
+}
+.docs-overlay.active { display: flex; }
+.docs-modal {
+  background: var(--panel); border: 1px solid var(--rack-line); border-radius: 14px;
+  width: min(760px, 100%); max-height: min(84vh, 900px);
+  display: flex; flex-direction: column; overflow: hidden;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+}
+.docs-modal-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 20px; border-bottom: 1px solid var(--rack-line);
+  background: var(--panel-raised); flex: none;
+}
+.docs-modal-head .title { font-size: 15px; font-weight: 700; }
+.docs-close {
+  width: 28px; height: 28px; border-radius: 7px; border: 1px solid var(--rack-line);
+  background: transparent; color: var(--text-dim); cursor: pointer; font-size: 13px;
+}
+.docs-close:hover { color: var(--crit); border-color: var(--crit); }
+.docs-modal-body { padding: 8px 24px 24px; overflow-y: auto; }
+.docs-section { padding-top: 20px; }
+.docs-section h2 {
+  font-size: 13px; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--accent); margin: 0 0 10px; font-weight: 700;
+}
+.docs-section p { font-size: 13.5px; line-height: 1.65; color: var(--text-dim); margin: 0 0 10px; }
+.docs-section ul, .docs-section ol { margin: 0 0 10px; padding-left: 22px; }
+.docs-section li { font-size: 13.5px; line-height: 1.65; color: var(--text-dim); margin-bottom: 6px; }
+.docs-section strong { color: var(--text); }
+.docs-section code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px;
+  background: var(--input-bg); border: 1px solid var(--rack-line);
+  border-radius: 4px; padding: 1px 5px; color: var(--accent);
+}
+
+/* ---------- Layout ---------- */
+.app {
+  max-width: 1400px; margin: 0 auto;
+  padding: 24px;
+  display: flex; flex-direction: column; gap: 20px;
+}
+
+.upload-zone {
+  border: 1.5px dashed var(--rack-line);
+  border-radius: 12px;
+  background: var(--panel);
+  padding: 36px 24px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color .15s, background .15s;
+}
+.upload-zone:hover, .upload-zone.dragover {
+  border-color: var(--accent);
+  background: var(--panel-raised);
+}
+.upload-zone .icon { font-size: 28px; margin-bottom: 8px; opacity: .7; }
+.upload-zone .primary { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+.upload-zone .secondary { font-size: 12.5px; color: var(--text-faint); }
+.upload-zone input { display: none; }
+
+.workspace { display: none; flex-direction: column; gap: 20px; }
+.workspace.active { display: flex; }
+
+.file-strip {
+  display: flex; align-items: center; gap: 14px;
+  background: var(--panel); border: 1px solid var(--rack-line);
+  border-radius: 10px; padding: 12px 16px;
+  font-size: 13px;
+}
+.file-strip .name { font-weight: 600; }
+.file-strip .meta { color: var(--text-faint); font-size: 12px; }
+.file-strip button.new-file {
+  margin-left: auto;
+  background: transparent; border: 1px solid var(--rack-line);
+  color: var(--text-dim); border-radius: 7px; padding: 6px 12px;
+  font-size: 12px; cursor: pointer;
+}
+.file-strip button.new-file:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ---------- Grid: analysis (left) + tool chain (right) ---------- */
+.grid {
+  display: grid;
+  grid-template-columns: 1.15fr 0.85fr;
+  gap: 20px;
+  align-items: start;
+}
+@media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--rack-line);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.panel-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--rack-line);
+  background: var(--panel-raised);
+}
+.panel-head .title {
+  font-size: 11.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--text-dim);
+}
+.panel-body { padding: 16px; }
+
+/* ---------- Score meters ---------- */
+.score-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+.score-card {
+  background: var(--panel-raised);
+  border: 1px solid var(--rack-line);
+  border-radius: 10px;
+  padding: 14px;
+}
+.score-card .label { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--text-faint); margin-bottom: 8px; }
+.score-card .value { font-size: 30px; font-weight: 700; line-height: 1; margin-bottom: 8px; }
+.score-card .value.good { color: var(--good); }
+.score-card .value.warn { color: var(--warn); }
+.score-card .value.crit { color: var(--crit); }
+.meter-track {
+  height: 6px; border-radius: 3px; background: var(--input-bg);
+  overflow: hidden; border: 1px solid var(--rack-line);
+}
+.meter-fill { height: 100%; border-radius: 3px; transition: width .4s ease; }
+.meter-fill.good { background: var(--good); }
+.meter-fill.warn { background: var(--warn); }
+.meter-fill.crit { background: var(--crit); }
+.pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 100px;
+  margin-top: 8px;
+}
+.pill.good { background: var(--accent-glow); color: var(--good); }
+.pill.crit { background: rgba(224,84,79,0.15); color: var(--crit); }
+.pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+.stat-list { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 4px; }
+.stat {
+  background: var(--panel-raised); border: 1px solid var(--rack-line);
+  border-radius: 8px; padding: 10px 12px;
+}
+.stat .k { font-size: 10.5px; color: var(--text-faint); text-transform: uppercase; letter-spacing: .05em; }
+.stat .v { font-size: 15px; font-weight: 600; margin-top: 2px; }
+.stat .v.flag { color: var(--warn); }
+
+/* ---------- spectrum canvas ---------- */
+.spectrum-wrap { margin-top: 14px; }
+.spectrum-wrap .caption {
+  font-size: 11px; color: var(--text-faint); margin-bottom: 6px;
+  display: flex; justify-content: space-between;
+}
+canvas#spectrumCanvas {
+  width: 100%; height: 140px; display: block;
+  background: var(--input-bg); border-radius: 8px; border: 1px solid var(--rack-line);
+}
+
+/* ---------- Tool chain list ---------- */
+.chain-list { display: flex; flex-direction: column; gap: 8px; }
+.tool-row {
+  display: flex; align-items: flex-start; gap: 12px;
+  background: var(--panel-raised);
+  border: 1px solid var(--rack-line);
+  border-radius: 9px;
+  padding: 11px 13px;
+  cursor: pointer;
+  transition: border-color .12s, background .12s;
+}
+.tool-row:hover { border-color: var(--accent-dim); }
+.tool-row.checked { border-color: var(--accent); background: var(--accent-glow); }
+.tool-row .box {
+  width: 18px; height: 18px; border-radius: 5px;
+  border: 1.5px solid var(--text-faint);
+  flex: none; margin-top: 1px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; color: var(--bg);
+}
+.tool-row.checked .box { background: var(--accent); border-color: var(--accent); }
+.tool-row .box::after { content: ""; }
+.tool-row.checked .box::after { content: "✓"; }
+.tool-row .info { flex: 1; min-width: 0; }
+.tool-row .name { font-size: 13.5px; font-weight: 600; }
+.tool-row .desc { font-size: 11.5px; color: var(--text-dim); margin-top: 2px; line-height: 1.4; }
+.tool-row .rec-badge {
+  font-size: 9.5px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+  color: var(--accent); border: 1px solid var(--accent-dim); border-radius: 5px;
+  padding: 1px 6px; margin-left: 8px; white-space: nowrap;
+}
+.tool-row.disabled { opacity: .45; cursor: not-allowed; }
+
+.chain-group-label {
+  font-size: 10.5px; color: var(--text-faint); text-transform: uppercase; letter-spacing: .08em;
+  margin: 10px 0 2px; padding-left: 2px;
+}
+.chain-group-label:first-child { margin-top: 0; }
+
+.filename-input {
+  width: 100%; box-sizing: border-box;
+  background: var(--input-bg); border: 1px solid var(--rack-line);
+  border-radius: 8px; padding: 10px 12px;
+  font-size: 13px; color: var(--text);
+}
+.filename-input::placeholder { color: var(--text-faint); }
+.filename-input:focus {
+  outline: none; border-color: var(--focus);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+.run-bar { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-top: 1px solid var(--rack-line); }
+.btn {
+  border: none; border-radius: 8px; padding: 10px 20px;
+  font-size: 13.5px; font-weight: 700; cursor: pointer;
+  background: var(--accent); color: #0c1210;
+  transition: filter .12s, transform .06s;
+}
+.btn:hover { filter: brightness(1.08); }
+.btn:active { transform: scale(0.98); }
+.btn:disabled { opacity: .4; cursor: not-allowed; }
+.btn.secondary { background: transparent; border: 1px solid var(--rack-line); color: var(--text); }
+.btn.secondary:hover { border-color: var(--accent); color: var(--accent); }
+.run-count { font-size: 12px; color: var(--text-faint); margin-left: auto; }
+
+/* ---------- Progress ---------- */
+.progress-panel { display: none; }
+.progress-panel.active { display: block; }
+.progress-step-row {
+  display: flex; justify-content: space-between; align-items: baseline;
+  font-size: 12.5px; margin-bottom: 8px;
+}
+.progress-step-row #progressStepLabel { color: var(--text); font-weight: 600; }
+.progress-step-row #progressStepCount { color: var(--text-faint); }
+.progress-bar-track {
+  height: 8px; border-radius: 4px; background: var(--input-bg);
+  border: 1px solid var(--rack-line); overflow: hidden; margin-bottom: 12px;
+}
+.progress-bar-fill {
+  height: 100%; background: linear-gradient(90deg, var(--accent-dim), var(--accent));
+  width: 8%; transition: width .5s ease;
+  background-size: 200% 100%;
+  animation: barpulse 1.6s linear infinite;
+}
+@keyframes barpulse { 0% { background-position: 0% 0; } 100% { background-position: -200% 0; } }
+.log-box {
+  background: var(--input-bg); border: 1px solid var(--rack-line); border-radius: 8px;
+  padding: 10px 12px; height: 160px; overflow-y: auto;
+  font-size: 11.5px; line-height: 1.6; color: var(--text-dim);
+}
+.log-box .line { white-space: pre-wrap; word-break: break-word; }
+.log-box .line.err { color: var(--crit); }
+
+/* ---------- Results ---------- */
+.results { display: none; flex-direction: column; gap: 20px; }
+.results.active { display: flex; }
+
+.verdict-banner {
+  border-radius: 12px; padding: 18px 20px;
+  display: flex; align-items: center; gap: 16px;
+  border: 1px solid var(--rack-line);
+}
+.verdict-banner.pass { background: var(--accent-glow); border-color: var(--accent-dim); }
+.verdict-banner.fail { background: rgba(224,84,79,0.12); border-color: var(--crit); }
+.verdict-banner .icon { font-size: 26px; }
+.verdict-banner .title { font-size: 15.5px; font-weight: 700; }
+.verdict-banner .sub { font-size: 12.5px; color: var(--text-dim); margin-top: 2px; }
+
+.compare-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.compare-table th {
+  text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--text-faint); font-weight: 600; padding: 8px 12px; border-bottom: 1px solid var(--rack-line);
+}
+.compare-table td { padding: 10px 12px; border-bottom: 1px solid var(--rack-line); }
+.compare-table tr:last-child td { border-bottom: none; }
+.compare-table td.good { color: var(--good); font-weight: 600; }
+.compare-table td.crit { color: var(--crit); font-weight: 600; }
+.table-wrap { overflow-x: auto; }
+
+.steps-list { display: flex; flex-direction: column; gap: 6px; }
+.step-item {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 9px 12px; background: var(--panel-raised); border-radius: 8px;
+  border: 1px solid var(--rack-line); font-size: 12.5px;
+}
+.step-item .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; margin-top: 5px; }
+.step-item .dot.warn { background: var(--warn); }
+.step-item .txt { flex: 1; }
+.step-item .time { color: var(--text-faint); font-size: 11px; flex: none; }
+.step-warning {
+  margin-top: 4px; font-size: 11.5px; color: var(--warn);
+  line-height: 1.5;
+}
+
+/* ---------- A/B player ---------- */
+.ab-player {
+  display: flex; flex-direction: column; gap: 14px;
+}
+.ab-switch {
+  display: flex; background: var(--input-bg); border: 1px solid var(--rack-line);
+  border-radius: 100px; padding: 4px; width: fit-content; margin: 0 auto;
+}
+.ab-switch button {
+  border: none; background: transparent; color: var(--text-dim);
+  font-size: 13px; font-weight: 700; padding: 8px 22px; border-radius: 100px;
+  cursor: pointer; letter-spacing: .03em;
+}
+.ab-switch button.active { background: var(--accent); color: #0c1210; }
+.transport {
+  display: flex; align-items: center; gap: 12px;
+}
+.transport button.play {
+  width: 44px; height: 44px; border-radius: 50%; border: none;
+  background: var(--accent); color: #0c1210; font-size: 15px; cursor: pointer;
+  flex: none; display: flex; align-items: center; justify-content: center;
+}
+.timeline {
+  flex: 1; height: 34px; position: relative; cursor: pointer;
+  background: var(--input-bg); border: 1px solid var(--rack-line); border-radius: 8px;
+  overflow: hidden;
+}
+canvas#waveCanvas { width: 100%; height: 100%; display: block; }
+.playhead {
+  position: absolute; top: 0; bottom: 0; width: 2px; background: var(--accent);
+  box-shadow: 0 0 6px var(--accent-glow); pointer-events: none;
+}
+.time-label { font-size: 11.5px; color: var(--text-faint); width: 42px; text-align: center; flex: none; }
+
+.download-row { display: flex; gap: 10px; justify-content: flex-end; }
+
+.hidden { display: none !important; }
+
+footer {
+  text-align: center; padding: 30px 16px 50px;
+  font-size: 11px; color: var(--text-faint);
+}
+</style>
+
+<header>
+  <div class="brand"><span class="the">the</span><span class="mark">FIXER</span></div>
+  <div class="tagline">Mastering &amp; AI-detector verification console</div>
+  <div class="spacer"></div>
+  <button class="docs-btn" id="docsBtn" title="Instructions, chain reference &amp; known limitations">Docs</button>
+  <button class="theme-toggle" id="themeToggle" title="Toggle theme">◐</button>
+</header>
+
+<div class="app">
+
+  <div class="upload-zone" id="uploadZone">
+    <div class="icon">⏏</div>
+    <div class="primary">Drop an audio file, or click to browse</div>
+    <div class="secondary">WAV, MP3, FLAC — analyzed instantly against both AI-detector models</div>
+    <input type="file" id="fileInput" accept="audio/*" />
+  </div>
+
+  <div class="workspace" id="workspace">
+
+    <div class="file-strip">
+      <div>
+        <div class="name" id="fileName">—</div>
+        <div class="meta mono" id="fileMeta">—</div>
+      </div>
+      <button class="new-file" id="newFileBtn">Analyze a different file</button>
+    </div>
+
+    <div class="grid">
+      <!-- LEFT: analysis -->
+      <div class="panel">
+        <div class="panel-head"><span class="title">Detector Analysis</span></div>
+        <div class="panel-body">
+          <div class="score-row">
+            <div class="score-card">
+              <div class="label">Linear model</div>
+              <div class="value mono" id="linearScore">—</div>
+              <div class="meter-track"><div class="meter-fill" id="linearMeter" style="width:0%"></div></div>
+              <div id="linearPill"></div>
+            </div>
+            <div class="score-card">
+              <div class="label">CNN model</div>
+              <div class="value mono" id="cnnScore">—</div>
+              <div class="meter-track"><div class="meter-fill" id="cnnMeter" style="width:0%"></div></div>
+              <div id="cnnPill"></div>
+            </div>
+          </div>
+
+          <div class="stat-list" id="statList"></div>
+
+          <div class="spectrum-wrap">
+            <div class="caption"><span>Spectrum (avg. power)</span><span>20Hz&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;20kHz</span></div>
+            <canvas id="spectrumCanvas" width="700" height="140"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- RIGHT: tool chain -->
+      <div class="panel">
+        <div class="panel-head"><span class="title">Signal Chain</span></div>
+        <div class="panel-body">
+          <div class="chain-group-label">Cleanup</div>
+          <div class="chain-list" id="chainGroupCleanup"></div>
+
+          <div class="chain-group-label">AI-detector fixes</div>
+          <div class="chain-list" id="chainGroupAI"></div>
+
+          <div class="chain-group-label">Mastering</div>
+          <div class="chain-list" id="chainGroupMaster"></div>
+
+          <div class="chain-group-label">Output filename</div>
+          <input type="text" class="filename-input mono" id="outputNameInput" placeholder="e.g. northstar_fixed.wav" />
+        </div>
+        <div class="run-bar">
+          <button class="btn" id="runBtn">Process file</button>
+          <button class="btn secondary" id="selectRecBtn">Select recommended</button>
+          <span class="run-count mono" id="runCount">0 selected</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel progress-panel" id="progressPanel">
+      <div class="panel-head"><span class="title">Processing</span></div>
+      <div class="panel-body">
+        <div class="progress-step-row">
+          <span class="mono" id="progressStepLabel">—</span>
+          <span class="mono" id="progressStepCount"></span>
+        </div>
+        <div class="progress-bar-track"><div class="progress-bar-fill" id="progressFill"></div></div>
+        <div class="log-box mono" id="logBox"></div>
+      </div>
+    </div>
+
+    <div class="results" id="results">
+
+      <div class="verdict-banner" id="verdictBanner">
+        <div class="icon" id="verdictIcon">—</div>
+        <div>
+          <div class="title" id="verdictTitle">—</div>
+          <div class="sub" id="verdictSub">—</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><span class="title">Before / After</span></div>
+        <div class="panel-body table-wrap">
+          <table class="compare-table mono" id="compareTable"></table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><span class="title">What was done</span></div>
+        <div class="panel-body">
+          <div class="steps-list" id="stepsList"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><span class="title">A/B Listen</span></div>
+        <div class="panel-body ab-player">
+          <div class="ab-switch">
+            <button id="abOriginal" class="active">A · Original</button>
+            <button id="abFixed">B · Fixed</button>
+          </div>
+          <div class="transport">
+            <button class="play" id="playBtn">▶</button>
+            <span class="time-label mono" id="timeCur">0:00</span>
+            <div class="timeline" id="timeline">
+              <canvas id="waveCanvas" width="900" height="34"></canvas>
+              <div class="playhead" id="playhead" style="left:0%"></div>
+            </div>
+            <span class="time-label mono" id="timeTotal">0:00</span>
+          </div>
+          <div class="download-row">
+            <button class="btn secondary" id="downloadOrig">Download original</button>
+            <button class="btn" id="downloadFixed">Download fixed file</button>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+  </div>
+</div>
+
+<footer>The Fixer — local mastering &amp; AI-detector verification console</footer>
+
+<audio id="audioOrig" preload="auto"></audio>
+<audio id="audioFixed" preload="auto"></audio>
+
+<div class="docs-overlay" id="docsOverlay">
+  <div class="docs-modal">
+    <div class="docs-modal-head">
+      <span class="title">Documentation</span>
+      <button class="docs-close" id="docsCloseBtn" title="Close">✕</button>
+    </div>
+    <div class="docs-modal-body">
+
+      <section class="docs-section">
+        <h2>How to use this</h2>
+        <ol>
+          <li>Drop an audio file, or click to browse. It's decoded and immediately scored against both AI-music detector models.</li>
+          <li>Review the analysis panel — detector scores, LUFS, stereo correlation, DC offset, silence, transients, and the spectrum plot.</li>
+          <li>Pick which signal-chain tools to run in the right-hand panel. Recommended tools (based on the analysis) are badged; "Select recommended" picks them all at once.</li>
+          <li>Optionally set an output filename before processing — it defaults to <code>&lt;original name&gt;_fixed.wav</code>.</li>
+          <li>Click "Process file." A live log and step-aware progress bar track exactly which step is running; the CNN fix step also shows its internal optimization step count, since that stage alone can take many minutes.</li>
+          <li>When done, review the before/after table, what-was-done log, and spectrum overlay, then A/B the original against the fixed file in the player. Download either one — filenames follow what you set.</li>
+        </ol>
+      </section>
+
+      <section class="docs-section">
+        <h2>The signal chain, in order</h2>
+        <p>The order matters and was tuned through direct testing, not chosen arbitrarily.</p>
+        <ol>
+          <li><strong>Trim leading/trailing silence</strong> — true-digital-silence detection (threshold 0.0005 linear amplitude, 5ms safety pad).</li>
+          <li><strong>DC offset correction</strong> — subtracts each channel's mean.</li>
+          <li><strong>Surgical transient/pop fix</strong> — detects genuine click/glitch artifacts (requires both a large sample-to-sample jump AND a spike far above a 200ms local RMS envelope, so it never fires on ordinary kick/snare hits) and applies a raised-cosine gain-reduction envelope (3ms attack, 60ms release). Target reduction is derived from the track's own recent loudness context, not a fixed value.</li>
+          <li><strong>High-pass filter</strong> — 2nd-order Butterworth, zero-phase, 30Hz cutoff.</li>
+          <li><strong>Stereo phase/correlation correction</strong> — blends mid/side if correlation is negative enough to risk mono-cancellation.</li>
+          <li><strong>LUFS loudness normalization</strong> — targets -14 LUFS.</li>
+          <li><strong>Multiband compression</strong> — gentle 3-band downward compression, ratio 1.3:1, threshold -12dB. See limitations below.</li>
+          <li><strong>Linear-model AI-detector fix</strong> — gradient-based adversarial correction targeting the fakeprint/logistic-regression detector.</li>
+          <li><strong>CNN-model AI-detector fix</strong> — whole-track joint gradient optimization targeting the CQT-cepstrum CNN detector across all overlapping 10-second analysis windows simultaneously.</li>
+          <li><strong>Post-chain linear re-verification</strong> (automatic, not a selectable tool) — if both AI fixes were selected, re-scores the linear model on the final post-chain audio and, if <code>cnn_fix</code> disturbed it back above target, re-runs <code>linear_fix</code> once more, verified.</li>
+          <li><strong>True-peak limiter</strong> — brick-wall ceiling at -1dBTP, oversampled 4x to catch inter-sample peaks.</li>
+        </ol>
+        <p><strong>Why AI-detector fixes run after mastering but before the limiter:</strong> any gain/EQ/dynamics change applied after an adversarial correction can perturb its exact spectral signature enough to undo it, even though the fix passed real-model verification immediately after it ran. Confirmed directly: a linear fix verified at &lt;1% scored 16% once <code>normalize_lufs</code>/<code>multiband_compress</code> ran on top of it in an earlier, wrongly-ordered version of the chain. The limiter is the one exception — it's a safety net against clipping, not a musical/spectral-shaping step, and it needs to see the truly final signal to actually guarantee the delivered file stays under its ceiling.</p>
+        <p><strong>Why there's an automatic re-verification pass:</strong> running <code>linear_fix</code> then <code>cnn_fix</code> can still let the CNN fix's broadband correction disturb the linear fix's precise correction, even in the correct order. Confirmed directly on a full 276.9s test track: a verified 1.56% became 9.65% once <code>cnn_fix</code> had also run. The re-verification pass catches and corrects this specific interaction automatically, but is not a complete fix for the underlying issue — see Roadmap.</p>
+      </section>
+
+      <section class="docs-section">
+        <h2>Multiband compressor: how it compares to a real one</h2>
+        <p>The concept is standard mastering practice (split into bands, compress each independently to smooth tonal-balance imbalance without one broadband compressor squashing everything together) — real tools like iZotope Ozone, Waves C6, or FabFilter Pro-MB do exactly this. The implementation here is a simplified, conservative version, not a full-featured multiband compressor.</p>
+        <p><strong>What's NOT industry-standard / simplified compared to real tools:</strong></p>
+        <ul>
+          <li><strong>No attack/release time constants.</strong> Real compressors have separate attack and release envelopes (how fast gain reduction engages vs. releases) — this implementation uses a single 20ms median-filter smoothing window as a stand-in for both, which is a crude approximation. A proper compressor would let you set attack ~5-30ms and release ~50-500ms independently per band.</li>
+          <li><strong>No knee.</strong> Real compressors have a "soft knee" — gain reduction ramps in gradually around the threshold rather than switching on hard. This one has a hard knee (<code>over = max(env_db - threshold_db, 0)</code>), which can sound more abrupt.</li>
+          <li><strong>No makeup gain.</strong> After compressing, real multibands typically let you add back gain to compensate for the loudness you just removed. This doesn't do that automatically.</li>
+          <li><strong>No lookahead.</strong> Can't anticipate a transient before it hits.</li>
+          <li><strong>Filter crossover isn't phase-aligned/Linkwitz-Riley.</strong> Splitting into bands with plain Butterworth low/high/bandpass filters (rather than a proper Linkwitz-Riley crossover) can introduce small phase-cancellation artifacts when the bands are summed back together — professional multiband tools use LR crossovers specifically to avoid this.</li>
+        </ul>
+      </section>
+
+      <section class="docs-section">
+        <h2>What's genuinely missing (comparing against a real mastering-engineer checklist)</h2>
+        <ul>
+          <li><strong>Attack/release-aware dynamics</strong> (as above) — the biggest gap.</li>
+          <li><strong>Stereo widening/imaging tools</strong> beyond the basic phase-correlation fix (mid/side EQ, stereo width control).</li>
+          <li><strong>De-essing</strong> (sibilance control) — not applicable to most full mixes but standard on vocal-heavy masters.</li>
+          <li><strong>Harmonic exciter/saturation</strong> — common "analog warmth" step in commercial mastering, not present here.</li>
+          <li><strong>Dithering</strong> — you explicitly told me to skip this earlier in the project, so its absence is intentional, not an oversight.</li>
+          <li><strong>Reference-track matching</strong> (matching tonal curve/loudness to a target reference song) — a common modern mastering workflow, not implemented.</li>
+          <li><strong>Metering/monitoring for mono-fold-down beyond the correlation check</strong> — no LRA (loudness range) metering, no true-peak metering displayed pre-limiting.</li>
+        </ul>
+      </section>
+
+      <section class="docs-section">
+        <h2>Verification discipline</h2>
+        <p>Every AI-detector fix is checked against the REAL (non-differentiable, exact librosa+ONNX pipeline) model, not just the differentiable PyTorch surrogate used during gradient optimization — the surrogate has been observed to diverge sharply from the real model specifically after optimization, even when it matches near-perfectly on unperturbed audio. Verification happens during optimization (periodic real-score checks with extra optimization weight for windows that disagree), after the resample/stereo transfer (a second, independent point where a verified-good result can still degrade), after the full chain (final linear re-check with automatic retry), and in the final job result (scores always reflect the real model on the actual saved output, never a self-reported mid-pipeline claim). A fix is only ever reported as applied after the real model has confirmed it on the actual delivered audio.</p>
+      </section>
+
+      <section class="docs-section">
+        <h2>Roadmap</h2>
+        <p><strong>Fix-interaction correctness (highest priority):</strong></p>
+        <ul>
+          <li>The cnn_fix-disturbs-linear_fix interaction has a targeted one-shot patch (automatic linear re-verification/retry after the full chain), but the root cause — two independent adversarial corrections sharing the same audio without a joint objective — is unsolved.</li>
+          <li>The CNN whole-track optimizer does not always converge on every overlapping analysis window on long tracks — on one full-track test, 5 of 108 windows plateaued around 93-96% AI probability despite full-budget optimization. Surfaced honestly via <code>worst_score_after_transfer</code>/<code>verified_after_transfer</code>, never hidden.</li>
+        </ul>
+        <p><strong>Mastering-chain gaps:</strong> attack/release-aware dynamics, stereo widening/imaging, de-essing, harmonic exciter/saturation, dithering (intentionally excluded), reference-track matching, fuller metering, multiband compressor improvements (attack/release, soft knee, makeup gain, lookahead, Linkwitz-Riley crossovers).</p>
+        <p><strong>App/UX gaps:</strong> no undo/versioning across runs, no persistence across server restarts, single-file/single-job workflow only, no authentication/multi-user support (local single-user tool by design).</p>
+      </section>
+
+      <section class="docs-section">
+        <h2>Deployment</h2>
+        <p>There is no client-side audio processing at all — the frontend is a thin client that calls the Flask backend for every operation. No <code>localStorage</code>, <code>indexedDB</code>, or <code>sessionStorage</code> is used anywhere; nothing persists in the browser. All state lives on the server's disk and in an in-memory job dict that is lost on server restart. Running it requires the Flask server (<code>./run.sh</code>) to be up.</p>
+      </section>
+
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
