@@ -2,9 +2,20 @@ import numpy as np
 import torch
 from .cnn_differentiable_v2 import (
     forward_logit_differentiable, forward_score_differentiable,
-    get_real_score_segment, SR,
+    get_real_score_segment, SR, SEGMENT_SAMPLES,
 )
 from .cnn_gradient_optimizer_v2 import perceptual_penalty, band_limit_penalty, tonality_penalty, apply_silence_guard_to_delta
+
+
+# The differentiable optimization path (nnAudio's CQT feeding the CNN's
+# pooling layers) genuinely crashes below this many samples - verified
+# directly: 3200 samples raises "Output size is too small" inside a pooling
+# layer, 500 samples raises a padding-size error in the CQT itself, while
+# 4000 samples (250ms @ 16kHz) is the smallest input that runs cleanly. The
+# real (non-differentiable, librosa-based) scoring path tolerates much
+# shorter input without crashing, so this floor applies ONLY to what the
+# optimizer can operate on, not to scoring.
+MIN_VIABLE_SEGMENT_SAMPLES = 4000
 
 
 def build_sliding_windows(n_samples, hop_sec=2.5, segment_sec=10.0, sr=SR, edge_guard_sec=0.5):
@@ -14,18 +25,24 @@ def build_sliding_windows(n_samples, hop_sec=2.5, segment_sec=10.0, sr=SR, edge_
 
     if n_samples < seg_len + 2 * edge_guard:
         # track too short for even one full-length window plus edge guards on
-        # both sides - previously this silently produced an out-of-bounds
-        # window position (e.g. any track under ~10.9s at the default
-        # segment_sec=10.0/edge_guard_sec=0.5), which downstream code sliced
-        # with no length check, causing a shape-mismatch crash inside the CQT/
-        # CNN pipeline. Shrink the window to fit the track instead, still
+        # both sides - shrink the window to fit the track instead, still
         # respecting the edge guard on both sides where possible.
-        seg_len = max(1, n_samples - 2 * edge_guard)
-        if seg_len < 1:
-            # pathologically short (shorter than 2*edge_guard) - use the
-            # whole track as one window and drop the edge guard entirely
-            # rather than producing an empty/negative-length segment
-            return [0], n_samples
+        seg_len = n_samples - 2 * edge_guard
+        if seg_len < MIN_VIABLE_SEGMENT_SAMPLES:
+            # still too short even after dropping the edge guard entirely -
+            # a previous version returned [0], n_samples here unconditionally,
+            # which silently fed a too-short segment into the differentiable
+            # CQT/pooling pipeline and crashed with a low-level tensor-shape
+            # error. Try the whole track with no edge guard as a last resort,
+            # and only proceed if that itself clears the real minimum -
+            # otherwise the caller must not attempt optimization at all.
+            if n_samples >= MIN_VIABLE_SEGMENT_SAMPLES:
+                return [0], n_samples
+            raise ValueError(
+                f"track too short ({n_samples} samples = {n_samples / sr:.2f}s at {sr}Hz) "
+                f"for the CNN optimizer, which needs at least "
+                f"{MIN_VIABLE_SEGMENT_SAMPLES} samples ({MIN_VIABLE_SEGMENT_SAMPLES / sr:.2f}s)"
+            )
         return [edge_guard], seg_len
 
     # a window must not touch the literal first OR last sample of the signal -
@@ -57,7 +74,22 @@ def optimize_whole_track_verified(
     the REAL (librosa-based) score at each window and, for any window where
     the real score still exceeds real_target despite the surrogate claiming
     success, boosts that window's weight in the loss so the optimizer keeps
-    working on it specifically rather than trusting the surrogate blindly."""
+    working on it specifically rather than trusting the surrogate blindly.
+
+    For tracks shorter than the real detector's own analysis segment length
+    (10s), the real detector zero-pads the clip out to a full segment before
+    scoring it (see detector.py's extract_segments) - if the optimizer only
+    ever analyzed the real (shorter, unpadded) audio, it would be optimizing
+    against a DIFFERENT signal than what the detector actually scores.
+    Zero-pad here too so both sides analyze the same representation; the
+    returned delta is only as long as the padding needed, and the caller
+    (cnn_fix.fix_cnn) truncates it back down to the real track length before
+    applying it, since the padded tail doesn't exist in the delivered file."""
+    n_real = len(audio_np)
+    if n_real < SEGMENT_SAMPLES:
+        padded = np.zeros(SEGMENT_SAMPLES, dtype=audio_np.dtype)
+        padded[:n_real] = audio_np
+        audio_np = padded
     n = len(audio_np)
     positions, seg_len = build_sliding_windows(n, hop_sec=hop_sec)
     print(f"track length: {n/SR:.1f}s, {len(positions)} overlapping windows "
@@ -95,6 +127,22 @@ def optimize_whole_track_verified(
 
         loss = total_logit_loss + lambda_perceptual * percep + lambda_band * band_pen + lambda_tonality * tonal_pen
         loss.backward()
+
+        # a very short track zero-padded up to the detector's 10s segment
+        # length can put most of a window over pure digital silence, which
+        # has produced non-finite gradients (verified: a 2s clip padded to
+        # 10s NaNs on the very first optimizer step) - a different failure
+        # mode than the documented CQT edge-of-track singularity. Detect and
+        # fail cleanly here rather than let a corrupted delta silently
+        # propagate into a later real-model check (which crashes deep inside
+        # librosa with a much less diagnosable "buffer is not finite" error).
+        if delta.grad is None or not torch.isfinite(delta.grad).all():
+            raise ValueError(
+                "gradient became non-finite during CNN optimization - this can happen on "
+                "very short tracks padded with a large proportion of silence; the CNN fix "
+                "is not currently reliable on tracks this short"
+            )
+
         optimizer.step()
 
         if progress_cb is not None:

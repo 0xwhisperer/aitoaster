@@ -40,11 +40,22 @@ def fix_cnn(stereo_audio, sr, max_steps=300, min_steps=100, hop_sec=2.5,
     if progress_cb:
         progress_cb(f"cnn: optimizing {len(mono_16k)/CNN_SR:.1f}s of audio (this can take a while)")
 
-    delta_16k, positions, seg_len = optimize_whole_track_verified(
-        mono_16k, max_steps=max_steps, min_steps=min_steps, hop_sec=hop_sec,
-        real_check_interval=real_check_interval, verbose=True,
-        progress_cb=step_progress_cb,
-    )
+    try:
+        delta_16k, positions, seg_len = optimize_whole_track_verified(
+            mono_16k, max_steps=max_steps, min_steps=min_steps, hop_sec=hop_sec,
+            real_check_interval=real_check_interval, verbose=True,
+            progress_cb=step_progress_cb,
+        )
+    except ValueError as e:
+        return stereo_audio, {"applied": False, "reason": str(e)}
+
+    # tracks shorter than the real detector's segment length get zero-padded
+    # internally before optimization (see optimize_whole_track_verified) so
+    # the optimizer analyzes the same padded representation the real
+    # detector scores - truncate the delta back down to the real audio's
+    # length here, since the padded tail doesn't exist in the delivered file.
+    if len(delta_16k) > len(mono_16k):
+        delta_16k = delta_16k[:len(mono_16k)]
 
     delta_peak = np.abs(delta_16k).max()
     if delta_peak < 1e-9:
@@ -55,11 +66,20 @@ def fix_cnn(stereo_audio, sr, max_steps=300, min_steps=100, hop_sec=2.5,
     delta_native_norm = _resample_mono(delta_norm_16k, CNN_SR, sr) if sr != CNN_SR else delta_norm_16k
     delta_native = delta_native_norm / scale
 
-    n = min(len(stereo_audio), len(delta_native))
-    out = stereo_audio[:n].copy()
-    out[:, 0] += delta_native[:n]
-    out[:, 1] += delta_native[:n]
+    # apply the correction only where a delta exists (resampling can leave
+    # delta_native a few samples shorter/longer than stereo_audio) but carry
+    # the FULL original track through unchanged elsewhere - never truncate
+    # the delivered audio down to however much the delta happened to cover.
+    n_delta = min(len(stereo_audio), len(delta_native))
+    out = stereo_audio.copy()
+    out[:n_delta, 0] += delta_native[:n_delta]
+    out[:n_delta, 1] += delta_native[:n_delta]
+    n = len(out)
 
+    # emergency anti-clipping safety net ONLY (not the app's real loudness
+    # ceiling) - see linear_fix.py's identical clamp for why this alone does
+    # not guarantee -1dBTP compliance without the true-peak limiter also
+    # running as the final chain stage.
     peak = np.abs(out).max()
     if peak > 0.97:
         out *= 0.97 / peak

@@ -9,6 +9,9 @@ is the "ordinary mastering engineer" toolbox: silence trim, DC offset, high
 pass, RMS/LUFS normalization, multiband compression, stereo correlation,
 true-peak limiting.
 """
+import subprocess
+import json as _json
+
 import numpy as np
 from scipy import signal
 import pyloudnorm as pyln
@@ -163,8 +166,16 @@ def fix_transient(audio, sr, time_sec, target_peak=None, attack_ms=3, release_ms
 
 
 def measure_lufs(audio, sr):
+    """Returns the ITU-R BS.1770 integrated loudness in LUFS, or NaN if the
+    clip is too short for pyloudnorm's measurement block size (it raises a
+    ValueError rather than returning a degraded estimate) - callers should
+    treat NaN the same way they already treat -inf (silent audio): as "no
+    meaningful LUFS value available", not as an error."""
     meter = pyln.Meter(sr)
-    return meter.integrated_loudness(audio)
+    try:
+        return meter.integrated_loudness(audio)
+    except ValueError:
+        return float("nan")
 
 
 def normalize_lufs(audio, sr, target_lufs=-14.0):
@@ -299,3 +310,68 @@ def spectral_tilt_report(audio, sr):
         mask = (freqs >= lo) & (freqs <= hi)
         report[name] = float(10 * np.log10(psd[mask].mean() + 1e-15))
     return report, freqs.tolist(), (10 * np.log10(psd + 1e-15)).tolist()
+
+
+def read_metadata_tags(path):
+    """Read every container/ID3 metadata tag from the source file - both
+    format-level (title/artist/comment/encoder/etc.) AND per-stream tags,
+    plus a report of any non-audio streams (embedded cover art, attached
+    images) since those can themselves carry their own metadata (e.g. EXIF
+    in a JPEG) and most users don't expect a cover-art image riding along
+    inside an audio file at all.
+
+    Many AI-generation platforms embed identifying tags (comment fields
+    naming the platform, generation UUIDs, timestamps, platform-style
+    artist handles) directly in the uploaded file's metadata, independent
+    of anything detectable in the audio itself. This never modifies the
+    file - it's a read-only report used by /api/analyze so a user can see
+    everything the original upload was carrying.
+
+    Returns {"format": {...}, "streams": [{"index", "codec_type",
+    "codec_name", "tags": {...}}, ...]}."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json",
+         "-show_format", "-show_streams", str(path)],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return {"format": {}, "streams": []}
+    try:
+        data = _json.loads(result.stdout)
+    except _json.JSONDecodeError:
+        return {"format": {}, "streams": []}
+
+    format_tags = data.get("format", {}).get("tags", {}) or {}
+    streams = []
+    for s in data.get("streams", []):
+        streams.append({
+            "index": s.get("index"),
+            "codec_type": s.get("codec_type"),
+            "codec_name": s.get("codec_name"),
+            "is_attached_image": bool(s.get("disposition", {}).get("attached_pic")),
+            "tags": s.get("tags", {}) or {},
+        })
+    return {"format": format_tags, "streams": streams}
+
+
+def strip_metadata_tags(in_path, out_path):
+    """Write a copy of in_path with every container/ID3 metadata tag removed
+    (title, artist, comment, encoder, any platform-identifying fields) at
+    both the format AND per-stream level, and drops any non-audio stream
+    entirely (embedded cover art/attached images), rather than only
+    clearing their tags - the image data itself is removed, not just its
+    label. The actual audio stream is stream-copied (not re-encoded), so
+    audio quality is untouched.
+
+    One unavoidable exception: ffmpeg's own muxer writes a small
+    self-identifying "encoder" tag (e.g. "Lavf62.12.100") into most output
+    containers regardless of -map_metadata; this identifies ffmpeg itself,
+    not the source platform, and there is no ffmpeg flag that suppresses
+    it. Every OTHER tag - including all platform/generation-identifying
+    fields - is fully removed."""
+    subprocess.run(
+        ["ffmpeg", "-v", "quiet", "-y", "-i", str(in_path),
+         "-map", "0:a", "-map_metadata", "-1", "-map_chapters", "-1",
+         "-c", "copy", str(out_path)],
+        check=True,
+    )

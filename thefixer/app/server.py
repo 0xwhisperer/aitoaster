@@ -23,6 +23,27 @@ from flask import Flask, request, jsonify, send_from_directory, Response
 from . import chain
 from .detector import Scorer
 
+
+def _json_safe(value):
+    """Recursively replace NaN/+-Infinity with None. Silent or near-silent
+    audio can legitimately produce these (e.g. LUFS on true silence is
+    mathematically -inf), but Python's json.dumps writes them as the bare
+    tokens NaN/-Infinity/Infinity, which are NOT valid JSON and every
+    browser's JSON.parse rejects outright - the analyze/job endpoints would
+    otherwise return a response the frontend can't parse at all, silently
+    breaking the whole page rather than just showing an odd number."""
+    if isinstance(value, float):
+        return None if not np.isfinite(value) else value
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def safe_jsonify(payload):
+    return jsonify(_json_safe(payload))
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "outputs"
@@ -57,6 +78,65 @@ def load_stereo(path, sr=44100):
 def save_stereo(path, audio, sr=44100):
     audio_clipped = np.clip(audio, -1.0, 1.0)
     sf.write(str(path), audio_clipped, sr, subtype="PCM_16")
+
+
+OUTPUT_FORMAT_EXTENSIONS = {"wav": ".wav", "mp3": ".mp3", "flac": ".flac"}
+
+
+def resolve_output_format(requested_format, original_upload_path):
+    """"same" means match the original upload's container; anything else is
+    taken literally. Falls back to wav if the source extension isn't one of
+    the formats this app knows how to encode to."""
+    if requested_format != "same":
+        return requested_format
+    ext = Path(original_upload_path).suffix.lower().lstrip(".")
+    if ext in ("mp3",):
+        return "mp3"
+    if ext in ("flac",):
+        return "flac"
+    return "wav"
+
+
+def encode_final_output(audio, sr, out_format, dest_path_no_ext):
+    """Write the final processed audio to disk in the requested format, with
+    ALL container/ID3 metadata stripped regardless of format (WAV via
+    soundfile carries none by default; MP3/FLAC are explicitly stripped via
+    ffmpeg's -map_metadata -1 on top of that, so no encoder ever silently
+    reintroduces a title/artist/comment field). Returns the actual path
+    written (with the correct extension for the chosen format).
+
+    MP3 is encoded at the highest quality libmpx3lame offers (-q:a 0,
+    VBR ~245kbps average) since "highest bitrate" for a VBR-capable modern
+    encoder means the top quality setting, not a fixed high constant
+    bitrate that can waste space on simple passages."""
+    ext = OUTPUT_FORMAT_EXTENSIONS.get(out_format, ".wav")
+    final_path = Path(f"{dest_path_no_ext}{ext}")
+
+    if out_format == "wav":
+        save_stereo(final_path, audio, sr)
+        return final_path
+
+    # MP3/FLAC: write a temporary WAV first (soundfile has no MP3/FLAC
+    # writer of its own), then let ffmpeg do the real encode + explicit
+    # metadata strip in one pass.
+    tmp_wav = Path(f"{dest_path_no_ext}_tmp.wav")
+    save_stereo(tmp_wav, audio, sr)
+    try:
+        if out_format == "mp3":
+            cmd = ["ffmpeg", "-v", "quiet", "-y", "-i", str(tmp_wav),
+                   "-map_metadata", "-1", "-codec:a", "libmp3lame", "-q:a", "0",
+                   str(final_path)]
+        elif out_format == "flac":
+            cmd = ["ffmpeg", "-v", "quiet", "-y", "-i", str(tmp_wav),
+                   "-map_metadata", "-1", "-codec:a", "flac",
+                   str(final_path)]
+        else:
+            raise ValueError(f"unknown output format: {out_format}")
+        subprocess.run(cmd, check=True)
+    finally:
+        if tmp_wav.exists():
+            tmp_wav.unlink()
+    return final_path
 
 
 def job_log(job_id, msg):
@@ -131,7 +211,17 @@ def upload():
     })
 
 
+_FILE_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+
+
 def _find_upload_path(file_id):
+    # file_id must be exactly the 12-char hex ID this app itself generates
+    # (uuid.uuid4().hex[:12] at upload time) - without this check, a glob
+    # metacharacter like "*" as the literal file_id would match ANY file in
+    # UPLOAD_DIR, letting a caller fetch/analyze an arbitrary previously-
+    # uploaded file without knowing its real ID.
+    if not _FILE_ID_RE.match(file_id):
+        return None
     matches = list(UPLOAD_DIR.glob(f"{file_id}.*"))
     if not matches:
         return None
@@ -156,6 +246,21 @@ def analyze(file_id):
 
     _, silence_info = chain.trim_silence(audio, 44100)
 
+    metadata = chain.read_metadata_tags(path)
+    # flag anything that looks like it names a generation platform, tool, or
+    # otherwise identifies provenance beyond what the user themselves set -
+    # AI-generation platforms commonly embed this in comment/encoder fields
+    PROVENANCE_KEYWORDS = ("suno", "udio", "made with", "generated", "ai-generated",
+                           "riffusion", "mubert", "soundraw", "aiva", "boomy")
+    all_tag_values = list(metadata["format"].items()) + [
+        item for s in metadata["streams"] for item in s["tags"].items()
+    ]
+    provenance_hits = {
+        k: v for k, v in all_tag_values
+        if isinstance(v, str) and any(kw in v.lower() for kw in PROVENANCE_KEYWORDS)
+    }
+    has_embedded_images = any(s["is_attached_image"] for s in metadata["streams"])
+
     recommendations = []
     if scores["linear"]["probability"] >= 0.01:
         recommendations.append("linear_fix")
@@ -175,7 +280,7 @@ def analyze(file_id):
     recommendations.append("multiband_compress")
     recommendations.append("true_peak_limit")
 
-    return jsonify({
+    return safe_jsonify({
         "file_id": file_id,
         "scores": scores,
         "lufs": lufs,
@@ -185,6 +290,9 @@ def analyze(file_id):
         "transients": transients,
         "spectral_tilt": tilt_report,
         "spectrum": {"freqs": freqs, "psd_db": psd_db},
+        "metadata": metadata,
+        "provenance_tags_found": provenance_hits,
+        "has_embedded_images": has_embedded_images,
         "recommended_tools": recommendations,
         "passes_both": scores["passes_both"],
     })
@@ -228,7 +336,7 @@ TOOL_LABELS = {
 }
 
 
-def run_pipeline(job_id, file_id, tools, options, output_name=None):
+def run_pipeline(job_id, file_id, tools, options, output_name=None, output_format="same"):
     try:
         path = _find_upload_path(file_id)
         if path is None:
@@ -328,20 +436,44 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None):
                     reverify_info["triggered_by"] = f"post-chain recheck showed {recheck_score * 100:.3f}%"
                     steps.append(reverify_info)
                     job_log(job_id, f"  done ({reverify_info['elapsed_sec']}s)")
+
+                    # the re-verification pass adds a fresh linear correction
+                    # AFTER true_peak_limit already ran in the main loop above -
+                    # if the limiter was selected, it must run again here so it
+                    # remains the genuine last stage and the delivered file
+                    # actually stays under its ceiling, rather than only having
+                    # been checked against audio that predates this correction.
+                    if "true_peak_limit" in tools:
+                        job_log(job_id, "re-running true-peak limiter after re-verification pass")
+                        t0 = time.time()
+                        audio, limiter_info = chain.true_peak_limit(
+                            audio, sr, ceiling_db=options.get("ceiling_db", -1.0))
+                        limiter_info["tool"] = "true_peak_limit_reverify"
+                        limiter_info["label"] = "True-peak limiter (post-reverification safety pass)"
+                        limiter_info["elapsed_sec"] = round(time.time() - t0, 2)
+                        steps.append(limiter_info)
+                        job_log(job_id, f"  done ({limiter_info['elapsed_sec']}s)")
             finally:
                 if recheck_path.exists():
                     recheck_path.unlink()
 
         out_id = uuid.uuid4().hex[:12]
-        out_path = OUTPUT_DIR / f"{out_id}.wav"
-        job_log(job_id, "saving output file")
-        save_stereo(out_path, audio, sr)
+        # always keep a WAV copy for detector re-scoring regardless of the
+        # chosen delivery format, since the scorer needs a file ffmpeg/
+        # librosa can decode and re-scoring must reflect the exact audio
+        # that was actually processed
+        scoring_wav_path = OUTPUT_DIR / f"{out_id}_score.wav"
+        save_stereo(scoring_wav_path, audio, sr)
+
+        resolved_format = resolve_output_format(output_format, path)
+        job_log(job_id, f"saving output file (format: {resolved_format})")
+        out_path = encode_final_output(audio, sr, resolved_format, OUTPUT_DIR / out_id)
 
         orig_path = OUTPUT_DIR / f"{out_id}_orig.wav"
         save_stereo(orig_path, original_audio, sr)
 
         job_log(job_id, "re-scoring with AI detectors")
-        scores_after = scorer.score(str(out_path))
+        scores_after = scorer.score(str(scoring_wav_path))
         scores_before = scorer.score(str(path))
         if not scores_after["passes_both"]:
             failing = []
@@ -366,10 +498,27 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None):
         tilt_before, freqs_b, psd_b = chain.spectral_tilt_report(original_audio, sr)
         tilt_after, freqs_a, psd_a = chain.spectral_tilt_report(audio, sr)
 
-        default_output_name = f"{Path(path.name).stem}_fixed.wav"
+        # the scoring WAV is redundant once re-scoring is done UNLESS the
+        # delivered format IS wav (in which case out_path == scoring_wav_path
+        # already covers it) - only remove the extra copy when they differ
+        if scoring_wav_path != out_path and scoring_wav_path.exists():
+            scoring_wav_path.unlink()
+
+        default_output_name = f"{Path(path.name).stem}_fixed{out_path.suffix}"
+        # the extension in output_name must always match what was ACTUALLY
+        # encoded, regardless of what the user typed (e.g. leaving the
+        # auto-filled "..._fixed.wav" in the field while choosing MP3 as the
+        # output format would otherwise download real MP3 bytes under a
+        # .wav name) - swap on whatever suffix is present, add one if absent.
+        final_output_name = output_name or default_output_name
+        if Path(final_output_name).suffix.lower() != out_path.suffix.lower():
+            final_output_name = f"{Path(final_output_name).stem}{out_path.suffix}"
+
         result = {
             "out_id": out_id,
-            "output_name": output_name or default_output_name,
+            "output_name": final_output_name,
+            "output_format": resolved_format,
+            "output_ext": out_path.suffix,
             "steps": steps,
             "scores_before": scores_before,
             "scores_after": scores_after,
@@ -405,6 +554,9 @@ def process(file_id):
     tools = body.get("tools", [])
     options = body.get("options", {})
     output_name = _safe_download_name(body.get("output_name"), None)
+    output_format = body.get("output_format", "same")
+    if output_format not in ("same", "wav", "mp3", "flac"):
+        return jsonify({"error": f"invalid output_format: {output_format!r} (expected same/wav/mp3/flac)"}), 400
 
     job_id = uuid.uuid4().hex
     with JOBS_LOCK:
@@ -413,7 +565,7 @@ def process(file_id):
             "current_step_idx": None, "total_steps": None, "current_step_name": None, "sub_progress": None,
         }
 
-    thread = threading.Thread(target=run_pipeline, args=(job_id, file_id, tools, options, output_name), daemon=True)
+    thread = threading.Thread(target=run_pipeline, args=(job_id, file_id, tools, options, output_name, output_format), daemon=True)
     thread.start()
 
     return jsonify({"job_id": job_id})
@@ -425,7 +577,7 @@ def job_status(job_id):
         job = JOBS.get(job_id)
         if job is None:
             return jsonify({"error": "unknown job_id"}), 404
-        return jsonify({
+        return safe_jsonify({
             "status": job["status"],
             "progress_msg": job.get("progress_msg", ""),
             "current_step_idx": job.get("current_step_idx"),
@@ -438,19 +590,32 @@ def job_status(job_id):
         })
 
 
-def _safe_download_name(name, fallback):
+def _safe_download_name(name, fallback, ext=".wav"):
     """Sanitize a user-supplied filename: strip any path components, keep
-    only a safe character set, ensure a .wav extension, and fall back to a
-    default if what's left is empty."""
+    only a safe character set, ensure it has SOME audio extension (defaults
+    to `ext` if none was given so a bare name still downloads correctly),
+    and fall back to a default if what's left is empty."""
     if not name:
         return fallback
     name = Path(name).name  # drop any directory components
     name = re.sub(r"[^A-Za-z0-9._ -]", "_", name).strip()
     if not name or name in (".", ".."):
         return fallback
-    if not name.lower().endswith(".wav"):
-        name = f"{name}.wav"
+    if Path(name).suffix.lower() not in (".wav", ".mp3", ".flac"):
+        name = f"{name}{ext}"
     return name
+
+
+def _find_output_path(file_id, suffix=""):
+    """Outputs can be .wav/.mp3/.flac depending on the output_format chosen
+    at process time - glob for whichever extension was actually written
+    instead of assuming .wav. file_id is validated the same way as
+    _find_upload_path, for the same reason (a glob metacharacter must never
+    be able to match an arbitrary file)."""
+    if not _FILE_ID_RE.match(file_id):
+        return None
+    matches = list(OUTPUT_DIR.glob(f"{file_id}{suffix}.*"))
+    return matches[0] if matches else None
 
 
 @app.route("/api/audio/<kind>/<file_id>")
@@ -459,18 +624,18 @@ def serve_audio(kind, file_id):
         path = _find_upload_path(file_id)
         default_name = path.name if path else "audio.wav"
     elif kind == "output":
-        path = OUTPUT_DIR / f"{file_id}.wav"
-        default_name = f"{file_id}_fixed.wav"
+        path = _find_output_path(file_id)
+        default_name = f"{file_id}_fixed{path.suffix if path else '.wav'}"
     elif kind == "output_orig":
-        path = OUTPUT_DIR / f"{file_id}_orig.wav"
-        default_name = f"{file_id}_original.wav"
+        path = _find_output_path(file_id, suffix="_orig")
+        default_name = f"{file_id}_original{path.suffix if path else '.wav'}"
     else:
         return jsonify({"error": "invalid kind"}), 400
 
     if path is None or not Path(path).exists():
         return jsonify({"error": "not found"}), 404
 
-    download_name = _safe_download_name(request.args.get("name"), default_name)
+    download_name = _safe_download_name(request.args.get("name"), default_name, ext=path.suffix)
     return send_from_directory(path.parent, path.name, as_attachment=True, download_name=download_name)
 
 
