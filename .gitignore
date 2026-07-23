@@ -1,0 +1,13 @@
+# Audio scratch/output files - these are large binary artifacts from
+# processing runs, not source. Keep them out of git; use audio_archive/
+# or thefixer/uploads|outputs/ on disk instead.
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.aac
+*.ogg
+*.aiff
+*.aif
+
+.DS_Store
