@@ -618,40 +618,40 @@ footer {
           <li>Review the analysis panel — detector scores, LUFS, stereo correlation, DC offset, silence, transients, and the spectrum plot.</li>
           <li>Pick which signal-chain tools to run in the right-hand panel. Recommended tools (based on the analysis) are badged; "Select recommended" picks them all at once.</li>
           <li>Optionally set an output filename before processing — it defaults to <code>&lt;original name&gt;_fixed.wav</code>.</li>
-          <li>Click "Process file." A live log and step-aware progress bar track exactly which step is running; the CNN fix step also shows its internal optimization step count, since that stage alone can take many minutes.</li>
-          <li>When done, review the before/after table, what-was-done log, and spectrum overlay, then A/B the original against the fixed file in the player. Download either one — filenames follow what you set.</li>
+          <li>Click "Process file." A live log and step-aware progress bar track exactly which step is running; the CNN fix step also shows its internal optimization step count, since that stage alone can take several minutes.</li>
+          <li>When done, review the before/after table, what-was-done log, and spectrum overlay, then A/B the original against the fixed file in the player. Download either one — filenames follow the name that was set.</li>
         </ol>
       </section>
 
       <section class="docs-section">
         <h2>The signal chain, in order</h2>
-        <p>The order matters and was tuned through direct testing, not chosen arbitrarily.</p>
+        <p>The processing order is deliberate.</p>
         <ol>
           <li><strong>Trim leading/trailing silence</strong> — true-digital-silence detection (threshold 0.0005 linear amplitude, 5ms safety pad).</li>
           <li><strong>DC offset correction</strong> — subtracts each channel's mean.</li>
-          <li><strong>Surgical transient/pop fix</strong> — detects genuine click/glitch artifacts (requires both a large sample-to-sample jump AND a spike far above a 200ms local RMS envelope, so it never fires on ordinary kick/snare hits) and applies a raised-cosine gain-reduction envelope (3ms attack, 60ms release). Target reduction is derived from the track's own recent loudness context, not a fixed value.</li>
+          <li><strong>Surgical transient/pop fix</strong> — detects genuine click/glitch artifacts (requires both a large sample-to-sample jump AND a spike far above a 200ms local RMS envelope, so ordinary kick/snare hits are never flagged) and applies a raised-cosine gain-reduction envelope (3ms attack, 60ms release). Target reduction is derived from the track's own recent loudness context, not a fixed value.</li>
           <li><strong>High-pass filter</strong> — 2nd-order Butterworth, zero-phase, 30Hz cutoff.</li>
           <li><strong>Stereo phase/correlation correction</strong> — blends mid/side if correlation is negative enough to risk mono-cancellation.</li>
           <li><strong>LUFS loudness normalization</strong> — targets -14 LUFS.</li>
           <li><strong>Multiband compression</strong> — gentle 3-band downward compression, ratio 1.3:1, threshold -12dB. See limitations below.</li>
           <li><strong>Linear-model AI-detector fix</strong> — gradient-based adversarial correction targeting the fakeprint/logistic-regression detector.</li>
           <li><strong>CNN-model AI-detector fix</strong> — whole-track joint gradient optimization targeting the CQT-cepstrum CNN detector across all overlapping 10-second analysis windows simultaneously.</li>
-          <li><strong>Post-chain linear re-verification</strong> (automatic, not a selectable tool) — if both AI fixes were selected, re-scores the linear model on the final post-chain audio and, if <code>cnn_fix</code> disturbed it back above target, re-runs <code>linear_fix</code> once more, verified.</li>
+          <li><strong>Post-chain linear re-verification</strong> (automatic, not a selectable tool) — if both AI fixes were selected, re-scores the linear model on the final post-chain audio and, if the CNN fix disturbed it back above target, re-runs the linear fix once more, verified.</li>
           <li><strong>True-peak limiter</strong> — brick-wall ceiling at -1dBTP, oversampled 4x to catch inter-sample peaks.</li>
         </ol>
-        <p><strong>Why AI-detector fixes run after mastering but before the limiter:</strong> any gain/EQ/dynamics change applied after an adversarial correction can perturb its exact spectral signature enough to undo it, even though the fix passed real-model verification immediately after it ran. Confirmed directly: a linear fix verified at &lt;1% scored 16% once <code>normalize_lufs</code>/<code>multiband_compress</code> ran on top of it in an earlier, wrongly-ordered version of the chain. The limiter is the one exception — it's a safety net against clipping, not a musical/spectral-shaping step, and it needs to see the truly final signal to actually guarantee the delivered file stays under its ceiling.</p>
-        <p><strong>Why there's an automatic re-verification pass:</strong> running <code>linear_fix</code> then <code>cnn_fix</code> can still let the CNN fix's broadband correction disturb the linear fix's precise correction, even in the correct order. Confirmed directly on a full 276.9s test track: a verified 1.56% became 9.65% once <code>cnn_fix</code> had also run. The re-verification pass catches and corrects this specific interaction automatically, but is not a complete fix for the underlying issue — see Roadmap.</p>
+        <p><strong>Why AI-detector fixes run after mastering but before the limiter:</strong> any gain/EQ/dynamics change applied after an adversarial correction can perturb its exact spectral signature enough to undo it, even if the fix passed real-model verification immediately after it ran. For example, a linear fix verified at under 1% can score much higher again once LUFS normalization or multiband compression runs on top of it. The limiter is the one exception — it's a safety net against clipping, not a musical/spectral-shaping step, and it needs to see the truly final signal to actually guarantee the delivered file stays under its ceiling.</p>
+        <p><strong>Why there's an automatic re-verification pass:</strong> running the linear fix followed by the CNN fix can still let the CNN fix's broadband correction disturb the linear fix's precise correction, even in the correct order. On a full-length test track, a verified 1.56% rose to 9.65% once the CNN fix had also run. The re-verification pass catches and corrects this specific interaction automatically, but is not a complete fix for the underlying issue — see Roadmap.</p>
       </section>
 
       <section class="docs-section">
         <h2>Multiband compressor: how it compares to a real one</h2>
         <p>The concept is standard mastering practice (split into bands, compress each independently to smooth tonal-balance imbalance without one broadband compressor squashing everything together) — real tools like iZotope Ozone, Waves C6, or FabFilter Pro-MB do exactly this. The implementation here is a simplified, conservative version, not a full-featured multiband compressor.</p>
-        <p><strong>What's NOT industry-standard / simplified compared to real tools:</strong></p>
+        <p><strong>What's missing or simplified compared to a real mastering-grade multiband:</strong></p>
         <ul>
-          <li><strong>No attack/release time constants.</strong> Real compressors have separate attack and release envelopes (how fast gain reduction engages vs. releases) — this implementation uses a single 20ms median-filter smoothing window as a stand-in for both, which is a crude approximation. A proper compressor would let you set attack ~5-30ms and release ~50-500ms independently per band.</li>
-          <li><strong>No knee.</strong> Real compressors have a "soft knee" — gain reduction ramps in gradually around the threshold rather than switching on hard. This one has a hard knee (<code>over = max(env_db - threshold_db, 0)</code>), which can sound more abrupt.</li>
-          <li><strong>No makeup gain.</strong> After compressing, real multibands typically let you add back gain to compensate for the loudness you just removed. This doesn't do that automatically.</li>
-          <li><strong>No lookahead.</strong> Can't anticipate a transient before it hits.</li>
+          <li><strong>No attack/release time constants.</strong> Real compressors have separate attack and release envelopes (how fast gain reduction engages vs. releases) — this implementation uses a single 20ms median-filter smoothing window as a stand-in for both, which is a crude approximation. A proper compressor would offer attack around 5-30ms and release around 50-500ms independently per band.</li>
+          <li><strong>No knee.</strong> Real compressors have a soft knee — gain reduction ramps in gradually around the threshold rather than switching on hard. This implementation has a hard knee, which can sound more abrupt.</li>
+          <li><strong>No makeup gain.</strong> After compressing, real multibands typically add gain back to compensate for the loudness that was removed. This doesn't happen automatically here.</li>
+          <li><strong>No lookahead.</strong> Cannot anticipate a transient before it hits.</li>
           <li><strong>Filter crossover isn't phase-aligned/Linkwitz-Riley.</strong> Splitting into bands with plain Butterworth low/high/bandpass filters (rather than a proper Linkwitz-Riley crossover) can introduce small phase-cancellation artifacts when the bands are summed back together — professional multiband tools use LR crossovers specifically to avoid this.</li>
         </ul>
       </section>
@@ -662,8 +662,8 @@ footer {
           <li><strong>Attack/release-aware dynamics</strong> (as above) — the biggest gap.</li>
           <li><strong>Stereo widening/imaging tools</strong> beyond the basic phase-correlation fix (mid/side EQ, stereo width control).</li>
           <li><strong>De-essing</strong> (sibilance control) — not applicable to most full mixes but standard on vocal-heavy masters.</li>
-          <li><strong>Harmonic exciter/saturation</strong> — common "analog warmth" step in commercial mastering, not present here.</li>
-          <li><strong>Dithering</strong> — you explicitly told me to skip this earlier in the project, so its absence is intentional, not an oversight.</li>
+          <li><strong>Harmonic exciter/saturation</strong> — a common "analog warmth" step in commercial mastering, not present here.</li>
+          <li><strong>Dithering</strong> — out of scope for this version.</li>
           <li><strong>Reference-track matching</strong> (matching tonal curve/loudness to a target reference song) — a common modern mastering workflow, not implemented.</li>
           <li><strong>Metering/monitoring for mono-fold-down beyond the correlation check</strong> — no LRA (loudness range) metering, no true-peak metering displayed pre-limiting.</li>
         </ul>
@@ -671,17 +671,17 @@ footer {
 
       <section class="docs-section">
         <h2>Verification discipline</h2>
-        <p>Every AI-detector fix is checked against the REAL (non-differentiable, exact librosa+ONNX pipeline) model, not just the differentiable PyTorch surrogate used during gradient optimization — the surrogate has been observed to diverge sharply from the real model specifically after optimization, even when it matches near-perfectly on unperturbed audio. Verification happens during optimization (periodic real-score checks with extra optimization weight for windows that disagree), after the resample/stereo transfer (a second, independent point where a verified-good result can still degrade), after the full chain (final linear re-check with automatic retry), and in the final job result (scores always reflect the real model on the actual saved output, never a self-reported mid-pipeline claim). A fix is only ever reported as applied after the real model has confirmed it on the actual delivered audio.</p>
+        <p>Every AI-detector fix is checked against the real (non-differentiable, exact librosa+ONNX pipeline) model, not just the differentiable PyTorch surrogate used during gradient optimization — the surrogate can diverge from the real model specifically after optimization, even when it matches near-perfectly on unperturbed audio. Verification happens during optimization (periodic real-score checks with extra optimization weight for windows that disagree), after the resample/stereo transfer (a second, independent point where a verified-good result can still degrade), after the full chain (final linear re-check with automatic retry), and in the final job result (scores always reflect the real model on the actual saved output, never a self-reported mid-pipeline claim). A fix is only ever reported as applied once the real model has confirmed it on the actual delivered audio.</p>
       </section>
 
       <section class="docs-section">
         <h2>Roadmap</h2>
         <p><strong>Fix-interaction correctness (highest priority):</strong></p>
         <ul>
-          <li>The cnn_fix-disturbs-linear_fix interaction has a targeted one-shot patch (automatic linear re-verification/retry after the full chain), but the root cause — two independent adversarial corrections sharing the same audio without a joint objective — is unsolved.</li>
-          <li>The CNN whole-track optimizer does not always converge on every overlapping analysis window on long tracks — on one full-track test, 5 of 108 windows plateaued around 93-96% AI probability despite full-budget optimization. Surfaced honestly via <code>worst_score_after_transfer</code>/<code>verified_after_transfer</code>, never hidden.</li>
+          <li>The interaction where the CNN fix can disturb the linear fix has a targeted one-shot patch (automatic linear re-verification/retry after the full chain), but the root cause — two independent adversarial corrections sharing the same audio without a joint objective — is unsolved.</li>
+          <li>The CNN whole-track optimizer does not always converge on every overlapping analysis window on long tracks — on one full-track test, 5 of 108 windows plateaued around 93-96% AI probability despite full-budget optimization. This is surfaced in the result (via <code>worst_score_after_transfer</code>/<code>verified_after_transfer</code>) rather than hidden.</li>
         </ul>
-        <p><strong>Mastering-chain gaps:</strong> attack/release-aware dynamics, stereo widening/imaging, de-essing, harmonic exciter/saturation, dithering (intentionally excluded), reference-track matching, fuller metering, multiband compressor improvements (attack/release, soft knee, makeup gain, lookahead, Linkwitz-Riley crossovers).</p>
+        <p><strong>Mastering-chain gaps:</strong> attack/release-aware dynamics, stereo widening/imaging, de-essing, harmonic exciter/saturation, dithering (out of scope), reference-track matching, fuller metering, multiband compressor improvements (attack/release, soft knee, makeup gain, lookahead, Linkwitz-Riley crossovers).</p>
         <p><strong>App/UX gaps:</strong> no undo/versioning across runs, no persistence across server restarts, single-file/single-job workflow only, no authentication/multi-user support (local single-user tool by design).</p>
       </section>
 
