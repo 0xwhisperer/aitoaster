@@ -1,0 +1,527 @@
+<!doctype html>
+<title>The Fixer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+:root {
+  --bg: #14161a;
+  --panel: #1c1f26;
+  --panel-raised: #232732;
+  --rack-line: #2b303b;
+  --text: #e8eaed;
+  --text-dim: #8b91a0;
+  --text-faint: #565c6b;
+  --accent: #5ec9a8;
+  --accent-dim: #3d8a72;
+  --accent-glow: rgba(94, 201, 168, 0.25);
+  --warn: #e8a33d;
+  --crit: #e0544f;
+  --good: #5ec9a8;
+  --input-bg: #101215;
+  --focus: #7fd9ba;
+}
+:root[data-theme="light"] {
+  --bg: #eef0f2;
+  --panel: #ffffff;
+  --panel-raised: #f7f8fa;
+  --rack-line: #dadfe5;
+  --text: #191c20;
+  --text-dim: #565f6b;
+  --text-faint: #9099a4;
+  --accent: #1f8f6f;
+  --accent-dim: #16694f;
+  --accent-glow: rgba(31, 143, 111, 0.15);
+  --warn: #b3711a;
+  --crit: #c23c37;
+  --good: #1f8f6f;
+  --input-bg: #ffffff;
+  --focus: #16694f;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #eef0f2;
+    --panel: #ffffff;
+    --panel-raised: #f7f8fa;
+    --rack-line: #dadfe5;
+    --text: #191c20;
+    --text-dim: #565f6b;
+    --text-faint: #9099a4;
+    --accent: #1f8f6f;
+    --accent-dim: #16694f;
+    --accent-glow: rgba(31, 143, 111, 0.15);
+    --warn: #b3711a;
+    --crit: #c23c37;
+    --good: #1f8f6f;
+    --input-bg: #ffffff;
+    --focus: #16694f;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, "Inter", "Segoe UI", sans-serif;
+  overflow-x: hidden;
+}
+body { min-height: 100vh; }
+
+.mono {
+  font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Header / transport strip ---------- */
+header {
+  display: flex; align-items: center; gap: 20px;
+  padding: 14px 24px;
+  background: linear-gradient(180deg, var(--panel-raised), var(--panel));
+  border-bottom: 1px solid var(--rack-line);
+  position: sticky; top: 0; z-index: 50;
+}
+.brand {
+  display: flex; align-items: baseline; gap: 8px;
+  font-family: "Helvetica Neue", Arial, sans-serif;
+  font-weight: 800;
+  font-size: 19px;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+}
+.brand .the { font-weight: 400; color: var(--text-dim); font-size: 14px; letter-spacing: 0.02em; }
+.brand .mark { color: var(--accent); }
+.tagline {
+  font-size: 11px; color: var(--text-faint);
+  letter-spacing: 0.08em; text-transform: uppercase;
+  border-left: 1px solid var(--rack-line);
+  padding-left: 20px;
+  display: none;
+}
+@media (min-width: 760px) { .tagline { display: block; } }
+
+.spacer { flex: 1; }
+
+.theme-toggle {
+  width: 34px; height: 34px; border-radius: 8px;
+  border: 1px solid var(--rack-line); background: var(--panel-raised);
+  color: var(--text-dim); cursor: pointer; font-size: 15px;
+  display: flex; align-items: center; justify-content: center;
+}
+.theme-toggle:hover { color: var(--accent); border-color: var(--accent-dim); }
+
+/* ---------- Layout ---------- */
+.app {
+  max-width: 1400px; margin: 0 auto;
+  padding: 24px;
+  display: flex; flex-direction: column; gap: 20px;
+}
+
+.upload-zone {
+  border: 1.5px dashed var(--rack-line);
+  border-radius: 12px;
+  background: var(--panel);
+  padding: 36px 24px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color .15s, background .15s;
+}
+.upload-zone:hover, .upload-zone.dragover {
+  border-color: var(--accent);
+  background: var(--panel-raised);
+}
+.upload-zone .icon { font-size: 28px; margin-bottom: 8px; opacity: .7; }
+.upload-zone .primary { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+.upload-zone .secondary { font-size: 12.5px; color: var(--text-faint); }
+.upload-zone input { display: none; }
+
+.workspace { display: none; flex-direction: column; gap: 20px; }
+.workspace.active { display: flex; }
+
+.file-strip {
+  display: flex; align-items: center; gap: 14px;
+  background: var(--panel); border: 1px solid var(--rack-line);
+  border-radius: 10px; padding: 12px 16px;
+  font-size: 13px;
+}
+.file-strip .name { font-weight: 600; }
+.file-strip .meta { color: var(--text-faint); font-size: 12px; }
+.file-strip button.new-file {
+  margin-left: auto;
+  background: transparent; border: 1px solid var(--rack-line);
+  color: var(--text-dim); border-radius: 7px; padding: 6px 12px;
+  font-size: 12px; cursor: pointer;
+}
+.file-strip button.new-file:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ---------- Grid: analysis (left) + tool chain (right) ---------- */
+.grid {
+  display: grid;
+  grid-template-columns: 1.15fr 0.85fr;
+  gap: 20px;
+  align-items: start;
+}
+@media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--rack-line);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.panel-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--rack-line);
+  background: var(--panel-raised);
+}
+.panel-head .title {
+  font-size: 11.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--text-dim);
+}
+.panel-body { padding: 16px; }
+
+/* ---------- Score meters ---------- */
+.score-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+.score-card {
+  background: var(--panel-raised);
+  border: 1px solid var(--rack-line);
+  border-radius: 10px;
+  padding: 14px;
+}
+.score-card .label { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--text-faint); margin-bottom: 8px; }
+.score-card .value { font-size: 30px; font-weight: 700; line-height: 1; margin-bottom: 8px; }
+.score-card .value.good { color: var(--good); }
+.score-card .value.warn { color: var(--warn); }
+.score-card .value.crit { color: var(--crit); }
+.meter-track {
+  height: 6px; border-radius: 3px; background: var(--input-bg);
+  overflow: hidden; border: 1px solid var(--rack-line);
+}
+.meter-fill { height: 100%; border-radius: 3px; transition: width .4s ease; }
+.meter-fill.good { background: var(--good); }
+.meter-fill.warn { background: var(--warn); }
+.meter-fill.crit { background: var(--crit); }
+.pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 100px;
+  margin-top: 8px;
+}
+.pill.good { background: var(--accent-glow); color: var(--good); }
+.pill.crit { background: rgba(224,84,79,0.15); color: var(--crit); }
+.pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+.stat-list { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 4px; }
+.stat {
+  background: var(--panel-raised); border: 1px solid var(--rack-line);
+  border-radius: 8px; padding: 10px 12px;
+}
+.stat .k { font-size: 10.5px; color: var(--text-faint); text-transform: uppercase; letter-spacing: .05em; }
+.stat .v { font-size: 15px; font-weight: 600; margin-top: 2px; }
+.stat .v.flag { color: var(--warn); }
+
+/* ---------- spectrum canvas ---------- */
+.spectrum-wrap { margin-top: 14px; }
+.spectrum-wrap .caption {
+  font-size: 11px; color: var(--text-faint); margin-bottom: 6px;
+  display: flex; justify-content: space-between;
+}
+canvas#spectrumCanvas {
+  width: 100%; height: 140px; display: block;
+  background: var(--input-bg); border-radius: 8px; border: 1px solid var(--rack-line);
+}
+
+/* ---------- Tool chain list ---------- */
+.chain-list { display: flex; flex-direction: column; gap: 8px; }
+.tool-row {
+  display: flex; align-items: flex-start; gap: 12px;
+  background: var(--panel-raised);
+  border: 1px solid var(--rack-line);
+  border-radius: 9px;
+  padding: 11px 13px;
+  cursor: pointer;
+  transition: border-color .12s, background .12s;
+}
+.tool-row:hover { border-color: var(--accent-dim); }
+.tool-row.checked { border-color: var(--accent); background: var(--accent-glow); }
+.tool-row .box {
+  width: 18px; height: 18px; border-radius: 5px;
+  border: 1.5px solid var(--text-faint);
+  flex: none; margin-top: 1px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; color: var(--bg);
+}
+.tool-row.checked .box { background: var(--accent); border-color: var(--accent); }
+.tool-row .box::after { content: ""; }
+.tool-row.checked .box::after { content: "✓"; }
+.tool-row .info { flex: 1; min-width: 0; }
+.tool-row .name { font-size: 13.5px; font-weight: 600; }
+.tool-row .desc { font-size: 11.5px; color: var(--text-dim); margin-top: 2px; line-height: 1.4; }
+.tool-row .rec-badge {
+  font-size: 9.5px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+  color: var(--accent); border: 1px solid var(--accent-dim); border-radius: 5px;
+  padding: 1px 6px; margin-left: 8px; white-space: nowrap;
+}
+.tool-row.disabled { opacity: .45; cursor: not-allowed; }
+
+.chain-group-label {
+  font-size: 10.5px; color: var(--text-faint); text-transform: uppercase; letter-spacing: .08em;
+  margin: 10px 0 2px; padding-left: 2px;
+}
+.chain-group-label:first-child { margin-top: 0; }
+
+.run-bar { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-top: 1px solid var(--rack-line); }
+.btn {
+  border: none; border-radius: 8px; padding: 10px 20px;
+  font-size: 13.5px; font-weight: 700; cursor: pointer;
+  background: var(--accent); color: #0c1210;
+  transition: filter .12s, transform .06s;
+}
+.btn:hover { filter: brightness(1.08); }
+.btn:active { transform: scale(0.98); }
+.btn:disabled { opacity: .4; cursor: not-allowed; }
+.btn.secondary { background: transparent; border: 1px solid var(--rack-line); color: var(--text); }
+.btn.secondary:hover { border-color: var(--accent); color: var(--accent); }
+.run-count { font-size: 12px; color: var(--text-faint); margin-left: auto; }
+
+/* ---------- Progress ---------- */
+.progress-panel { display: none; }
+.progress-panel.active { display: block; }
+.progress-bar-track {
+  height: 8px; border-radius: 4px; background: var(--input-bg);
+  border: 1px solid var(--rack-line); overflow: hidden; margin-bottom: 12px;
+}
+.progress-bar-fill {
+  height: 100%; background: linear-gradient(90deg, var(--accent-dim), var(--accent));
+  width: 8%; transition: width .5s ease;
+  background-size: 200% 100%;
+  animation: barpulse 1.6s linear infinite;
+}
+@keyframes barpulse { 0% { background-position: 0% 0; } 100% { background-position: -200% 0; } }
+.log-box {
+  background: var(--input-bg); border: 1px solid var(--rack-line); border-radius: 8px;
+  padding: 10px 12px; height: 160px; overflow-y: auto;
+  font-size: 11.5px; line-height: 1.6; color: var(--text-dim);
+}
+.log-box .line { white-space: pre-wrap; word-break: break-word; }
+.log-box .line.err { color: var(--crit); }
+
+/* ---------- Results ---------- */
+.results { display: none; flex-direction: column; gap: 20px; }
+.results.active { display: flex; }
+
+.verdict-banner {
+  border-radius: 12px; padding: 18px 20px;
+  display: flex; align-items: center; gap: 16px;
+  border: 1px solid var(--rack-line);
+}
+.verdict-banner.pass { background: var(--accent-glow); border-color: var(--accent-dim); }
+.verdict-banner.fail { background: rgba(224,84,79,0.12); border-color: var(--crit); }
+.verdict-banner .icon { font-size: 26px; }
+.verdict-banner .title { font-size: 15.5px; font-weight: 700; }
+.verdict-banner .sub { font-size: 12.5px; color: var(--text-dim); margin-top: 2px; }
+
+.compare-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.compare-table th {
+  text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--text-faint); font-weight: 600; padding: 8px 12px; border-bottom: 1px solid var(--rack-line);
+}
+.compare-table td { padding: 10px 12px; border-bottom: 1px solid var(--rack-line); }
+.compare-table tr:last-child td { border-bottom: none; }
+.compare-table td.good { color: var(--good); font-weight: 600; }
+.compare-table td.crit { color: var(--crit); font-weight: 600; }
+.table-wrap { overflow-x: auto; }
+
+.steps-list { display: flex; flex-direction: column; gap: 6px; }
+.step-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 12px; background: var(--panel-raised); border-radius: 8px;
+  border: 1px solid var(--rack-line); font-size: 12.5px;
+}
+.step-item .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
+.step-item .txt { flex: 1; }
+.step-item .time { color: var(--text-faint); font-size: 11px; }
+
+/* ---------- A/B player ---------- */
+.ab-player {
+  display: flex; flex-direction: column; gap: 14px;
+}
+.ab-switch {
+  display: flex; background: var(--input-bg); border: 1px solid var(--rack-line);
+  border-radius: 100px; padding: 4px; width: fit-content; margin: 0 auto;
+}
+.ab-switch button {
+  border: none; background: transparent; color: var(--text-dim);
+  font-size: 13px; font-weight: 700; padding: 8px 22px; border-radius: 100px;
+  cursor: pointer; letter-spacing: .03em;
+}
+.ab-switch button.active { background: var(--accent); color: #0c1210; }
+.transport {
+  display: flex; align-items: center; gap: 12px;
+}
+.transport button.play {
+  width: 44px; height: 44px; border-radius: 50%; border: none;
+  background: var(--accent); color: #0c1210; font-size: 15px; cursor: pointer;
+  flex: none; display: flex; align-items: center; justify-content: center;
+}
+.timeline {
+  flex: 1; height: 34px; position: relative; cursor: pointer;
+  background: var(--input-bg); border: 1px solid var(--rack-line); border-radius: 8px;
+  overflow: hidden;
+}
+canvas#waveCanvas { width: 100%; height: 100%; display: block; }
+.playhead {
+  position: absolute; top: 0; bottom: 0; width: 2px; background: var(--accent);
+  box-shadow: 0 0 6px var(--accent-glow); pointer-events: none;
+}
+.time-label { font-size: 11.5px; color: var(--text-faint); width: 42px; text-align: center; flex: none; }
+
+.download-row { display: flex; gap: 10px; justify-content: flex-end; }
+
+.hidden { display: none !important; }
+
+footer {
+  text-align: center; padding: 30px 16px 50px;
+  font-size: 11px; color: var(--text-faint);
+}
+</style>
+
+<header>
+  <div class="brand"><span class="the">the</span><span class="mark">FIXER</span></div>
+  <div class="tagline">Mastering &amp; AI-detector verification console</div>
+  <div class="spacer"></div>
+  <button class="theme-toggle" id="themeToggle" title="Toggle theme">◐</button>
+</header>
+
+<div class="app">
+
+  <div class="upload-zone" id="uploadZone">
+    <div class="icon">⏏</div>
+    <div class="primary">Drop an audio file, or click to browse</div>
+    <div class="secondary">WAV, MP3, FLAC — analyzed instantly against both AI-detector models</div>
+    <input type="file" id="fileInput" accept="audio/*" />
+  </div>
+
+  <div class="workspace" id="workspace">
+
+    <div class="file-strip">
+      <div>
+        <div class="name" id="fileName">—</div>
+        <div class="meta mono" id="fileMeta">—</div>
+      </div>
+      <button class="new-file" id="newFileBtn">Analyze a different file</button>
+    </div>
+
+    <div class="grid">
+      <!-- LEFT: analysis -->
+      <div class="panel">
+        <div class="panel-head"><span class="title">Detector Analysis</span></div>
+        <div class="panel-body">
+          <div class="score-row">
+            <div class="score-card">
+              <div class="label">Linear model</div>
+              <div class="value mono" id="linearScore">—</div>
+              <div class="meter-track"><div class="meter-fill" id="linearMeter" style="width:0%"></div></div>
+              <div id="linearPill"></div>
+            </div>
+            <div class="score-card">
+              <div class="label">CNN model</div>
+              <div class="value mono" id="cnnScore">—</div>
+              <div class="meter-track"><div class="meter-fill" id="cnnMeter" style="width:0%"></div></div>
+              <div id="cnnPill"></div>
+            </div>
+          </div>
+
+          <div class="stat-list" id="statList"></div>
+
+          <div class="spectrum-wrap">
+            <div class="caption"><span>Spectrum (avg. power)</span><span>20Hz&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;20kHz</span></div>
+            <canvas id="spectrumCanvas" width="700" height="140"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- RIGHT: tool chain -->
+      <div class="panel">
+        <div class="panel-head"><span class="title">Signal Chain</span></div>
+        <div class="panel-body">
+          <div class="chain-group-label">Cleanup</div>
+          <div class="chain-list" id="chainGroupCleanup"></div>
+
+          <div class="chain-group-label">AI-detector fixes</div>
+          <div class="chain-list" id="chainGroupAI"></div>
+
+          <div class="chain-group-label">Mastering</div>
+          <div class="chain-list" id="chainGroupMaster"></div>
+        </div>
+        <div class="run-bar">
+          <button class="btn" id="runBtn">Process file</button>
+          <button class="btn secondary" id="selectRecBtn">Select recommended</button>
+          <span class="run-count mono" id="runCount">0 selected</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel progress-panel" id="progressPanel">
+      <div class="panel-head"><span class="title">Processing</span></div>
+      <div class="panel-body">
+        <div class="progress-bar-track"><div class="progress-bar-fill" id="progressFill"></div></div>
+        <div class="log-box mono" id="logBox"></div>
+      </div>
+    </div>
+
+    <div class="results" id="results">
+
+      <div class="verdict-banner" id="verdictBanner">
+        <div class="icon" id="verdictIcon">—</div>
+        <div>
+          <div class="title" id="verdictTitle">—</div>
+          <div class="sub" id="verdictSub">—</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><span class="title">Before / After</span></div>
+        <div class="panel-body table-wrap">
+          <table class="compare-table mono" id="compareTable"></table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><span class="title">What was done</span></div>
+        <div class="panel-body">
+          <div class="steps-list" id="stepsList"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><span class="title">A/B Listen</span></div>
+        <div class="panel-body ab-player">
+          <div class="ab-switch">
+            <button id="abOriginal" class="active">A · Original</button>
+            <button id="abFixed">B · Fixed</button>
+          </div>
+          <div class="transport">
+            <button class="play" id="playBtn">▶</button>
+            <span class="time-label mono" id="timeCur">0:00</span>
+            <div class="timeline" id="timeline">
+              <canvas id="waveCanvas" width="900" height="34"></canvas>
+              <div class="playhead" id="playhead" style="left:0%"></div>
+            </div>
+            <span class="time-label mono" id="timeTotal">0:00</span>
+          </div>
+          <div class="download-row">
+            <button class="btn secondary" id="downloadOrig">Download original</button>
+            <button class="btn" id="downloadFixed">Download fixed file</button>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+  </div>
+</div>
+
+<footer>The Fixer — local mastering &amp; AI-detector verification console</footer>
+
+<audio id="audioEl" preload="auto"></audio>
+
+<script src="/static/app.js"></script>
