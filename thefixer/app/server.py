@@ -273,10 +273,13 @@ def analyze(file_id):
         if isinstance(v, str) and any(kw in v.lower() for kw in PROVENANCE_KEYWORDS)
     }
     has_embedded_images = any(s["is_attached_image"] for s in metadata["streams"])
+    has_rolloff, rolloff_cutoff_hz, rolloff_deficit_db = chain.detect_spectral_rolloff(audio, 44100)
 
     recommendations = []
     if metadata["format"] or any(s["tags"] for s in metadata["streams"]) or has_embedded_images:
         recommendations.append("strip_metadata")
+    if has_rolloff:
+        recommendations.append("spectral_revive")
     if scores["linear"]["probability"] >= 0.01:
         recommendations.append("linear_fix")
     if scores["cnn"]["probability"] >= 0.5:
@@ -308,6 +311,7 @@ def analyze(file_id):
         "metadata": metadata,
         "provenance_tags_found": provenance_hits,
         "has_embedded_images": has_embedded_images,
+        "spectral_rolloff": {"detected": has_rolloff, "cutoff_hz": rolloff_cutoff_hz, "deficit_db": round(rolloff_deficit_db, 1)},
         "recommended_tools": recommendations,
         "passes_both": scores["passes_both"],
     })
@@ -331,7 +335,8 @@ def analyze(file_id):
 # that's a blunt sample-peak scale-down, not an inter-sample-peak-aware
 # limiter, so true_peak_limit still belongs after them as the real final stage.
 TOOL_ORDER = [
-    "strip_metadata", "trim_silence", "dc_offset", "fix_transients", "high_pass",
+    "strip_metadata", "trim_silence", "dc_offset", "fix_transients",
+    "spectral_revive", "high_pass",
     "fix_phase", "normalize_lufs", "multiband_compress",
     "linear_fix", "cnn_fix",
     "true_peak_limit",
@@ -342,6 +347,7 @@ TOOL_LABELS = {
     "trim_silence": "Trim leading/trailing silence",
     "dc_offset": "DC offset correction",
     "fix_transients": "Surgical transient/pop limiting",
+    "spectral_revive": "High-frequency spectral fill-in (17kHz+)",
     "high_pass": "High-pass filter (rumble removal)",
     "linear_fix": "AI-detector fix: linear model",
     "cnn_fix": "AI-detector fix: CNN model",
@@ -411,6 +417,8 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                     audio, tinfo = chain.fix_transient(audio, sr, t["time_sec"],
                                                          target_peak=options.get("transient_target_peak"))
                     info["details"].append(tinfo)
+            elif tool == "spectral_revive":
+                audio, info = chain.spectral_revive(audio, sr, cutoff_hz=options.get("spectral_revive_cutoff_hz"))
             elif tool == "high_pass":
                 audio, info = chain.high_pass_filter(audio, sr, cutoff_hz=options.get("high_pass_hz", 30))
             elif tool == "linear_fix":

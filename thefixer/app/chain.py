@@ -299,6 +299,234 @@ def true_peak_limit(audio, sr, ceiling_db=-1.0, oversample=4):
     }
 
 
+def detect_spectral_rolloff(audio, sr, cutoff_hz=17000.0):
+    """Check whether a track has a hard high-frequency rolloff (a common
+    artifact of lossy encoding, low-quality AI generation, or resampling
+    from a lower source rate) starting around cutoff_hz - measured as a
+    steep drop in average spectral energy right at that frequency compared
+    to what the track's own lower-frequency rolloff slope would predict.
+    Returns (has_rolloff: bool, detected_cutoff_hz: float or None,
+    deficit_db: float) so callers can decide whether spectral_revive is
+    worth running, rather than always applying it regardless of whether
+    the file actually needs it."""
+    mono = audio.mean(axis=1)
+    win = 32768
+    if len(mono) < win * 2:
+        return False, None, 0.0
+    window = np.hanning(win)
+    freqs = np.fft.rfftfreq(win, 1 / sr)
+    mags = []
+    for start in range(0, len(mono) - win, win // 4):
+        seg = mono[start:start + win] * window
+        mags.append(np.abs(np.fft.rfft(seg)))
+    avg_spec = np.array(mags).mean(axis=0)
+    avg_db = 20 * np.log10(avg_spec + 1e-12)
+    norm_db = avg_db - avg_db.max()
+
+    nyquist = sr / 2
+    if cutoff_hz >= nyquist - 500:
+        return False, None, 0.0
+
+    fit_lo, fit_hi = 3000.0, cutoff_hz - 500.0
+    fit_mask = (freqs >= fit_lo) & (freqs <= fit_hi)
+    if fit_mask.sum() < 10:
+        return False, None, 0.0
+    slope, intercept = np.polyfit(np.log2(freqs[fit_mask]), norm_db[fit_mask], 1)
+
+    predicted_db = slope * np.log2(cutoff_hz + 1000) + intercept
+    actual_mask = (freqs >= cutoff_hz + 500) & (freqs <= cutoff_hz + 1500)
+    if actual_mask.sum() < 2:
+        return False, None, 0.0
+    actual_db = norm_db[actual_mask].mean()
+
+    deficit_db = predicted_db - actual_db
+    # a real, natural rolloff still loses SOME energy at the top - only flag
+    # this as an artificial cutoff worth reviving if the actual level is
+    # substantially below what the track's own established slope predicts
+    has_rolloff = deficit_db > 6.0
+    return has_rolloff, (cutoff_hz if has_rolloff else None), float(max(0, deficit_db))
+
+
+def spectral_revive(audio, sr, cutoff_hz=None, seed=42):
+    """Fill in high-frequency content above a hard rolloff (commonly left by
+    lossy encoding, low-quality AI generation, or resampling from a lower
+    source rate) using ONLY this track's own spectral characteristics - no
+    external reference file or fixed target curve is used anywhere:
+
+    1. Fits this track's OWN rolloff slope (dB/octave) in the region just
+       below the cutoff, then extrapolates that same line past it. Natural
+       spectral decay is close to linear in log-frequency space, so this
+       gives a physically plausible target level derived entirely from the
+       file's own measured characteristics.
+    2. Projects harmonics from each frame's own detected spectral peaks
+       upward past the cutoff (a harmonic at 2x/3x/4x... the fundamental
+       decays by a fixed dB/octave rate) rather than adding disconnected
+       synthetic content.
+    3. Adds broadband texture at the self-derived target level, modulated
+       frame-by-frame by this track's OWN dynamics (how bright this exact
+       moment is relative to the track's own average brightness) so the
+       fill breathes with the music instead of being a static hiss.
+
+    Returns (audio, info) with the fitted rolloff slope and the frequency
+    range extended, for the "what was done" report."""
+    if cutoff_hz is None:
+        has_rolloff, detected_cutoff, deficit_db = detect_spectral_rolloff(audio, sr)
+        if not has_rolloff:
+            return audio, {"applied": False, "reason": "no artificial high-frequency rolloff detected"}
+        cutoff_hz = detected_cutoff
+    else:
+        deficit_db = None
+
+    n_total = len(audio)
+    WIN = 4096
+    HOP = WIN // 4
+    window = np.hanning(WIN)
+    freqs = np.fft.rfftfreq(WIN, 1 / sr)
+    n_frames = (n_total - WIN) // HOP
+    if n_frames < 4:
+        return audio, {"applied": False, "reason": "track too short for spectral revival"}
+
+    rng = np.random.default_rng(seed)
+
+    # self-referential target level: fit this track's own rolloff slope
+    # below the cutoff and extrapolate it past the cutoff
+    ANALYSIS_WIN = 32768
+    _win = np.hanning(ANALYSIS_WIN)
+    _freqs_hi = np.fft.rfftfreq(ANALYSIS_WIN, 1 / sr)
+    mono = audio.mean(axis=1)
+    _mags = []
+    for start in range(0, len(mono) - ANALYSIS_WIN, ANALYSIS_WIN // 4):
+        seg = mono[start:start + ANALYSIS_WIN] * _win
+        _mags.append(np.abs(np.fft.rfft(seg)))
+    _avg_spec = np.array(_mags).mean(axis=0)
+    _avg_db = 20 * np.log10(_avg_spec + 1e-12)
+    _norm_db = _avg_db - _avg_db.max()
+
+    fit_lo, fit_hi = 3000.0, cutoff_hz - 500.0
+    fit_mask = (_freqs_hi >= fit_lo) & (_freqs_hi <= fit_hi)
+    slope, intercept = np.polyfit(np.log2(_freqs_hi[fit_mask]), _norm_db[fit_mask], 1)
+
+    def target_curve_db(f):
+        # guard against log2(0) at the DC bin - target_db_at_freqs is only
+        # ever read at extend_mask positions (near/above the cutoff, always
+        # far from 0), so this value is never actually used, but computing
+        # it unguarded still raises a divide-by-zero warning on the full
+        # freqs array (which starts at 0 from np.fft.rfftfreq).
+        f_safe = np.maximum(f, 1.0)
+        return slope * np.log2(f_safe) + intercept
+
+    target_db_at_freqs = target_curve_db(freqs)
+
+    # small irregular texture (formant-like bumps) riding on top of the
+    # self-derived target level, not replacing it
+    range_lo, range_hi = cutoff_hz - 300, min(22050, sr / 2)
+    bump_spacing = 600.0
+    n_bumps = max(1, int((range_hi - range_lo) / bump_spacing) + 1)
+    bump_centers = np.linspace(range_lo, range_hi, n_bumps)
+    bump_freqs = bump_centers + rng.uniform(-150, 150, n_bumps)
+    bump_widths = rng.uniform(350, 500, n_bumps)
+    bump_gains_db = rng.uniform(-2, 2, n_bumps)
+
+    def resonance_shape(f):
+        shape = np.zeros_like(f, dtype=np.float64)
+        for bf, bw, bg in zip(bump_freqs, bump_widths, bump_gains_db):
+            shape += bg * np.exp(-0.5 * ((f - bf) / bw) ** 2)
+        return shape
+
+    res_shape_db = resonance_shape(freqs)
+    extend_mask = freqs >= (cutoff_hz - 500)
+    n_extend_bins = int(extend_mask.sum())
+    if n_extend_bins == 0:
+        return audio, {"applied": False, "reason": "cutoff too close to Nyquist to extend"}
+
+    src_lo, src_hi = cutoff_hz * 0.35, cutoff_hz * 0.75
+    src_mask = (freqs >= src_lo) & (freqs <= src_hi)
+    ref_frame_energy = np.sqrt(np.mean(_avg_spec[(_freqs_hi >= src_lo) & (_freqs_hi <= src_hi)] ** 2))
+    target_mag_at_freqs = (10 ** (target_db_at_freqs / 20)) * _avg_spec.max()
+
+    out = np.zeros_like(audio)
+    ola_norm = np.zeros(n_total)
+
+    for ch in range(audio.shape[1]):
+        sig = audio[:, ch]
+        for i in range(n_frames):
+            start = i * HOP
+            seg = sig[start:start + WIN] * window
+            spec = np.fft.rfft(seg)
+            mag = np.abs(spec)
+            phase = np.angle(spec)
+
+            if src_mask.sum() < 4:
+                out[start:start + WIN, ch] += seg * window
+                if ch == 0:
+                    ola_norm[start:start + WIN] += window ** 2
+                continue
+
+            src_freqs = freqs[src_mask]
+            src_mag = mag[src_mask]
+            src_phase = phase[src_mask]
+
+            frame_energy = np.sqrt(np.mean(src_mag ** 2))
+            dynamics_mult = frame_energy / (ref_frame_energy + 1e-12)
+
+            peak_idx = []
+            for k in range(1, len(src_mag) - 1):
+                if src_mag[k] > src_mag[k - 1] and src_mag[k] > src_mag[k + 1] and src_mag[k] > np.median(src_mag) * 1.5:
+                    peak_idx.append(k)
+
+            new_spec = spec.copy()
+
+            # harmonic projection from this frame's own detected peaks
+            for k in peak_idx:
+                f0 = src_freqs[k]
+                a0 = src_mag[k]
+                p0 = src_phase[k]
+                h = 2
+                while f0 * h < min(22050, sr / 2) and h < 8:
+                    target_f = f0 * h
+                    if target_f >= cutoff_hz - 500:
+                        bin_idx = int(round(target_f / (sr / WIN)))
+                        if bin_idx < len(freqs):
+                            decay_db = -8.0 * np.log2(h)
+                            amp = a0 * (10 ** (decay_db / 20))
+                            amp *= 10 ** (res_shape_db[bin_idx] / 20)
+                            new_phase = (p0 * h) % (2 * np.pi)
+                            new_spec[bin_idx] += amp * np.exp(1j * new_phase)
+                    h += 1
+
+            # broadband texture at the self-derived target level, modulated
+            # by this frame's own dynamics relative to the track's average
+            if n_extend_bins > 0:
+                base_mag = target_mag_at_freqs[extend_mask] * dynamics_mult
+                texture_mag = base_mag * (10 ** (res_shape_db[extend_mask] / 20))
+                micro_var = rng.uniform(0.75, 1.25, n_extend_bins)
+                texture_mag = texture_mag * micro_var
+                texture_phase = rng.uniform(0, 2 * np.pi, n_extend_bins)
+                new_spec[extend_mask] += texture_mag * np.exp(1j * texture_phase)
+
+            new_seg = np.fft.irfft(new_spec, n=WIN)
+            out[start:start + WIN, ch] += new_seg * window
+            if ch == 0:
+                ola_norm[start:start + WIN] += window ** 2
+
+    steady_state = np.median(ola_norm[ola_norm > 0])
+    edge_thresh = steady_state * 0.5
+    safe_mask = ola_norm >= edge_thresh
+    out[~safe_mask] = 0.0
+    out[safe_mask] = out[safe_mask] / ola_norm[safe_mask, None]
+
+    peak = np.abs(out).max()
+    if peak > 0.98:
+        out = out * (0.95 / peak)
+
+    return out, {
+        "applied": True,
+        "cutoff_hz": cutoff_hz,
+        "fitted_rolloff_db_per_octave": float(slope),
+        "deficit_db": deficit_db,
+    }
+
+
 def spectral_tilt_report(audio, sr):
     """Simple tonal-balance measurement: energy ratio across low/mid/high
     thirds, useful for the UI's 'before vs after' EQ curve display."""

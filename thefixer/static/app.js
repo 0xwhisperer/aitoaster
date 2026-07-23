@@ -31,6 +31,7 @@
     { id: "trim_silence", group: "chainGroupCleanup", name: "Trim silence", desc: "Removes leading/trailing true silence at the very start and end." },
     { id: "dc_offset", group: "chainGroupCleanup", name: "DC offset correction", desc: "Centers the waveform on zero if it's biased up or down." },
     { id: "fix_transients", group: "chainGroupCleanup", name: "Surgical transient/pop fix", desc: "Auto-detects sharp pops/spikes and gently limits just that moment." },
+    { id: "spectral_revive", group: "chainGroupCleanup", name: "High-frequency fill-in (17kHz+)", desc: "Detects an artificial cutoff (common in lossy encoding or low-quality AI generation) and fills content above it using only this track's own rolloff slope, harmonics, and dynamics - no external reference." },
     { id: "high_pass", group: "chainGroupCleanup", name: "High-pass filter", desc: "Removes inaudible sub-30Hz rumble that eats into headroom." },
     { id: "linear_fix", group: "chainGroupAI", name: "Linear model fix", desc: "Gradient-optimized correction targeting the fakeprint logistic-regression detector." },
     { id: "cnn_fix", group: "chainGroupAI", name: "CNN model fix", desc: "Whole-track joint optimization targeting the CQT-cepstrum CNN detector. Slower." },
@@ -487,10 +488,11 @@
     else if (s.tool === "cnn_fix") {
       text = ` — SNR ${s.snr_db.toFixed(1)}dB`;
       if (s.worst_score_after_transfer !== undefined && s.worst_score_after_transfer !== null) {
-        text += `, worst window ${(s.worst_score_after_transfer * 100).toFixed(1)}% AI`;
+        text += `, worst of ${s.n_windows || "all"} optimization windows: ${(s.worst_score_after_transfer * 100).toFixed(1)}% AI`;
       }
     }
     else if (s.tool === "fix_transients") text = ` — ${s.count} anomal${s.count === 1 ? "y" : "ies"} found`;
+    else if (s.tool === "spectral_revive") text = ` — filled above ${(s.cutoff_hz/1000).toFixed(0)}kHz (self-fitted rolloff: ${s.fitted_rolloff_db_per_octave.toFixed(1)}dB/octave)`;
     else if (s.tool === "fix_phase") text = s.correlation_after !== undefined
       ? ` — correlation ${s.correlation_before.toFixed(2)} → ${s.correlation_after.toFixed(2)}`
       : "";
