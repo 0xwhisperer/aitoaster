@@ -18,10 +18,9 @@ First run creates a venv and installs `requirements.txt` automatically
 (numpy/scipy/librosa/onnxruntime/soundfile/flask/pyloudnorm/torch/torchaudio/
 onnx2torch/nnAudio/pyyaml). Then open **http://localhost:8090**.
 
-This is a local Python+Flask app, not a static site — it needs the server
-running to do anything (audio decoding, ONNX inference, PyTorch gradient
-optimization all happen server-side). It cannot be hosted on GitHub Pages or
-any other static host; see [Deployment](#deployment) below.
+This is a local Python+Flask app - it needs the server running to do
+anything (audio decoding, ONNX inference, PyTorch gradient optimization all
+happen server-side). See [Deployment](#deployment) below.
 
 ## The signal chain, in order
 
@@ -161,21 +160,13 @@ confirmed it on the actual audio that gets delivered.
 
 ## Deployment
 
-This cannot run as a static site or on GitHub Pages. There is no client-side
-audio processing at all - the frontend is a thin client that calls
-`/api/upload`, `/api/analyze`, `/api/process`, `/api/job` on the Flask
-backend for every operation. No `localStorage`, `indexedDB`, or
-`sessionStorage` is used anywhere; nothing persists in the browser. All
+There is no client-side audio processing at all - the frontend is a thin
+client that calls `/api/upload`, `/api/analyze`, `/api/process`, `/api/job`
+on the Flask backend for every operation. No `localStorage`, `indexedDB`,
+or `sessionStorage` is used anywhere; nothing persists in the browser. All
 state lives on the server's disk (`thefixer/uploads/`, `thefixer/outputs/`)
-and in an in-memory job dict that is lost on server restart.
-
-Making this static-hostable would require a fundamentally different
-architecture: onnxruntime-web (WASM) for detector scoring, a full
-JavaScript/WASM reimplementation of the DSP chain, and dropping the
-PyTorch gradient-based AI-detector fixes entirely (there is no practical
-way to run gradient-based adversarial optimization against a real
-ONNX model in a browser at acceptable speed). That is a different project,
-not a deployment configuration change.
+and in an in-memory job dict that is lost on server restart. Running it
+requires the Flask server (`./run.sh`) to be up.
 
 ## Multiband compressor: how it compares to a real one
 

@@ -681,7 +681,7 @@ footer {
 
       <section class="docs-section">
         <h2>Deployment</h2>
-        <p>This cannot run as a static site or on GitHub Pages. There is no client-side audio processing at all — the frontend is a thin client that calls the Flask backend for every operation. No <code>localStorage</code>, <code>indexedDB</code>, or <code>sessionStorage</code> is used anywhere; nothing persists in the browser. All state lives on the server's disk and in an in-memory job dict that is lost on server restart.</p>
+        <p>There is no client-side audio processing at all — the frontend is a thin client that calls the Flask backend for every operation. No <code>localStorage</code>, <code>indexedDB</code>, or <code>sessionStorage</code> is used anywhere; nothing persists in the browser. All state lives on the server's disk and in an in-memory job dict that is lost on server restart. Running it requires the Flask server (<code>./run.sh</code>) to be up.</p>
       </section>
 
     </div>
