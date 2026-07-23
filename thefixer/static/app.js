@@ -362,7 +362,7 @@
     let subText = "";
     if (data.sub_progress && data.sub_progress.total) {
       const sp = data.sub_progress;
-      subText = ` (${sp.current}/${sp.total}`;
+      subText = ` (optimization step ${sp.current} of ${sp.total}`;
       if (sp.attempt && sp.max_attempts) subText += `, attempt ${sp.attempt}/${sp.max_attempts}`;
       if (sp.score_pct !== undefined) subText += `, live estimate ${sp.score_pct}% AI`;
       subText += ")";

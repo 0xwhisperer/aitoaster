@@ -159,7 +159,11 @@ def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=400,
             }
 
         if progress_cb:
-            progress_cb(f"linear: real score {final_score * 100:.2f}% is above the <{ACCEPT_THRESHOLD*100:.0f}% target - retrying with a stricter internal target")
+            if attempt < max_retries:
+                progress_cb(f"linear: real score {final_score * 100:.2f}% is above the <{ACCEPT_THRESHOLD*100:.0f}% target - retrying with a stricter internal target")
+            else:
+                progress_cb(f"linear: real score {final_score * 100:.2f}% is above the <{ACCEPT_THRESHOLD*100:.0f}% target "
+                            f"after all {max_retries + 1} attempts - shipping the best-scoring attempt found and continuing to the next tool")
         cur_real_target = max(0.002, cur_real_target * 0.3)
         target = max(0.001, target * 0.3)
 
