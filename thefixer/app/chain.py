@@ -343,7 +343,7 @@ def detect_spectral_rolloff(audio, sr, cutoff_hz=17000.0):
     # a real, natural rolloff still loses SOME energy at the top - only flag
     # this as an artificial cutoff worth reviving if the actual level is
     # substantially below what the track's own established slope predicts
-    has_rolloff = deficit_db > 6.0
+    has_rolloff = bool(deficit_db > 6.0)
     return has_rolloff, (cutoff_hz if has_rolloff else None), float(max(0, deficit_db))
 
 
