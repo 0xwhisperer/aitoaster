@@ -14,6 +14,17 @@
     root.setAttribute("data-theme", effectiveDark ? "light" : "dark");
   });
 
+  // ---------- docs overlay ----------
+  const docsOverlay = $("docsOverlay");
+  $("docsBtn").addEventListener("click", () => docsOverlay.classList.add("active"));
+  $("docsCloseBtn").addEventListener("click", () => docsOverlay.classList.remove("active"));
+  docsOverlay.addEventListener("click", (e) => {
+    if (e.target === docsOverlay) docsOverlay.classList.remove("active");
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") docsOverlay.classList.remove("active");
+  });
+
   // ---------- tool catalog ----------
   const TOOLS = [
     { id: "trim_silence", group: "chainGroupCleanup", name: "Trim silence", desc: "Removes leading/trailing true silence at the very start and end." },
