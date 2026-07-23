@@ -656,6 +656,7 @@ footer {
           <li>Click "Process file." A live log and step-aware progress bar track exactly which step is running; both AI-detector fix steps show live sub-progress (current optimization step, retry attempt, and live score) since these stages can take several minutes.</li>
           <li>When done, review the before/after table, what-was-done log, and spectrum overlay (labeled before/after), then A/B the original against the fixed file in the player — both are preloaded and switch instantly with no re-buffering gap. Download either one — filenames follow the name and format that were set.</li>
         </ol>
+        <p><strong>Why the live percentage during optimization can differ from the log line right after it:</strong> the number shown while a step is running (e.g. "step 137/400, live estimate 0.006% AI") is a fast internal approximation, checked every step so it can update live. Once that attempt finishes, the actual delivered audio is re-checked against the real detector model - a slower, more thorough check that can land on a noticeably different number (e.g. 3.8%). The fast estimate is a progress signal, not the final answer; only the post-attempt real-model check decides whether the result passes or triggers a retry.</p>
       </section>
 
       <section class="docs-section">

@@ -80,7 +80,10 @@ def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=400,
     cur_real_target = real_target
     for attempt in range(max_retries + 1):
         if progress_cb:
-            progress_cb(f"linear: starting gradient optimization (attempt {attempt + 1}, real_target={cur_real_target})")
+            progress_cb(f"linear: attempt {attempt + 1} of {max_retries + 1} - optimizing (the live "
+                        f"percentage shown during this step is a fast internal estimate, not the "
+                        f"final verified score - it will be re-checked against the real detector "
+                        f"once this attempt finishes)")
 
         audio_t = torch.tensor(analysis, dtype=torch.float32)
         cur_attempt = attempt
@@ -134,7 +137,8 @@ def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=400,
 
         final_score = _score_stereo_array(out, sr)
         if progress_cb:
-            progress_cb(f"linear: final real-model score after transfer to {sr}Hz stereo: {final_score * 100:.3f}%")
+            progress_cb(f"linear: attempt {attempt + 1} result checked against the REAL detector "
+                        f"(not the fast estimate) on the actual delivered audio: {final_score * 100:.3f}%")
 
         if final_score < best_final_score:
             best_final_score = final_score
@@ -155,7 +159,7 @@ def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=400,
             }
 
         if progress_cb:
-            progress_cb(f"linear: transferred result still scored {final_score * 100:.2f}% (need <{ACCEPT_THRESHOLD*100:.0f}%) - retrying with a stricter target")
+            progress_cb(f"linear: real score {final_score * 100:.2f}% is above the <{ACCEPT_THRESHOLD*100:.0f}% target - retrying with a stricter internal target")
         cur_real_target = max(0.002, cur_real_target * 0.3)
         target = max(0.001, target * 0.3)
 
