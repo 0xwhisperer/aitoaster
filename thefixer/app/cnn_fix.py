@@ -28,9 +28,12 @@ def _resample_mono(audio, sr_in, sr_out):
 
 
 def fix_cnn(stereo_audio, sr, max_steps=300, min_steps=100, hop_sec=2.5,
-            real_check_interval=25, progress_cb=None):
+            real_check_interval=25, progress_cb=None, step_progress_cb=None):
     """Whole-track CNN fix. stereo_audio: [N,2] float32 at native sr.
-    Returns (fixed_stereo, info)."""
+    Returns (fixed_stereo, info). progress_cb receives log-line strings;
+    step_progress_cb(step, max_steps) receives raw optimizer step counts for
+    UI progress bars, since this stage's internal optimization loop can run
+    for many minutes with no other visible progress signal."""
     mono = stereo_audio.mean(axis=1)
     mono_16k = _resample_mono(mono, sr, CNN_SR) if sr != CNN_SR else mono.copy()
 
@@ -40,6 +43,7 @@ def fix_cnn(stereo_audio, sr, max_steps=300, min_steps=100, hop_sec=2.5,
     delta_16k, positions, seg_len = optimize_whole_track_verified(
         mono_16k, max_steps=max_steps, min_steps=min_steps, hop_sec=hop_sec,
         real_check_interval=real_check_interval, verbose=True,
+        progress_cb=step_progress_cb,
     )
 
     delta_peak = np.abs(delta_16k).max()

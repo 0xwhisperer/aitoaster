@@ -86,6 +86,9 @@
       $("fileName").textContent = data.filename;
       $("fileMeta").textContent = `${fmtDuration(data.duration_sec)} · ${data.samples.toLocaleString()} samples`;
 
+      const stem = data.filename.replace(/\.[^.]+$/, "");
+      $("outputNameInput").value = `${stem}_fixed.wav`;
+
       $("workspace").classList.add("active");
       $("results").classList.remove("active");
       renderToolChain();
@@ -278,16 +281,52 @@
     $("progressFill").style.width = "6%";
     $("runBtn").disabled = true;
 
+    const outputName = $("outputNameInput").value.trim();
     const res = await fetch(`/api/process/${state.fileId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tools: Array.from(state.selected), options: {} }),
+      body: JSON.stringify({ tools: Array.from(state.selected), options: {}, output_name: outputName || undefined }),
     });
     const data = await res.json();
     if (data.error) { appendLog(data.error, true); $("runBtn").disabled = false; return; }
     state.jobId = data.job_id;
     pollJob();
   });
+
+  function updateProgress(data) {
+    const total = data.total_steps;
+    const idx = data.current_step_idx;
+
+    if (data.status === "done") {
+      $("progressFill").style.width = "100%";
+      $("progressStepLabel").textContent = "Complete";
+      $("progressStepCount").textContent = "";
+      return;
+    }
+
+    if (total == null || idx == null) {
+      // no step info yet (job just started)
+      $("progressFill").style.width = "4%";
+      $("progressStepLabel").textContent = data.progress_msg || "Starting…";
+      $("progressStepCount").textContent = "";
+      return;
+    }
+
+    // base progress: fraction of steps fully completed
+    let fracWithinStep = 0;
+    if (data.sub_progress && data.sub_progress.total) {
+      fracWithinStep = Math.min(1, data.sub_progress.current / data.sub_progress.total);
+    }
+    const overallFrac = (idx + fracWithinStep) / total;
+    const pct = Math.min(99, Math.round(overallFrac * 100));
+    $("progressFill").style.width = `${pct}%`;
+
+    $("progressStepLabel").textContent = data.current_step_name || data.progress_msg || "Working…";
+    const subText = data.sub_progress && data.sub_progress.total
+      ? ` (${data.sub_progress.current}/${data.sub_progress.total})`
+      : "";
+    $("progressStepCount").textContent = `Step ${idx + 1} of ${total}${subText}`;
+  }
 
   function appendLog(msg, isErr) {
     const box = $("logBox");
@@ -309,10 +348,7 @@
       seenLogCount = data.log.length;
       for (const l of newLines) appendLog(l.msg);
 
-      const totalTools = state.selected.size;
-      const doneSteps = data.result ? data.result.steps.length : 0;
-      const pct = data.status === "done" ? 100 : Math.min(92, 8 + (doneSteps / Math.max(1, totalTools)) * 84);
-      $("progressFill").style.width = `${pct}%`;
+      updateProgress(data);
 
       if (data.status === "running") {
         state.pollTimer = setTimeout(pollJob, 1200);
@@ -404,8 +440,13 @@
     $("abOriginal").classList.add("active");
     $("abFixed").classList.remove("active");
 
-    $("downloadOrig").onclick = () => { window.location.href = origUrl; };
-    $("downloadFixed").onclick = () => { window.location.href = fixedUrl; };
+    const outputName = result.output_name || "fixed.wav";
+    const origName = outputName.replace(/(\.wav)?$/i, "_original.wav");
+    const fixedDownloadUrl = `${fixedUrl}?name=${encodeURIComponent(outputName)}`;
+    const origDownloadUrl = `${origUrl}?name=${encodeURIComponent(origName)}`;
+
+    $("downloadOrig").onclick = () => { window.location.href = origDownloadUrl; };
+    $("downloadFixed").onclick = () => { window.location.href = fixedDownloadUrl; };
 
     async function switchTo(mode) {
       const wasPlaying = !audioEl.paused;

@@ -34,6 +34,7 @@ def optimize_whole_track_verified(
     hop_sec=2.5,
     real_check_interval=25,
     verbose=True,
+    progress_cb=None,
 ):
     """Same joint multi-window optimization as before, but periodically checks
     the REAL (librosa-based) score at each window and, for any window where
@@ -78,6 +79,9 @@ def optimize_whole_track_verified(
         loss = total_logit_loss + lambda_perceptual * percep + lambda_band * band_pen + lambda_tonality * tonal_pen
         loss.backward()
         optimizer.step()
+
+        if progress_cb is not None:
+            progress_cb(step, max_steps)
 
         if verbose and step % 5 == 0:
             snr = 20 * torch.log10(audio.norm() / (delta.norm() + 1e-8)).item()

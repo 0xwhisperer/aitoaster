@@ -8,6 +8,7 @@ tilt), and an A/B stream endpoint for real-time comparison in the browser.
 """
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -66,6 +67,31 @@ def job_log(job_id, msg):
         job["log"].append({"t": time.time(), "msg": msg})
         job["progress_msg"] = msg
     print(f"[{job_id[:8]}] {msg}", flush=True)
+
+
+def job_set_step(job_id, step_idx, total_steps, step_name):
+    """Track which step in the tool chain is currently running, so the UI
+    can show real step-aware progress ('step 3 of 6: CNN model fix') instead
+    of a single undifferentiated percentage."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is None:
+            return
+        job["current_step_idx"] = step_idx
+        job["total_steps"] = total_steps
+        job["current_step_name"] = step_name
+        job["sub_progress"] = None
+
+
+def job_set_sub_progress(job_id, current, total):
+    """Track fine-grained progress WITHIN one long-running step (currently
+    only the CNN optimizer, whose internal loop can run for many minutes
+    with the step-level progress bar otherwise frozen the whole time)."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is None:
+            return
+        job["sub_progress"] = {"current": current, "total": total}
 
 
 @app.route("/")
@@ -165,17 +191,27 @@ def analyze(file_id):
 
 
 # AI-detector fixes are extremely precisely-tuned adversarial corrections -
-# they MUST run last. Any gain/EQ/dynamics change applied after them (LUFS
-# normalization, compression, limiting, phase adjustment) can perturb their
-# exact spectral signature enough to undo the fix entirely, even though the
-# fix passed real-model verification right after it ran. Confirmed directly:
-# running linear_fix mid-chain scored <1% immediately after, but the SAME
-# delta scored 16% once normalize_lufs/multiband_compress/true_peak_limit
-# ran afterward and altered the signal the fix had been tuned against.
+# they MUST run last (except the limiter, see below). Any gain/EQ/dynamics
+# change applied after them (LUFS normalization, compression, phase
+# adjustment) can perturb their exact spectral signature enough to undo the
+# fix entirely, even though the fix passed real-model verification right
+# after it ran. Confirmed directly: running linear_fix mid-chain scored <1%
+# immediately after, but the SAME delta scored 16% once normalize_lufs/
+# multiband_compress ran afterward and altered the signal the fix had been
+# tuned against.
+#
+# true_peak_limit is the one exception: it's a safety net against clipping,
+# not a musical/spectral-shaping step, and it must see the FINAL signal -
+# including whatever small amount of energy the AI-detector fixes add - or
+# it can't actually guarantee the delivered file stays under the true-peak
+# ceiling. Both AI fixes already have their own last-resort peak clamp, but
+# that's a blunt sample-peak scale-down, not an inter-sample-peak-aware
+# limiter, so true_peak_limit still belongs after them as the real final stage.
 TOOL_ORDER = [
     "trim_silence", "dc_offset", "fix_transients", "high_pass",
-    "fix_phase", "normalize_lufs", "multiband_compress", "true_peak_limit",
+    "fix_phase", "normalize_lufs", "multiband_compress",
     "linear_fix", "cnn_fix",
+    "true_peak_limit",
 ]
 
 TOOL_LABELS = {
@@ -192,7 +228,7 @@ TOOL_LABELS = {
 }
 
 
-def run_pipeline(job_id, file_id, tools, options):
+def run_pipeline(job_id, file_id, tools, options, output_name=None):
     try:
         path = _find_upload_path(file_id)
         if path is None:
@@ -208,8 +244,10 @@ def run_pipeline(job_id, file_id, tools, options):
 
         ordered_tools = [t for t in TOOL_ORDER if t in tools]
         lead_samples_trimmed = 0
+        total_steps = len(ordered_tools)
 
-        for tool in ordered_tools:
+        for step_idx, tool in enumerate(ordered_tools):
+            job_set_step(job_id, step_idx, total_steps, TOOL_LABELS.get(tool, tool))
             job_log(job_id, f"running: {TOOL_LABELS.get(tool, tool)}")
             t0 = time.time()
 
@@ -237,11 +275,13 @@ def run_pipeline(job_id, file_id, tools, options):
                                           progress_cb=lambda m: job_log(job_id, m))
             elif tool == "cnn_fix":
                 from .cnn_fix import fix_cnn
+                cnn_max_steps = options.get("cnn_max_steps", 300)
                 audio, info = fix_cnn(audio, sr,
-                                       max_steps=options.get("cnn_max_steps", 300),
+                                       max_steps=cnn_max_steps,
                                        min_steps=options.get("cnn_min_steps", 100),
                                        hop_sec=options.get("cnn_hop_sec", 2.5),
-                                       progress_cb=lambda m: job_log(job_id, m))
+                                       progress_cb=lambda m: job_log(job_id, m),
+                                       step_progress_cb=lambda s, mx: job_set_sub_progress(job_id, s, mx))
             elif tool == "fix_phase":
                 audio, info = chain.fix_phase_issues(audio, sr)
             elif tool == "normalize_lufs":
@@ -259,6 +299,39 @@ def run_pipeline(job_id, file_id, tools, options):
             steps.append(info)
             job_log(job_id, f"  done ({info['elapsed_sec']}s)")
 
+        # Final re-verification pass: cnn_fix's own correction can disturb
+        # linear_fix's precise spectral tuning even when linear_fix ran first
+        # and passed its own verification right after it ran (confirmed
+        # directly: a verified 1.56% became 9.65% once cnn_fix ran on top of
+        # it). Re-score both models on the actual post-chain audio and, if
+        # the linear model is still above target, re-run linear_fix ONE more
+        # time (cheap relative to cnn_fix) rather than silently shipping a
+        # result that's worse than what linear_fix itself already achieved.
+        if "linear_fix" in tools and "cnn_fix" in tools:
+            job_log(job_id, "re-verifying linear model after full chain (cnn_fix can disturb it)")
+            recheck_path = OUTPUT_DIR / f"_recheck_{uuid.uuid4().hex[:8]}.wav"
+            try:
+                save_stereo(recheck_path, audio, sr)
+                recheck_score = scorer.linear.predict(str(recheck_path))["probability"]
+                job_log(job_id, f"  post-chain linear score: {recheck_score * 100:.3f}%")
+                if recheck_score >= 0.01:
+                    job_log(job_id, "  above target - re-running linear_fix once more on the final signal")
+                    from .linear_fix import fix_linear
+                    t0 = time.time()
+                    audio, reverify_info = fix_linear(
+                        audio, sr, target=options.get("linear_target", 0.01),
+                        progress_cb=lambda m: job_log(job_id, m),
+                    )
+                    reverify_info["tool"] = "linear_fix_reverify"
+                    reverify_info["label"] = "AI-detector fix: linear model (re-verification pass)"
+                    reverify_info["elapsed_sec"] = round(time.time() - t0, 2)
+                    reverify_info["triggered_by"] = f"post-chain recheck showed {recheck_score * 100:.3f}%"
+                    steps.append(reverify_info)
+                    job_log(job_id, f"  done ({reverify_info['elapsed_sec']}s)")
+            finally:
+                if recheck_path.exists():
+                    recheck_path.unlink()
+
         out_id = uuid.uuid4().hex[:12]
         out_path = OUTPUT_DIR / f"{out_id}.wav"
         job_log(job_id, "saving output file")
@@ -270,6 +343,13 @@ def run_pipeline(job_id, file_id, tools, options):
         job_log(job_id, "re-scoring with AI detectors")
         scores_after = scorer.score(str(out_path))
         scores_before = scorer.score(str(path))
+        if not scores_after["passes_both"]:
+            failing = []
+            if not scores_after["passes_linear"]:
+                failing.append(f"linear={scores_after['linear_pct']:.2f}%")
+            if not scores_after["passes_cnn"]:
+                failing.append(f"cnn={scores_after['cnn_pct']:.1f}%")
+            job_log(job_id, f"WARNING: final file still flagged by at least one model ({', '.join(failing)})")
 
         # align on the same underlying audio content before comparing samples:
         # if silence was trimmed from the front, "audio" starts later in the
@@ -286,8 +366,10 @@ def run_pipeline(job_id, file_id, tools, options):
         tilt_before, freqs_b, psd_b = chain.spectral_tilt_report(original_audio, sr)
         tilt_after, freqs_a, psd_a = chain.spectral_tilt_report(audio, sr)
 
+        default_output_name = f"{Path(path.name).stem}_fixed.wav"
         result = {
             "out_id": out_id,
+            "output_name": output_name or default_output_name,
             "steps": steps,
             "scores_before": scores_before,
             "scores_after": scores_after,
@@ -322,12 +404,16 @@ def process(file_id):
     body = request.get_json(force=True, silent=True) or {}
     tools = body.get("tools", [])
     options = body.get("options", {})
+    output_name = _safe_download_name(body.get("output_name"), None)
 
     job_id = uuid.uuid4().hex
     with JOBS_LOCK:
-        JOBS[job_id] = {"status": "running", "log": [], "result": None, "error": None, "progress_msg": ""}
+        JOBS[job_id] = {
+            "status": "running", "log": [], "result": None, "error": None, "progress_msg": "",
+            "current_step_idx": None, "total_steps": None, "current_step_name": None, "sub_progress": None,
+        }
 
-    thread = threading.Thread(target=run_pipeline, args=(job_id, file_id, tools, options), daemon=True)
+    thread = threading.Thread(target=run_pipeline, args=(job_id, file_id, tools, options, output_name), daemon=True)
     thread.start()
 
     return jsonify({"job_id": job_id})
@@ -342,27 +428,50 @@ def job_status(job_id):
         return jsonify({
             "status": job["status"],
             "progress_msg": job.get("progress_msg", ""),
+            "current_step_idx": job.get("current_step_idx"),
+            "total_steps": job.get("total_steps"),
+            "current_step_name": job.get("current_step_name"),
+            "sub_progress": job.get("sub_progress"),
             "log": job["log"][-200:],
             "result": job["result"],
             "error": job["error"],
         })
 
 
+def _safe_download_name(name, fallback):
+    """Sanitize a user-supplied filename: strip any path components, keep
+    only a safe character set, ensure a .wav extension, and fall back to a
+    default if what's left is empty."""
+    if not name:
+        return fallback
+    name = Path(name).name  # drop any directory components
+    name = re.sub(r"[^A-Za-z0-9._ -]", "_", name).strip()
+    if not name or name in (".", ".."):
+        return fallback
+    if not name.lower().endswith(".wav"):
+        name = f"{name}.wav"
+    return name
+
+
 @app.route("/api/audio/<kind>/<file_id>")
 def serve_audio(kind, file_id):
     if kind == "upload":
         path = _find_upload_path(file_id)
+        default_name = path.name if path else "audio.wav"
     elif kind == "output":
         path = OUTPUT_DIR / f"{file_id}.wav"
+        default_name = f"{file_id}_fixed.wav"
     elif kind == "output_orig":
         path = OUTPUT_DIR / f"{file_id}_orig.wav"
+        default_name = f"{file_id}_original.wav"
     else:
         return jsonify({"error": "invalid kind"}), 400
 
     if path is None or not Path(path).exists():
         return jsonify({"error": "not found"}), 404
 
-    return send_from_directory(path.parent, path.name)
+    download_name = _safe_download_name(request.args.get("name"), default_name)
+    return send_from_directory(path.parent, path.name, as_attachment=True, download_name=download_name)
 
 
 if __name__ == "__main__":

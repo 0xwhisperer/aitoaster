@@ -268,6 +268,18 @@ canvas#spectrumCanvas {
 }
 .chain-group-label:first-child { margin-top: 0; }
 
+.filename-input {
+  width: 100%; box-sizing: border-box;
+  background: var(--input-bg); border: 1px solid var(--rack-line);
+  border-radius: 8px; padding: 10px 12px;
+  font-size: 13px; color: var(--text);
+}
+.filename-input::placeholder { color: var(--text-faint); }
+.filename-input:focus {
+  outline: none; border-color: var(--focus);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
 .run-bar { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-top: 1px solid var(--rack-line); }
 .btn {
   border: none; border-radius: 8px; padding: 10px 20px;
@@ -285,6 +297,12 @@ canvas#spectrumCanvas {
 /* ---------- Progress ---------- */
 .progress-panel { display: none; }
 .progress-panel.active { display: block; }
+.progress-step-row {
+  display: flex; justify-content: space-between; align-items: baseline;
+  font-size: 12.5px; margin-bottom: 8px;
+}
+.progress-step-row #progressStepLabel { color: var(--text); font-weight: 600; }
+.progress-step-row #progressStepCount { color: var(--text-faint); }
 .progress-bar-track {
   height: 8px; border-radius: 4px; background: var(--input-bg);
   border: 1px solid var(--rack-line); overflow: hidden; margin-bottom: 12px;
@@ -451,6 +469,9 @@ footer {
 
           <div class="chain-group-label">Mastering</div>
           <div class="chain-list" id="chainGroupMaster"></div>
+
+          <div class="chain-group-label">Output filename</div>
+          <input type="text" class="filename-input mono" id="outputNameInput" placeholder="e.g. northstar_fixed.wav" />
         </div>
         <div class="run-bar">
           <button class="btn" id="runBtn">Process file</button>
@@ -463,6 +484,10 @@ footer {
     <div class="panel progress-panel" id="progressPanel">
       <div class="panel-head"><span class="title">Processing</span></div>
       <div class="panel-body">
+        <div class="progress-step-row">
+          <span class="mono" id="progressStepLabel">—</span>
+          <span class="mono" id="progressStepCount"></span>
+        </div>
         <div class="progress-bar-track"><div class="progress-bar-fill" id="progressFill"></div></div>
         <div class="log-box mono" id="logBox"></div>
       </div>
