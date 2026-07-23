@@ -96,7 +96,7 @@ def _real_score_for_delta(delta, audio_orig):
 
 def optimize(audio_orig, lambda_perceptual=2000.0, lambda_band=5000.0, lambda_tonality=50.0,
              target=0.01, real_target=0.05, max_steps=400, lr=0.00002,
-             real_check_interval=50, verbose=True):
+             real_check_interval=50, verbose=True, progress_cb=None):
     """Full per-sample gradient optimization: delta is a free-form waveform
     perturbation (not constrained to any fixed set of frequencies), optimized
     to minimize [detector score + perceptual penalty + out-of-band penalty]
@@ -133,6 +133,9 @@ def optimize(audio_orig, lambda_perceptual=2000.0, lambda_band=5000.0, lambda_to
 
         with torch.no_grad():
             cur_score = forward_score_differentiable(audio_orig + delta).item()
+
+        if progress_cb is not None:
+            progress_cb(step, max_steps, cur_score)
 
         if verbose and step % 50 == 0:
             snr = 20 * torch.log10(audio_orig.norm() / (delta.norm() + 1e-8)).item()

@@ -170,15 +170,21 @@ def job_set_step(job_id, step_idx, total_steps, step_name):
         job["sub_progress"] = None
 
 
-def job_set_sub_progress(job_id, current, total):
-    """Track fine-grained progress WITHIN one long-running step (currently
-    only the CNN optimizer, whose internal loop can run for many minutes
-    with the step-level progress bar otherwise frozen the whole time)."""
+def job_set_sub_progress(job_id, current, total, extra=None):
+    """Track fine-grained progress WITHIN one long-running step (the linear
+    and CNN gradient optimizers, whose internal loops can run for several
+    minutes with the step-level progress bar otherwise frozen the whole
+    time). extra carries optional live detail - e.g. the current surrogate
+    score, or which retry attempt is in progress - so the UI can show more
+    than a bare step counter during a real slowdown."""
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if job is None:
             return
-        job["sub_progress"] = {"current": current, "total": total}
+        payload = {"current": current, "total": total}
+        if extra:
+            payload.update(extra)
+        job["sub_progress"] = payload
 
 
 @app.route("/")
@@ -409,8 +415,12 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 audio, info = chain.high_pass_filter(audio, sr, cutoff_hz=options.get("high_pass_hz", 30))
             elif tool == "linear_fix":
                 from .linear_fix import fix_linear
-                audio, info = fix_linear(audio, sr, target=options.get("linear_target", 0.01),
-                                          progress_cb=lambda m: job_log(job_id, m))
+                audio, info = fix_linear(
+                    audio, sr, target=options.get("linear_target", 0.01),
+                    progress_cb=lambda m: job_log(job_id, m),
+                    step_progress_cb=lambda s, mx, score, att, mxatt: job_set_sub_progress(
+                        job_id, s, mx, extra={"score_pct": round(score * 100, 4), "attempt": att, "max_attempts": mxatt}),
+                )
             elif tool == "cnn_fix":
                 from .cnn_fix import fix_cnn
                 cnn_max_steps = options.get("cnn_max_steps", 300)
@@ -459,6 +469,8 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                     audio, reverify_info = fix_linear(
                         audio, sr, target=options.get("linear_target", 0.01),
                         progress_cb=lambda m: job_log(job_id, m),
+                        step_progress_cb=lambda s, mx, score, att, mxatt: job_set_sub_progress(
+                            job_id, s, mx, extra={"score_pct": round(score * 100, 4), "attempt": att, "max_attempts": mxatt}),
                     )
                     reverify_info["tool"] = "linear_fix_reverify"
                     reverify_info["label"] = "AI-detector fix: linear model (re-verification pass)"

@@ -43,7 +43,7 @@ ACCEPT_THRESHOLD = 0.01  # the user's actual bar is <1% AI, not just "under 50%"
 
 
 def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=400,
-                max_retries=3, progress_cb=None):
+                max_retries=3, progress_cb=None, step_progress_cb=None):
     """Apply the gradient-based linear-model fix. stereo_audio: [N,2] float32
     at native sr (typically 44100). Returns (fixed_stereo, info).
 
@@ -83,8 +83,14 @@ def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=400,
             progress_cb(f"linear: starting gradient optimization (attempt {attempt + 1}, real_target={cur_real_target})")
 
         audio_t = torch.tensor(analysis, dtype=torch.float32)
+        cur_attempt = attempt
+
+        def _on_step(step, mx, cur_score, _attempt=cur_attempt):
+            if step_progress_cb is not None:
+                step_progress_cb(step, mx, cur_score, _attempt + 1, max_retries + 1)
+
         delta_t, best_real_score = _optimize_linear(audio_t, target=target, real_target=cur_real_target,
-                                                      max_steps=max_steps, verbose=False)
+                                                      max_steps=max_steps, verbose=False, progress_cb=_on_step)
         if delta_t is None:
             if attempt < max_retries:
                 cur_real_target = min(0.5, cur_real_target * 3)

@@ -96,6 +96,7 @@
     $("workspace").classList.remove("active");
     $("results").classList.remove("active");
     $("progressPanel").classList.remove("active");
+    $("spectrumLegend").classList.remove("active");
     fileInput.value = "";
   }
 
@@ -357,9 +358,14 @@
     $("progressFill").style.width = `${pct}%`;
 
     $("progressStepLabel").textContent = data.current_step_name || data.progress_msg || "Working…";
-    const subText = data.sub_progress && data.sub_progress.total
-      ? ` (${data.sub_progress.current}/${data.sub_progress.total})`
-      : "";
+    let subText = "";
+    if (data.sub_progress && data.sub_progress.total) {
+      const sp = data.sub_progress;
+      subText = ` (${sp.current}/${sp.total}`;
+      if (sp.attempt && sp.max_attempts) subText += `, attempt ${sp.attempt}/${sp.max_attempts}`;
+      if (sp.score_pct !== undefined) subText += `, ${sp.score_pct}% AI`;
+      subText += ")";
+    }
     $("progressStepCount").textContent = `Step ${idx + 1} of ${total}${subText}`;
   }
 
@@ -450,6 +456,13 @@
 
     drawSpectrum($("spectrumCanvas"), result.spectrum_before.freqs, result.spectrum_before.psd_db,
                  result.spectrum_after.freqs, result.spectrum_after.psd_db);
+
+    const legend = $("spectrumLegend");
+    legend.classList.add("active");
+    legend.innerHTML = `
+      <div class="item"><span class="swatch" style="background: var(--text-faint)"></span>Before</div>
+      <div class="item"><span class="swatch" style="background: var(--accent)"></span>After</div>
+    `;
 
     setupABPlayer(result);
   }
