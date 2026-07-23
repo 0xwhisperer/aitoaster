@@ -57,10 +57,27 @@ class LinearDetector:
         self.expected_features = self.session.get_inputs()[0].shape[1]
 
     def _power_spectrogram(self, audio):
-        """Matches torchaudio.transforms.Spectrogram(n_fft, power=2, normalized=False):
-        a Hann-windowed STFT with hop = n_fft // 4, power spectrum, no normalization."""
+        """Matches torchaudio.transforms.Spectrogram(n_fft, power=2, normalized=False)
+        EXACTLY as it's actually configured in the real model pipeline and in the
+        differentiable reference (linear_differentiable.py's
+        torchaudio_style_spectrogram): hop = n_fft // 4, a PERIODIC Hann window
+        (not numpy's default symmetric one), and center=True with reflect-mode
+        padding (torch.stft's default) - the first frame is centered ON sample 0,
+        not starting at it. Getting any of these three wrong silently produces a
+        different (and previously verified-wrong: 84.57% vs 0.042% on the same
+        test tone) fakeprint, since the whole detector is built on this exact
+        spectrogram shape."""
         hop = self.n_fft // 4
-        window = np.hanning(self.n_fft)
+        # periodic Hann: numpy's hanning() is symmetric (includes both endpoints);
+        # torch.hann_window(..., periodic=True) is the first N samples of an
+        # N+1-point symmetric window, which is NOT the same function.
+        window = np.hanning(self.n_fft + 1)[:-1]
+
+        # center=True, pad_mode="reflect": reflect-pad n_fft//2 samples on each
+        # side before framing, matching torch.stft's default centering behavior.
+        pad = self.n_fft // 2
+        audio = np.pad(audio, (pad, pad), mode="reflect")
+
         n = len(audio)
         n_frames = 1 + (n - self.n_fft) // hop if n >= self.n_fft else 0
         if n_frames <= 0:

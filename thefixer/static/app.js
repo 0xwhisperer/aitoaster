@@ -50,7 +50,16 @@
     abMode: "orig", // 'orig' | 'fixed'
     audioCtx: null,
     waveData: null,
+    outputFormat: "same",
   };
+
+  // ---------- output format switch ----------
+  document.querySelectorAll("#formatSwitch button").forEach(btn => {
+    btn.addEventListener("click", () => {
+      state.outputFormat = btn.dataset.format;
+      document.querySelectorAll("#formatSwitch button").forEach(b => b.classList.toggle("active", b === btn));
+    });
+  });
 
   // ---------- upload ----------
   const uploadZone = $("uploadZone");
@@ -296,7 +305,11 @@
     const res = await fetch(`/api/process/${state.fileId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tools: Array.from(state.selected), options: {}, output_name: outputName || undefined }),
+      body: JSON.stringify({
+        tools: Array.from(state.selected), options: {},
+        output_name: outputName || undefined,
+        output_format: state.outputFormat,
+      }),
     });
     const data = await res.json();
     if (data.error) { appendLog(data.error, true); $("runBtn").disabled = false; return; }

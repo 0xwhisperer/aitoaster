@@ -327,6 +327,17 @@ canvas#spectrumCanvas {
   box-shadow: 0 0 0 3px var(--accent-glow);
 }
 
+.format-switch {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
+}
+.format-switch button {
+  border: 1px solid var(--rack-line); background: var(--input-bg);
+  color: var(--text-dim); border-radius: 7px; padding: 8px 10px;
+  font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.format-switch button.active { background: var(--accent); color: #0c1210; border-color: var(--accent); }
+.format-switch button:not(.active):hover { border-color: var(--accent-dim); color: var(--text); }
+
 .run-bar { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-top: 1px solid var(--rack-line); }
 .btn {
   border: none; border-radius: 8px; padding: 10px 20px;
@@ -525,6 +536,14 @@ footer {
 
           <div class="chain-group-label">Output filename</div>
           <input type="text" class="filename-input mono" id="outputNameInput" placeholder="e.g. northstar_fixed.wav" />
+
+          <div class="chain-group-label">Output format</div>
+          <div class="format-switch" id="formatSwitch">
+            <button data-format="same" class="active">Same as source</button>
+            <button data-format="wav">WAV</button>
+            <button data-format="mp3">MP3 (highest quality)</button>
+            <button data-format="flac">FLAC</button>
+          </div>
         </div>
         <div class="run-bar">
           <button class="btn" id="runBtn">Process file</button>

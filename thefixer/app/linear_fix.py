@@ -104,11 +104,24 @@ def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=400,
         delta_44k_norm = _resample_mono(delta_norm, LIN_SR, sr) if sr != LIN_SR else delta_norm
         delta_native = delta_44k_norm / scale
 
-        n = min(len(stereo_audio), len(delta_native))
-        out = stereo_audio[:n].copy()
-        out[:, 0] += delta_native[:n]
-        out[:, 1] += delta_native[:n]
+        # apply the correction only to the analyzed prefix - the model itself
+        # only ever scores the first MAX_DURATION seconds of a track (see the
+        # "truncated" check above), so that's the only region a delta exists
+        # for. Anything past that must be carried through UNCHANGED rather
+        # than truncated away: out must always cover the FULL original track
+        # length, not just however much was analyzed.
+        n_delta = min(len(stereo_audio), len(delta_native))
+        out = stereo_audio.copy()
+        out[:n_delta, 0] += delta_native[:n_delta]
+        out[:n_delta, 1] += delta_native[:n_delta]
+        n = len(out)
 
+        # emergency anti-clipping safety net ONLY (not the app's real
+        # loudness ceiling) - this just prevents raw digital clipping if the
+        # correction happens to push a peak past 1.0. It allows peaks up to
+        # ~-0.26dBFS, well above the -1dBTP the true-peak limiter targets;
+        # if that limiter isn't also selected/run as the final chain stage,
+        # this alone does not guarantee -1dBTP compliance.
         peak = np.abs(out).max()
         if peak > 0.97:
             out *= 0.97 / peak
