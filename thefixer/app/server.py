@@ -269,6 +269,8 @@ def analyze(file_id):
     has_embedded_images = any(s["is_attached_image"] for s in metadata["streams"])
 
     recommendations = []
+    if metadata["format"] or any(s["tags"] for s in metadata["streams"]) or has_embedded_images:
+        recommendations.append("strip_metadata")
     if scores["linear"]["probability"] >= 0.01:
         recommendations.append("linear_fix")
     if scores["cnn"]["probability"] >= 0.5:
@@ -323,13 +325,14 @@ def analyze(file_id):
 # that's a blunt sample-peak scale-down, not an inter-sample-peak-aware
 # limiter, so true_peak_limit still belongs after them as the real final stage.
 TOOL_ORDER = [
-    "trim_silence", "dc_offset", "fix_transients", "high_pass",
+    "strip_metadata", "trim_silence", "dc_offset", "fix_transients", "high_pass",
     "fix_phase", "normalize_lufs", "multiband_compress",
     "linear_fix", "cnn_fix",
     "true_peak_limit",
 ]
 
 TOOL_LABELS = {
+    "strip_metadata": "Strip metadata & embedded images",
     "trim_silence": "Trim leading/trailing silence",
     "dc_offset": "DC offset correction",
     "fix_transients": "Surgical transient/pop limiting",
@@ -366,7 +369,27 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
             job_log(job_id, f"running: {TOOL_LABELS.get(tool, tool)}")
             t0 = time.time()
 
-            if tool == "trim_silence":
+            if tool == "strip_metadata":
+                # nothing to do to the audio array itself here - every
+                # output this pipeline writes is re-encoded from raw PCM
+                # (WAV via soundfile carries no tags at all; MP3/FLAC are
+                # re-encoded from a tagless temp WAV with an explicit
+                # -map_metadata -1 pass in encode_final_output), so metadata
+                # is dropped by construction regardless of this step. This
+                # step exists to make that fact VISIBLE - report exactly
+                # what tags/images were found on the original upload and
+                # will not appear in the delivered file.
+                metadata = chain.read_metadata_tags(path)
+                all_tags = dict(metadata["format"])
+                for s in metadata["streams"]:
+                    all_tags.update(s["tags"])
+                has_images = any(s["is_attached_image"] for s in metadata["streams"])
+                info = {
+                    "applied": bool(all_tags or has_images),
+                    "tags_found": all_tags,
+                    "has_embedded_images": has_images,
+                }
+            elif tool == "trim_silence":
                 audio, info = chain.trim_silence(audio, sr)
                 # track how much was cut from the FRONT specifically, so any
                 # later before/after sample-domain comparison (SNR, delta)
@@ -463,6 +486,57 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
             finally:
                 if recheck_path.exists():
                     recheck_path.unlink()
+
+        # Final LUFS re-verification pass: normalize_lufs runs mid-chain, but
+        # every stage after it (multiband compression, both AI-detector
+        # fixes, the limiter) can shift overall loudness without anything
+        # checking whether the FINAL delivered file still matches the target
+        # - unlike linear_fix, which already gets a post-chain recheck. If
+        # normalize_lufs was selected, measure the true final LUFS and, if it
+        # has drifted meaningfully from target, apply one corrective gain
+        # pass right before delivery (not a full re-run of normalize_lufs,
+        # which would re-measure and target the same way - just a direct
+        # final trim to the actual requested target).
+        if "normalize_lufs" in tools:
+            target_lufs = options.get("lufs_target", -14.0)
+            final_lufs = chain.measure_lufs(audio, sr)
+            if np.isfinite(final_lufs) and abs(final_lufs - target_lufs) > 0.5:
+                job_log(job_id, f"post-chain LUFS check: {final_lufs:.1f} vs target {target_lufs:.1f} "
+                                 f"- correcting drift introduced by later processing stages")
+                t0 = time.time()
+                gain_db = target_lufs - final_lufs
+                gain_linear = 10 ** (gain_db / 20)
+                audio = audio * gain_linear
+                peak = np.abs(audio).max()
+                if peak > 0.999:
+                    audio = audio * (0.999 / peak)
+                lufs_reverify_info = {
+                    "tool": "normalize_lufs_reverify",
+                    "label": "LUFS loudness normalization (post-chain drift correction)",
+                    "applied": True,
+                    "lufs_before": float(final_lufs),
+                    "lufs_target": target_lufs,
+                    "lufs_after": float(chain.measure_lufs(audio, sr)),
+                    "elapsed_sec": round(time.time() - t0, 2),
+                }
+                steps.append(lufs_reverify_info)
+                job_log(job_id, f"  corrected to {lufs_reverify_info['lufs_after']:.1f} LUFS "
+                                 f"({lufs_reverify_info['elapsed_sec']}s)")
+
+                # a late gain change here can push a peak back over the
+                # limiter's ceiling - re-run it once more if it was selected,
+                # for the same reason the linear-fix re-verification pass
+                # re-runs the limiter above.
+                if "true_peak_limit" in tools:
+                    job_log(job_id, "re-running true-peak limiter after LUFS drift correction")
+                    t0 = time.time()
+                    audio, limiter_info2 = chain.true_peak_limit(
+                        audio, sr, ceiling_db=options.get("ceiling_db", -1.0))
+                    limiter_info2["tool"] = "true_peak_limit_reverify_lufs"
+                    limiter_info2["label"] = "True-peak limiter (post-LUFS-correction safety pass)"
+                    limiter_info2["elapsed_sec"] = round(time.time() - t0, 2)
+                    steps.append(limiter_info2)
+                    job_log(job_id, f"  done ({limiter_info2['elapsed_sec']}s)")
 
         out_id = uuid.uuid4().hex[:12]
         # always keep a WAV copy for detector re-scoring regardless of the

@@ -27,6 +27,7 @@
 
   // ---------- tool catalog ----------
   const TOOLS = [
+    { id: "strip_metadata", group: "chainGroupCleanup", name: "Strip metadata & embedded images", desc: "Reports and removes ID3/container tags (title, artist, comments, generation-platform provenance) and embedded cover art. The delivered file never carries these regardless, since every output is freshly encoded from raw audio - this step surfaces exactly what was found." },
     { id: "trim_silence", group: "chainGroupCleanup", name: "Trim silence", desc: "Removes leading/trailing true silence at the very start and end." },
     { id: "dc_offset", group: "chainGroupCleanup", name: "DC offset correction", desc: "Centers the waveform on zero if it's biased up or down." },
     { id: "fix_transients", group: "chainGroupCleanup", name: "Surgical transient/pop fix", desc: "Auto-detects sharp pops/spikes and gently limits just that moment." },
@@ -454,6 +455,14 @@
   }
 
   function stepDetailText(s) {
+    if (s.tool === "strip_metadata") {
+      if (!s.applied) return " — no metadata or embedded images found on the source file";
+      const tagNames = Object.keys(s.tags_found || {});
+      const parts = [];
+      if (tagNames.length) parts.push(`removed tags: ${tagNames.join(", ")}`);
+      if (s.has_embedded_images) parts.push("removed embedded cover art");
+      return ` — ${parts.join("; ")}`;
+    }
     if (!s.applied) return " — no change needed";
     let text = "";
     if (s.tool === "trim_silence") text = ` — removed ${s.lead_ms}ms / ${s.trail_ms}ms`;
