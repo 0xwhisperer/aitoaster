@@ -26,40 +26,81 @@ happen server-side). See [Deployment](#deployment) below.
 
 The processing order is deliberate — see [Why this order](#why-this-order).
 
-1. **Trim leading/trailing silence** — true-digital-silence detection
+1. **Strip metadata & embedded images** — reports every format- and
+   stream-level tag (title, artist, comment, encoder, generation-platform
+   provenance) plus any embedded cover art, and flags known AI-generation
+   platform keywords explicitly. Metadata is always stripped from the
+   delivered output regardless of selection (every output is freshly
+   encoded from raw audio, so there's no code path where a tag could
+   survive) — this step exists to make that fact visible and specific,
+   not to gate whether stripping happens.
+2. **Trim leading/trailing silence** — true-digital-silence detection
    (threshold 0.0005 linear amplitude, 5ms safety pad).
-2. **DC offset correction** — subtracts each channel's mean.
-3. **Surgical transient/pop fix** — detects genuine click/glitch artifacts
+3. **DC offset correction** — subtracts each channel's mean.
+4. **Surgical transient/pop fix** — detects genuine click/glitch artifacts
    (requires both a large sample-to-sample jump AND a spike far above a
    200ms local RMS envelope, so ordinary kick/snare hits are never flagged)
    and applies a raised-cosine gain-reduction envelope (3ms attack, 60ms
    release) just at that moment. Target reduction is derived from the
    track's own recent loudness context, not a fixed value.
-4. **High-pass filter** — 2nd-order Butterworth, zero-phase (`sosfiltfilt`),
+5. **High-frequency spectral fill-in (17kHz+)** — detects an artificial
+   hard cutoff (common in lossy encoding or low-quality AI generation) by
+   comparing the actual energy just above a candidate cutoff against what
+   the track's own established rolloff slope predicts, and only flags it
+   when the deficit is large. Fills content above the cutoff using
+   *only* this track's own characteristics — its self-fitted rolloff
+   slope extrapolated past the cutoff, harmonic projection from each
+   frame's own detected spectral peaks, and broadband texture modulated
+   by the track's own frame-by-frame dynamics. No external reference file
+   or fixed target curve is used anywhere in the calculation.
+6. **High-pass filter** — 2nd-order Butterworth, zero-phase (`sosfiltfilt`),
    30Hz cutoff. Removes sub-audible rumble/DC residue.
-5. **Stereo phase/correlation correction** — checks L/R correlation; if
+7. **Stereo phase/correlation correction** — checks L/R correlation; if
    negative enough to risk mono-cancellation, blends mid/side to restore
    safety.
-6. **LUFS loudness normalization** — targets -14 LUFS (general
+8. **LUFS loudness normalization** — targets -14 LUFS (general
    streaming-platform standard; Apple Music specifically targets -16, most
    others including Spotify/YouTube are closer to -14).
-7. **Multiband compression** — gentle 3-band (low/mid/high) downward
+9. **Multiband compression** — gentle 3-band (low/mid/high) downward
    compression, conservative settings (ratio 1.3:1, threshold -12dB). See
    [Multiband compressor: how it compares to a real one](#multiband-compressor-how-it-compares-to-a-real-one)
    for what's simplified here.
-8. **Linear-model AI-detector fix** — gradient-based adversarial correction
-   targeting the fakeprint/logistic-regression detector.
-9. **CNN-model AI-detector fix** — whole-track joint gradient optimization
-   targeting the CQT-cepstrum CNN detector, across all overlapping 10-second
-   analysis windows simultaneously.
-10. **Post-chain linear re-verification** (automatic, not a separate
+10. **Linear-model AI-detector fix** — gradient-based adversarial
+    correction targeting the fakeprint/logistic-regression detector.
+    Reports live progress during optimization: current step, which retry
+    attempt, and the live surrogate score as it converges.
+11. **CNN-model AI-detector fix** — whole-track joint gradient optimization
+    targeting the CQT-cepstrum CNN detector, across all overlapping
+    10-second analysis windows simultaneously.
+12. **Post-chain linear re-verification** (automatic, not a separate
     selectable tool) — if both AI fixes were selected, re-scores the linear
     model on the final post-chain audio and, if the CNN fix disturbed it
     back above target, re-runs the linear fix once more, verified. See
     [Why this order](#why-this-order).
-11. **True-peak limiter** — brick-wall ceiling at -1dBTP (industry-standard
+13. **Post-chain LUFS drift correction** (automatic, not a separate
+    selectable tool) — if `normalize_lufs` was selected, the truly final
+    LUFS is measured after every later stage (multiband compression, both
+    AI-detector fixes, the limiter) and corrected with one direct gain
+    pass if it has drifted more than 0.5dB from target. Re-runs the
+    limiter afterward if it was selected, since a late gain change can
+    push a peak back over ceiling.
+14. **True-peak limiter** — brick-wall ceiling at -1dBTP (industry-standard
     safe margin for lossy-codec transcoding headroom), oversampled 4x to
-    catch inter-sample peaks, not just sample peaks.
+    catch inter-sample peaks, not just sample peaks. Re-runs automatically
+    after either of the two re-verification passes above if it was
+    originally selected, so it remains the genuine last stage regardless
+    of what triggers a late correction.
+
+## Output format
+
+Choose the delivered file's format independently of the source: same as
+source, WAV, MP3, or FLAC. MP3 offers a further choice between VBR-0
+(libmp3lame's highest VBR quality tier, ~245kbps average — considered
+transparent/near-lossless and doesn't waste bits on simple passages) and
+CBR 320kbps (a flat bitrate on every frame, what most people mean literally
+by "highest bitrate"). The delivered filename's extension always matches
+what was actually encoded, regardless of what was typed into the filename
+field.
 
 ## Why this order
 
@@ -78,10 +119,20 @@ guarantee the delivered file stays under its ceiling.
 correct order.** Running the linear fix followed by the CNN fix can let the
 CNN fix's broadband correction disturb the linear fix's precise correction
 — on a full-length test track, a linear score verified at 1.56% rose to
-9.65% once the CNN fix had also run. This is why step 10 above exists — a
+9.65% once the CNN fix had also run. This is why step 12 above exists — a
 mandatory re-verification pass that catches and corrects this specific
 interaction automatically, rather than shipping a degraded result. It is
 not a complete fix for the underlying issue (see [Roadmap](#roadmap)).
+
+**LUFS normalization is checked again at the very end, for the same
+reason.** It runs mid-chain (step 8), but every stage after it — multiband
+compression, both AI-detector fixes, the limiter — can shift overall
+loudness without anything verifying the FINAL delivered file still matches
+the requested target. Traced directly on a real track end-to-end: LUFS
+held within a fraction of a dB across cleanup, mastering, the linear fix,
+and the CNN fix in one full run, but nothing previously guaranteed that on
+every file, so step 13 exists as the same kind of final safety net the
+linear-fix re-verification already provided.
 
 ## Verification discipline
 
@@ -232,6 +283,19 @@ compressor plugin where finer dynamics control is needed.
 
 ### App/UX gaps
 
+- [ ] Metadata stripping is not currently a real on/off toggle - every
+  output is always freshly encoded from raw audio (WAV via soundfile
+  carries no tags at all; MP3/FLAC are re-encoded from a tagless temp file
+  with an explicit strip pass), so there is no existing code path where a
+  tag could survive even if the tool were unchecked. Making it a genuine
+  toggle would require a new "preserve original tags" feature to copy
+  them forward when unchecked - not built, since doing so would also
+  preserve any AI-platform provenance tags the tool exists to remove.
+- [ ] The spectral revival tool's per-frame harmonic-projection loop is a
+  plain Python loop over every analysis frame - roughly 5x realtime on a
+  full track (about 52s for a 277s track in testing). Fine for the current
+  scale, but would benefit from vectorization if used on much longer
+  material or in a batch context.
 - [ ] No undo/versioning across multiple processing runs on the same
   upload — each run is independent; nothing automatically chains a prior
   output back in as a new input (re-uploading the output file works as a
