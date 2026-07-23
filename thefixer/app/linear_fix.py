@@ -67,6 +67,16 @@ def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=400,
         progress_cb(f"linear: model only ever scores the first {MAX_DURATION}s of a track "
                     f"(matches the detector's own limit) - only that portion will be corrected")
 
+    # track the best-scoring attempt across all retries, not just the last one -
+    # a later retry can converge WORSE than an earlier one (each retry tightens
+    # cur_real_target/target, which can make the optimizer's job harder within
+    # the same max_steps budget), so always ship whichever attempt actually
+    # scored lowest rather than whatever happened to run last.
+    best_out = None
+    best_final_score = 1.0
+    best_n = None
+    best_attempt = None
+
     cur_real_target = real_target
     for attempt in range(max_retries + 1):
         if progress_cb:
@@ -107,6 +117,12 @@ def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=400,
         if progress_cb:
             progress_cb(f"linear: final real-model score after transfer to {sr}Hz stereo: {final_score * 100:.3f}%")
 
+        if final_score < best_final_score:
+            best_final_score = final_score
+            best_out = out
+            best_n = n
+            best_attempt = attempt + 1
+
         if final_score < ACCEPT_THRESHOLD:
             orig_rms = np.sqrt(np.mean(stereo_audio[:n, 0] ** 2))
             delta_rms = np.sqrt(np.mean((out[:, 0] - stereo_audio[:n, 0]) ** 2))
@@ -124,22 +140,22 @@ def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=400,
         cur_real_target = max(0.002, cur_real_target * 0.3)
         target = max(0.001, target * 0.3)
 
-    # exhausted retries: if the last attempt's result is still meaningfully
-    # better than the model's own 50% decision boundary, ship it rather than
-    # discard useful (if imperfect) progress - but flag clearly that it did
-    # not reach the <1% bar
-    if final_score < 0.5:
-        orig_rms = np.sqrt(np.mean(stereo_audio[:n, 0] ** 2))
-        delta_rms = np.sqrt(np.mean((out[:, 0] - stereo_audio[:n, 0]) ** 2))
+    # exhausted retries: ship whichever attempt scored BEST across the whole
+    # loop, not whatever the last attempt happened to produce - a later retry
+    # can converge worse than an earlier one, so always use best_out here.
+    if best_out is not None and best_final_score < 0.5:
+        orig_rms = np.sqrt(np.mean(stereo_audio[:best_n, 0] ** 2))
+        delta_rms = np.sqrt(np.mean((best_out[:, 0] - stereo_audio[:best_n, 0]) ** 2))
         snr_db = 20 * np.log10(orig_rms / (delta_rms + 1e-12))
-        return out, {
+        return best_out, {
             "applied": True,
             "snr_db": float(snr_db),
             "target": target,
-            "final_real_score": final_score,
+            "final_real_score": best_final_score,
             "attempts": max_retries + 1,
+            "best_attempt": best_attempt,
             "warning": f"did not reach the <{ACCEPT_THRESHOLD*100:.0f}% target after {max_retries + 1} attempts; "
-                       f"best achieved was {final_score*100:.2f}%",
+                       f"best achieved was {best_final_score*100:.2f}% (on attempt {best_attempt})",
         }
 
     return stereo_audio, {"applied": False, "reason": "could not verify a working fix after transfer within retry budget"}

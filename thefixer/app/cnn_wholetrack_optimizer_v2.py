@@ -11,6 +11,23 @@ def build_sliding_windows(n_samples, hop_sec=2.5, segment_sec=10.0, sr=SR, edge_
     hop = int(hop_sec * sr)
     seg_len = int(segment_sec * sr)
     edge_guard = int(edge_guard_sec * sr)
+
+    if n_samples < seg_len + 2 * edge_guard:
+        # track too short for even one full-length window plus edge guards on
+        # both sides - previously this silently produced an out-of-bounds
+        # window position (e.g. any track under ~10.9s at the default
+        # segment_sec=10.0/edge_guard_sec=0.5), which downstream code sliced
+        # with no length check, causing a shape-mismatch crash inside the CQT/
+        # CNN pipeline. Shrink the window to fit the track instead, still
+        # respecting the edge guard on both sides where possible.
+        seg_len = max(1, n_samples - 2 * edge_guard)
+        if seg_len < 1:
+            # pathologically short (shorter than 2*edge_guard) - use the
+            # whole track as one window and drop the edge guard entirely
+            # rather than producing an empty/negative-length segment
+            return [0], n_samples
+        return [edge_guard], seg_len
+
     # a window must not touch the literal first OR last sample of the signal -
     # CQT boundary handling produces a NaN-gradient singularity at either edge
     # (confirmed: start-of-track and end-of-track both trigger this)

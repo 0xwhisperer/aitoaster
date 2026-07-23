@@ -397,13 +397,18 @@ canvas#spectrumCanvas {
 
 .steps-list { display: flex; flex-direction: column; gap: 6px; }
 .step-item {
-  display: flex; align-items: center; gap: 10px;
+  display: flex; align-items: flex-start; gap: 10px;
   padding: 9px 12px; background: var(--panel-raised); border-radius: 8px;
   border: 1px solid var(--rack-line); font-size: 12.5px;
 }
-.step-item .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
+.step-item .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; margin-top: 5px; }
+.step-item .dot.warn { background: var(--warn); }
 .step-item .txt { flex: 1; }
-.step-item .time { color: var(--text-faint); font-size: 11px; }
+.step-item .time { color: var(--text-faint); font-size: 11px; flex: none; }
+.step-warning {
+  margin-top: 4px; font-size: 11.5px; color: var(--warn);
+  line-height: 1.5;
+}
 
 /* ---------- A/B player ---------- */
 .ab-player {
@@ -595,7 +600,8 @@ footer {
 
 <footer>The Fixer — local mastering &amp; AI-detector verification console</footer>
 
-<audio id="audioEl" preload="auto"></audio>
+<audio id="audioOrig" preload="auto"></audio>
+<audio id="audioFixed" preload="auto"></audio>
 
 <div class="docs-overlay" id="docsOverlay">
   <div class="docs-modal">

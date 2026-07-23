@@ -411,12 +411,18 @@
         </tr>`).join("")}
       </tbody>`;
 
-    $("stepsList").innerHTML = result.steps.map(s => `
+    $("stepsList").innerHTML = result.steps.map(s => {
+      const warning = stepWarningText(s);
+      return `
       <div class="step-item">
-        <div class="dot"></div>
-        <div class="txt">${s.label}${stepDetailText(s)}</div>
+        <div class="dot${warning ? " warn" : ""}"></div>
+        <div class="txt">
+          ${s.label}${stepDetailText(s)}
+          ${warning ? `<div class="step-warning">⚠ ${warning}</div>` : ""}
+        </div>
         <div class="time">${s.elapsed_sec}s</div>
-      </div>`).join("") || `<div class="step-item"><div class="txt">No processing steps were run.</div></div>`;
+      </div>`;
+    }).join("") || `<div class="step-item"><div class="txt">No processing steps were run.</div></div>`;
 
     drawSpectrum($("spectrumCanvas"), result.spectrum_before.freqs, result.spectrum_before.psd_db,
                  result.spectrum_after.freqs, result.spectrum_after.psd_db);
@@ -426,27 +432,59 @@
 
   function stepDetailText(s) {
     if (!s.applied) return " — no change needed";
-    if (s.tool === "trim_silence") return ` — removed ${s.lead_ms}ms / ${s.trail_ms}ms`;
-    if (s.tool === "dc_offset") return ` — corrected ${s.dc_l_before.toFixed(5)} / ${s.dc_r_before.toFixed(5)}`;
-    if (s.tool === "normalize_lufs") return ` — ${s.lufs_before.toFixed(1)} → ${s.lufs_after.toFixed(1)} LUFS`;
-    if (s.tool === "true_peak_limit") return ` — reduced ${Math.abs(s.gain_reduction_db).toFixed(1)}dB`;
-    if (s.tool === "linear_fix" || s.tool === "cnn_fix") return ` — SNR ${s.snr_db.toFixed(1)}dB`;
-    if (s.tool === "fix_transients") return ` — ${s.count} anomal${s.count === 1 ? "y" : "ies"} found`;
-    if (s.tool === "fix_phase") return s.correlation_after !== undefined
+    let text = "";
+    if (s.tool === "trim_silence") text = ` — removed ${s.lead_ms}ms / ${s.trail_ms}ms`;
+    else if (s.tool === "dc_offset") text = ` — corrected ${s.dc_l_before.toFixed(5)} / ${s.dc_r_before.toFixed(5)}`;
+    else if (s.tool === "normalize_lufs") text = ` — ${s.lufs_before.toFixed(1)} → ${s.lufs_after.toFixed(1)} LUFS`;
+    else if (s.tool === "true_peak_limit") text = ` — reduced ${Math.abs(s.gain_reduction_db).toFixed(1)}dB`;
+    else if (s.tool === "linear_fix" || s.tool === "linear_fix_reverify")
+      text = ` — SNR ${s.snr_db.toFixed(1)}dB` + (s.final_real_score !== undefined ? `, ${(s.final_real_score * 100).toFixed(3)}% AI` : "");
+    else if (s.tool === "cnn_fix") {
+      text = ` — SNR ${s.snr_db.toFixed(1)}dB`;
+      if (s.worst_score_after_transfer !== undefined && s.worst_score_after_transfer !== null) {
+        text += `, worst window ${(s.worst_score_after_transfer * 100).toFixed(1)}% AI`;
+      }
+    }
+    else if (s.tool === "fix_transients") text = ` — ${s.count} anomal${s.count === 1 ? "y" : "ies"} found`;
+    else if (s.tool === "fix_phase") text = s.correlation_after !== undefined
       ? ` — correlation ${s.correlation_before.toFixed(2)} → ${s.correlation_after.toFixed(2)}`
       : "";
-    if (s.tool === "multiband_compress") return ` — up to ${Math.abs(Math.min(...s.bands.map(b => b.max_reduction_db))).toFixed(1)}dB gentle reduction`;
-    return "";
+    else if (s.tool === "multiband_compress") text = ` — up to ${Math.abs(Math.min(...s.bands.map(b => b.max_reduction_db))).toFixed(1)}dB gentle reduction`;
+
+    if (s.triggered_by) text += ` (auto re-run: ${s.triggered_by})`;
+    return text;
+  }
+
+  function stepWarningText(s) {
+    // Surface the honesty-signal fields that mean "this fix didn't fully
+    // reach its target" - these are set specifically so a partial fix is
+    // never silently reported as a full success.
+    if (s.warning) return s.warning;
+    if (s.tool === "cnn_fix" && s.verified_after_transfer === false) {
+      return `Not all analysis windows converged - worst window still scored ${(s.worst_score_after_transfer * 100).toFixed(1)}% AI after transfer.`;
+    }
+    return null;
   }
 
   // ---------- A/B player ----------
+  // Both A and B are loaded into their own <audio> element simultaneously and
+  // kept playing in lockstep at all times; switching just mutes one and
+  // unmutes the other (instant, sample-accurate, no re-fetch/re-decode gap)
+  // instead of swapping a single element's `src` mid-playback, which would
+  // force the browser to re-buffer and produce an audible glitch at the
+  // switch point.
   function setupABPlayer(result) {
-    const audioEl = $("audioEl");
+    const audioOrig = $("audioOrig");
+    const audioFixed = $("audioFixed");
     const origUrl = `/api/audio/output_orig/${result.out_id}`;
     const fixedUrl = `/api/audio/output/${result.out_id}`;
     state.urls = { orig: origUrl, fixed: fixedUrl };
     state.abMode = "orig";
-    audioEl.src = origUrl;
+
+    audioOrig.src = origUrl;
+    audioFixed.src = fixedUrl;
+    audioOrig.muted = false;
+    audioFixed.muted = true;
 
     $("abOriginal").classList.add("active");
     $("abFixed").classList.remove("active");
@@ -459,13 +497,20 @@
     $("downloadOrig").onclick = () => { window.location.href = origDownloadUrl; };
     $("downloadFixed").onclick = () => { window.location.href = fixedDownloadUrl; };
 
-    async function switchTo(mode) {
-      const wasPlaying = !audioEl.paused;
-      const t = audioEl.currentTime;
+    function activeEl() { return state.abMode === "orig" ? audioOrig : audioFixed; }
+    function inactiveEl() { return state.abMode === "orig" ? audioFixed : audioOrig; }
+
+    function switchTo(mode) {
+      if (mode === state.abMode) return;
       state.abMode = mode;
-      audioEl.src = mode === "orig" ? origUrl : fixedUrl;
-      audioEl.currentTime = t;
-      if (wasPlaying) audioEl.play();
+      audioOrig.muted = mode !== "orig";
+      audioFixed.muted = mode !== "fixed";
+      // guard against any drift between the two elements' clocks
+      const master = activeEl();
+      const other = inactiveEl();
+      if (Math.abs(other.currentTime - master.currentTime) > 0.05) {
+        other.currentTime = master.currentTime;
+      }
       $("abOriginal").classList.toggle("active", mode === "orig");
       $("abFixed").classList.toggle("active", mode === "fixed");
     }
@@ -473,26 +518,46 @@
     $("abFixed").onclick = () => switchTo("fixed");
 
     $("playBtn").onclick = () => {
-      if (audioEl.paused) { audioEl.play(); $("playBtn").textContent = "⏸"; }
-      else { audioEl.pause(); $("playBtn").textContent = "▶"; }
-    };
-    audioEl.onended = () => { $("playBtn").textContent = "▶"; };
-
-    audioEl.ontimeupdate = () => {
-      $("timeCur").textContent = fmtDuration(audioEl.currentTime);
-      if (audioEl.duration) {
-        $("playhead").style.left = `${(audioEl.currentTime / audioEl.duration) * 100}%`;
+      if (activeEl().paused) {
+        audioOrig.currentTime = audioFixed.currentTime = activeEl().currentTime;
+        audioOrig.play();
+        audioFixed.play();
+        $("playBtn").textContent = "⏸";
+      } else {
+        audioOrig.pause();
+        audioFixed.pause();
+        $("playBtn").textContent = "▶";
       }
     };
-    audioEl.onloadedmetadata = () => {
-      $("timeTotal").textContent = fmtDuration(audioEl.duration);
+    audioOrig.onended = audioFixed.onended = () => { $("playBtn").textContent = "▶"; };
+
+    const onTimeUpdate = () => {
+      const el = activeEl();
+      $("timeCur").textContent = fmtDuration(el.currentTime);
+      if (el.duration) {
+        $("playhead").style.left = `${(el.currentTime / el.duration) * 100}%`;
+      }
     };
+    audioOrig.ontimeupdate = onTimeUpdate;
+    audioFixed.ontimeupdate = onTimeUpdate;
+
+    const onLoadedMetadata = () => {
+      const el = activeEl();
+      if (el.duration) $("timeTotal").textContent = fmtDuration(el.duration);
+    };
+    audioOrig.onloadedmetadata = onLoadedMetadata;
+    audioFixed.onloadedmetadata = onLoadedMetadata;
 
     const timeline = $("timeline");
     timeline.onclick = (e) => {
       const rect = timeline.getBoundingClientRect();
       const frac = (e.clientX - rect.left) / rect.width;
-      if (audioEl.duration) audioEl.currentTime = frac * audioEl.duration;
+      const el = activeEl();
+      if (el.duration) {
+        const t = frac * el.duration;
+        audioOrig.currentTime = t;
+        audioFixed.currentTime = t;
+      }
     };
 
     drawWaveformPlaceholder();
