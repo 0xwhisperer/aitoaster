@@ -27,13 +27,17 @@ def _resample_mono(audio, sr_in, sr_out):
             os.unlink(out_path)
 
 
-def fix_cnn(stereo_audio, sr, max_steps=300, min_steps=100, hop_sec=2.5,
-            real_check_interval=25, progress_cb=None, step_progress_cb=None):
+def fix_cnn(stereo_audio, sr, max_steps=300, min_steps=100, hop_sec=0.5,
+            real_check_interval=10, progress_cb=None, step_progress_cb=None):
     """Whole-track CNN fix. stereo_audio: [N,2] float32 at native sr.
     Returns (fixed_stereo, info). progress_cb receives log-line strings;
-    step_progress_cb(step, max_steps) receives raw optimizer step counts for
-    UI progress bars, since this stage's internal optimization loop can run
-    for many minutes with no other visible progress signal."""
+    step_progress_cb(step, max_steps, max_surrogate_score, real_check_extra)
+    receives per-step optimizer detail for UI progress bars, since this
+    stage's internal optimization loop can run for many minutes - the last
+    two args mirror what already prints to the server log (the live
+    surrogate estimate every step, plus the periodic real-model re-check's
+    max score and how many windows are still failing) so the browser isn't
+    left with only a bare step count while all the detail stays server-side."""
     mono = stereo_audio.mean(axis=1)
     mono_16k = _resample_mono(mono, sr, CNN_SR) if sr != CNN_SR else mono.copy()
 
@@ -113,5 +117,9 @@ def fix_cnn(stereo_audio, sr, max_steps=300, min_steps=100, hop_sec=2.5,
         "n_windows": len(positions),
         "window_positions_sec": [p / CNN_SR for p in positions],
         "worst_score_after_transfer": float(worst_after_transfer) if worst_after_transfer is not None else None,
-        "verified_after_transfer": bool(worst_after_transfer is not None and worst_after_transfer < 0.5),
+        # 0.08 matches the optimizer's own real_target - a genuine safety
+        # margin below the model's raw 0.5 pass/fail boundary, not just
+        # barely crossing it (see cnn_wholetrack_optimizer_v2.py's real_target
+        # comment for why: a thin margin gets erased by any later stage).
+        "verified_after_transfer": bool(worst_after_transfer is not None and worst_after_transfer < 0.08),
     }

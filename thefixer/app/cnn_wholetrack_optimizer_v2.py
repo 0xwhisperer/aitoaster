@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import torch.nn.functional as F
 from .cnn_differentiable_v2 import (
     forward_logit_differentiable, forward_score_differentiable,
     get_real_score_segment, SR, SEGMENT_SAMPLES,
@@ -18,7 +19,7 @@ from .cnn_gradient_optimizer_v2 import perceptual_penalty, band_limit_penalty, t
 MIN_VIABLE_SEGMENT_SAMPLES = 4000
 
 
-def build_sliding_windows(n_samples, hop_sec=2.5, segment_sec=10.0, sr=SR, edge_guard_sec=0.5):
+def build_sliding_windows(n_samples, hop_sec=0.5, segment_sec=10.0, sr=SR, edge_guard_sec=0.5):
     hop = int(hop_sec * sr)
     seg_len = int(segment_sec * sr)
     edge_guard = int(edge_guard_sec * sr)
@@ -47,26 +48,67 @@ def build_sliding_windows(n_samples, hop_sec=2.5, segment_sec=10.0, sr=SR, edge_
 
     # a window must not touch the literal first OR last sample of the signal -
     # CQT boundary handling produces a NaN-gradient singularity at either edge
-    # (confirmed: start-of-track and end-of-track both trigger this)
+    # (confirmed: start-of-track and end-of-track both trigger this). The
+    # fallback below used to unconditionally append a window starting at
+    # EXACTLY last_valid_start - which places its END exactly at
+    # n_samples - edge_guard, i.e. right back at the boundary the guard
+    # exists to avoid. Verified directly: on a real 277s track this produced
+    # a window ending 0.46s from the literal last sample and its gradient
+    # came back non-finite on step 0 (logit 14.7, near-total confidence,
+    # right where the singularity bites hardest). Clamp the fallback to
+    # last_valid_start - hop instead so the final window keeps the full
+    # edge_guard margin like every other window, even if that means a
+    # slightly larger gap before it than `hop`.
     last_valid_start = n_samples - seg_len - edge_guard
     positions = list(range(edge_guard, max(edge_guard + 1, last_valid_start), hop))
-    if not positions or positions[-1] < last_valid_start:
-        positions.append(max(edge_guard, last_valid_start))
+    if not positions:
+        positions.append(edge_guard)
+    elif positions[-1] < last_valid_start:
+        safe_last = last_valid_start - hop
+        if safe_last > positions[-1]:
+            positions.append(safe_last)
     return positions, seg_len
 
 
 def optimize_whole_track_verified(
     audio_np,
     target=0.05,
-    real_target=0.35,  # be conservative on the REAL score target, since surrogate is optimistic
+    real_target=0.08,  # a real production run showed accepting anything under
+    # the model's raw 0.5 decision boundary (its old default of 0.35, or even
+    # accepting up to 0.5) leaves almost no safety margin: a file that reached
+    # 0.48 internally regressed to 0.999 the moment ANY later stage (here: the
+    # linear re-verification pass) nudged the audio at all. Linear's own
+    # target is 50x stricter than its 0.5 pass boundary (0.01 vs 0.5) for
+    # exactly this reason - a small margin gets erased by any later change.
+    # 0.08 mirrors that same margin-over-boundary ratio for cnn.
     lambda_perceptual=2000.0,
     lambda_band=5000.0,
     lambda_tonality=50.0,
     lr=0.00002,
     max_steps=600,
     min_steps=150,
-    hop_sec=2.5,
-    real_check_interval=25,
+    hop_sec=0.5,  # was 2.5 - confirmed directly on a real production file that
+    # the real (non-differentiable) detector's score oscillates wildly
+    # (0% to 99.99%+) with a period of roughly 0.8-0.9s on CNN-corrected
+    # audio - a 2.5s hop can skip 2-3 full oscillation cycles between
+    # sampled windows entirely, so the optimizer "converges" against its own
+    # sparse sampling while leaving most of the actual timeline unfixed
+    # (verified: optimizer reported 0/67 windows failing while the real
+    # detector's fixed 5-segment scan still landed on two ~100%-flagged
+    # positions the optimizer never checked). This same instability does
+    # NOT exist on unmodified source audio (verified: rock-stable ~99.9%
+    # regardless of sub-second offset) - it's specifically introduced by
+    # the correction overfitting to its own sparse sampling grid. 0.5s
+    # keeps at least one sample inside every observed "good" oscillation
+    # window instead of being able to skip over sub-second corrected
+    # regions entirely.
+    real_check_interval=10,  # was 25 - the real-model check is the only trustworthy
+    # progress signal (the surrogate/live-estimate is known to diverge sharply from
+    # the real model - see the transfer-loss investigation elsewhere in this file's
+    # history), so checking every 10 steps instead of 25 means the UI's meaningful
+    # progress detail (windows still failing, real max score) updates ~2.5x more
+    # often during a run that can otherwise take 9+ minutes with long silent gaps.
+
     verbose=True,
     progress_cb=None,
 ):
@@ -100,8 +142,50 @@ def optimize_whole_track_verified(
     optimizer = torch.optim.Adam([delta], lr=lr)
 
     logit_target = torch.logit(torch.tensor(target), eps=1e-6)
-    # per-window extra weight, boosted when the real model disagrees with the surrogate
-    window_weight = {pos: 1.0 for pos in positions}
+
+    # seed each window's weight from the REAL model's score on the untouched
+    # original audio, not just 1.0 - confirmed on a real production file that
+    # the differentiable surrogate can be badly wrong on specific windows
+    # (one window: surrogate said 17% AI, real model said 92% AI) even before
+    # any optimization happens. Waiting for the first periodic real-check
+    # (step 25) to notice this via the *= 1.5 boost means ~25 steps run with
+    # near-zero pressure on exactly the windows that need it most, since the
+    # main gradient loss trusts a surrogate that already thinks they're fine.
+    # Seeding from real scores up front means blind-spot windows get strong
+    # pressure from step 0 - the periodic re-check loop below still runs and
+    # keeps adjusting weight_window as delta evolves, this only fixes the
+    # starting point.
+    print("checking initial real-model score per window (before any optimization)...", flush=True)
+    window_weight = {}
+    audio_np_orig = audio_np
+    for pos in positions:
+        seg_np = audio_np_orig[pos:pos + seg_len]
+        real0 = get_real_score_segment(seg_np)
+        # same 1.0-20.0 scale and threshold the periodic re-check already uses,
+        # just applied before step 0 instead of first appearing at step 25
+        window_weight[pos] = min(20.0, 1.0 + 19.0 * max(0.0, real0 - real_target) / max(1e-6, 1.0 - real_target)) \
+            if real0 > real_target else 1.0
+    n_seeded_hot = sum(1 for w in window_weight.values() if w > 1.0)
+
+    # a real production file had 107/108 windows already scoring above
+    # real_target pre-optimization - applying the FULL 1.0-20.0 boost range
+    # simultaneously across nearly the entire track made the combined loss
+    # (and its gradient through the single shared delta tensor) blow up to
+    # non-finite on step 0 (verified directly: this exact crash reproduced
+    # with the un-normalized boost). Most windows needing SOME extra push is
+    # normal and fine; ALL of them needing the same near-max push at once is
+    # not something the existing lr/loss scale was tuned to handle. Rescale
+    # so the total pressure across all windows starts near what the un-seeded
+    # code would apply (average weight ~1.0), preserving each window's
+    # RELATIVE priority from the real-score gap without inflating the sum.
+    total_weight = sum(window_weight.values())
+    if total_weight > 0:
+        norm = len(positions) / total_weight
+        window_weight = {pos: w * norm for pos, w in window_weight.items()}
+
+    print(f"  {n_seeded_hot}/{len(positions)} windows started with boosted weight "
+          f"(real score already above real_target={real_target} pre-optimization), "
+          f"rescaled so total pressure matches the un-seeded baseline", flush=True)
 
     best_delta = None
     best_real_max = 1.0
@@ -116,7 +200,27 @@ def optimize_whole_track_verified(
             seg = perturbed[pos:pos + seg_len]
             logit = forward_logit_differentiable(seg.unsqueeze(0))
             w = window_weight[pos]
-            total_logit_loss = total_logit_loss + w * torch.relu(logit - logit_target + 1.0)
+            margin_term = logit - logit_target + 1.0
+            # CRITICAL FIX: plain relu(margin_term) is EXACTLY zero, with
+            # EXACTLY zero gradient, the instant a window's surrogate score
+            # drops low enough to clear the margin. Confirmed as the actual
+            # mechanism stalling every full-track CNN run this session: once
+            # a window "looks solved" to the differentiable surrogate, this
+            # term goes flat and boosting window_weight on it (even up to
+            # the 20x cap) multiplies zero by up to 20 and gets zero back -
+            # no amount of per-window weight can revive a term with no slope
+            # to amplify. That's why stuck windows stayed frozen at whatever
+            # score they'd already reached instead of continuing to improve,
+            # even while the REAL detector still flagged them.
+            # Fix: leaky_relu instead of relu - full gradient strength above
+            # the margin (identical behavior to before there), but a small
+            # residual negative slope below it, so a window the real model
+            # still disagrees with keeps getting pushed even after clearing
+            # its own surrogate's satisfied point. The residual slope is
+            # weighted by w same as before, so window_weight's per-window
+            # boosting is meaningful again everywhere, not just before a
+            # window first clears its margin.
+            total_logit_loss = total_logit_loss + w * F.leaky_relu(margin_term, negative_slope=0.02)
             with torch.no_grad():
                 s = torch.sigmoid(logit).item()
                 max_surrogate_score = max(max_surrogate_score, s)
@@ -146,7 +250,7 @@ def optimize_whole_track_verified(
         optimizer.step()
 
         if progress_cb is not None:
-            progress_cb(step, max_steps)
+            progress_cb(step, max_steps, max_surrogate_score, None)
 
         if verbose and step % 5 == 0:
             snr = 20 * torch.log10(audio.norm() / (delta.norm() + 1e-8)).item()
@@ -166,6 +270,10 @@ def optimize_whole_track_verified(
             if verbose:
                 print(f"    [real check @ step {step}] max_real_score={real_max:.4f}, "
                       f"{n_bad}/{len(positions)} windows still above real_target={real_target}", flush=True)
+            if progress_cb is not None:
+                progress_cb(step, max_steps, max_surrogate_score, {
+                    "real_max_score": real_max, "n_windows_bad": n_bad, "n_windows": len(positions),
+                })
 
             # boost weight for windows where real score is still too high
             for pos in positions:

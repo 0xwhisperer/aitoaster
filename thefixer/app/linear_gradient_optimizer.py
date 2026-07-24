@@ -96,15 +96,30 @@ def _real_score_for_delta(delta, audio_orig):
 
 def optimize(audio_orig, lambda_perceptual=2000.0, lambda_band=5000.0, lambda_tonality=50.0,
              target=0.01, real_target=0.05, max_steps=400, lr=0.00002,
-             real_check_interval=50, verbose=True, progress_cb=None):
+             real_check_interval=50, verbose=True, progress_cb=None, retry_index=0):
     """Full per-sample gradient optimization: delta is a free-form waveform
     perturbation (not constrained to any fixed set of frequencies), optimized
     to minimize [detector score + perceptual penalty + out-of-band penalty]
     jointly. Periodically re-verifies against the REAL (non-differentiable)
     model rather than trusting the surrogate's own score, and only accepts a
     candidate as "best" once the real model confirms it - the surrogate can
-    look perfect (score ~0) while the real model still flags the result."""
-    delta = torch.zeros_like(audio_orig, requires_grad=True)
+    look perfect (score ~0) while the real model still flags the result.
+
+    retry_index distinguishes repeated calls on the same audio (from
+    fix_linear's retry loop): starting every retry from an identical
+    zero-init delta with near-identical loss weights makes Adam reliably
+    re-converge to the SAME local optimum instead of trying something
+    different - confirmed on real production runs where attempts 1-2 and
+    3-4 landed on bit-identical scores despite a tightened target. Nudging
+    the init and the loss weights slightly per retry_index makes each retry
+    an actually different search instead of a near-repeat of the last one."""
+    if retry_index > 0:
+        gen = torch.Generator().manual_seed(1000 + retry_index)
+        delta = (torch.randn(audio_orig.shape, generator=gen) * 1e-5).requires_grad_(True)
+        lr = lr * (1.0 + 0.15 * retry_index)
+        lambda_perceptual = lambda_perceptual * (1.0 - 0.1 * min(retry_index, 3))
+    else:
+        delta = torch.zeros_like(audio_orig, requires_grad=True)
     optimizer = torch.optim.Adam([delta], lr=lr)
 
     best_delta = None

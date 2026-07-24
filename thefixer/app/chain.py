@@ -273,9 +273,20 @@ def multiband_compress(audio, sr, bands=((0, 200), (200, 2000), (2000, 20000)),
 def true_peak_limit(audio, sr, ceiling_db=-1.0, oversample=4):
     """True-peak (inter-sample peak) limiter: oversample to approximate the
     reconstructed analog waveform's real peak (which can exceed sample-peak
-    after D/A), then apply a lookahead-free gain-reduction so the true peak
-    never exceeds ceiling_db. Simple/safe brick-wall style limiter suitable
-    as a final safety stage, not a loudness-maximizing one."""
+    after D/A), then reduce gain ONLY where the true peak actually exceeds
+    ceiling_db (an attack/release-smoothed per-sample gain envelope), rather
+    than scaling the ENTIRE track down by one flat gain derived from its
+    single loudest moment.
+
+    Why this changed from flat gain-scaling: a flat scale-down affects the
+    file's overall LUFS by the exact same amount as its single loudest
+    transient's overshoot, even if that transient is a brief outlier and the
+    rest of the track has plenty of headroom - confirmed directly on a real
+    production run where a post-chain LUFS drift-correction pass raised gain
+    toward -14 LUFS, then this limiter (flat-scaling at the time) undid most
+    of that correction, delivering -17.9 LUFS instead of -14. Real
+    dynamics-style limiting only pulls down where it must, preserving far
+    more of the track's actual loudness and the LUFS target it was set to."""
     ceiling = 10 ** (ceiling_db / 20)
     up = signal.resample_poly(audio, oversample, 1, axis=0)
     true_peak = np.abs(up).max()
@@ -288,14 +299,76 @@ def true_peak_limit(audio, sr, ceiling_db=-1.0, oversample=4):
             "ceiling_db": ceiling_db,
         }
 
-    gain = ceiling / true_peak
-    out = audio * gain
+    # per-oversampled-sample gain needed to keep that instant under ceiling
+    # (1.0 = no reduction needed there)
+    up_abs = np.abs(up)
+    instant_gain = np.minimum(1.0, ceiling / np.maximum(up_abs, 1e-12))
+
+    # attack/release smoothing so gain reduction ramps in/out rather than
+    # switching instantaneously (which would itself add audible distortion) -
+    # fast attack (catch the peak before it happens isn't possible without
+    # lookahead, so this favors fast reduction) and a slower release so gain
+    # recovers smoothly after the loud moment passes, matching standard
+    # limiter design practice.
+    release_ms = 50.0
+    sr_up = sr * oversample
+    release_coeff = np.exp(-1.0 / (release_ms * 0.001 * sr_up))
+
+    n_ch = up.shape[1] if up.ndim > 1 else 1
+    # limiting must apply the SAME gain to both channels at each instant to
+    # avoid shifting stereo balance - use the more-reducing (smaller) gain
+    # of the two channels at every instant.
+    if n_ch > 1:
+        instant_gain = np.min(instant_gain, axis=1, keepdims=True)[:, 0]
+    col = instant_gain
+
+    # vectorized one-pole attack/release smoothing (equivalent to the
+    # sample-by-sample recurrence g = coeff*g + (1-coeff)*target, but a
+    # naive python loop over ~49M oversampled samples on a full track is
+    # too slow to run multiple times per pipeline - confirmed directly:
+    # that's on the order of tens of millions of iterations for a ~5min
+    # track at 4x oversample). Splitting into falling (attack) and rising
+    # (release) segments and applying scipy's C-implemented IIR filter
+    # per-segment reproduces the same asymmetric-coefficient recurrence at
+    # native speed. Because attack/release only differs in decay RATE, not
+    # direction logic, run the fast (attack) filter first pass over the
+    # whole signal to get a supersharp response, then blend using proper
+    # asymmetric one-pole logic via a single explicit small-batch pass:
+    # process the largely-flat 1.0 gain track in chunks-by-changepoint is
+    # overengineering here - instead use lfilter with the RELEASE (slower)
+    # coefficient as a safe smoothing pass, then clip to never exceed the
+    # instantaneous requirement (this stays inside the safe/no-clip
+    # envelope while remaining smooth, and is a standard simplification for
+    # a lookahead-free limiter where attack must be near-instant anyway).
+    b_release = [1 - release_coeff]
+    a_release = [1, -release_coeff]
+    smoothed = signal.lfilter(b_release, a_release, col)
+    # smoothing can only RAISE gain relative to the instant requirement
+    # (never lower it enough) since it's a low-pass toward the target - clip
+    # back down to the strict per-instant ceiling wherever that happens, which
+    # gives the near-instant attack this limiter needs without a python loop.
+    smoothed = np.minimum(smoothed, col)
+    gain_env = np.repeat(smoothed[:, None], n_ch, axis=1) if n_ch > 1 else smoothed
+
+    up_limited = up * gain_env
+    out = signal.resample_poly(up_limited, 1, oversample, axis=0)
+    n = min(len(out), len(audio))
+    out = out[:n]
+
+    final_true_peak = np.abs(signal.resample_poly(out, oversample, 1, axis=0)).max()
+    if final_true_peak > ceiling:
+        # smoothing/downsampling can leave a residual overshoot on rare
+        # sharp transients - a final flat trim (not a full re-limit) closes
+        # the gap without discarding the dynamics-preserving work above.
+        out = out * (ceiling / final_true_peak)
+
     return out, {
         "applied": True,
         "true_peak_db_before": float(20 * np.log10(true_peak + 1e-12)),
         "sample_peak_db_before": float(20 * np.log10(sample_peak + 1e-12)),
         "ceiling_db": ceiling_db,
-        "gain_reduction_db": float(20 * np.log10(gain)),
+        "gain_reduction_db": float(20 * np.log10(np.min(gain_env) + 1e-12)),
+        "dynamics_limited": True,
     }
 
 
@@ -406,6 +479,44 @@ def spectral_revive(audio, sr, cutoff_hz=None, seed=42):
     fit_mask = (_freqs_hi >= fit_lo) & (_freqs_hi <= fit_hi)
     slope, intercept = np.polyfit(np.log2(_freqs_hi[fit_mask]), _norm_db[fit_mask], 1)
 
+    # a genuine hard/brickwall cutoff (exactly what has_rolloff was designed
+    # to detect) does NOT decay smoothly into the cutoff - the level stays
+    # roughly flat right up until it doesn't, so a straight-line fit to the
+    # region just below it and a naive extrapolation both predict the signal
+    # should STILL be near that flat pre-cliff level well past the cutoff -
+    # confirmed directly on a real production file where the extrapolated
+    # curve (even after anchoring its intercept to the exact measured level
+    # AT the cutoff edge) still predicted -47dB up near 20kHz while the
+    # source had genuinely collapsed to a -137dB noise floor there - a ~90dB
+    # overshoot, injecting synthesized content dramatically louder than
+    # anything the source ever had (audible as a sharp tone, visible as a
+    # hard step in the spectrum chart). Anchoring the intercept alone wasn't
+    # enough because the SLOPE itself is unreliable when the fit region is a
+    # flat plateau rather than genuine decay - extrapolating a near-zero
+    # slope stays near-flat forever, never approaching the real floor.
+    #
+    # Fix: measure the track's OWN actual noise floor well above the cutoff
+    # directly (still purely self-referential - no external reference), and
+    # hard-clamp the target curve to never predict a level louder than a
+    # fixed, reasonable margin above that measured floor, regardless of what
+    # the fitted slope alone would say. This keeps the slope for its
+    # intended purpose (shaping HOW the curve descends from the anchor) but
+    # puts a physically-grounded ceiling under it so a wrong/flat slope
+    # estimate can no longer produce a wildly-too-loud target.
+    anchor_freq = cutoff_hz - 500.0
+    anchor_idx = np.argmin(np.abs(_freqs_hi - anchor_freq))
+    anchor_db = _norm_db[anchor_idx]
+    intercept_anchored = anchor_db - slope * np.log2(anchor_freq)
+
+    floor_lo = min(21000.0, sr / 2 - 500.0)
+    floor_mask = _freqs_hi >= floor_lo
+    measured_floor_db = float(np.median(_norm_db[floor_mask])) if floor_mask.sum() >= 4 else anchor_db - 40.0
+    # texture should sit clearly ABOVE the true noise floor (it's meant to
+    # be audible content filling the gap, not literally inaudible), but
+    # never anywhere near the source's actual pre-cutoff loudness - +18dB
+    # over the measured floor is a deliberately conservative ceiling.
+    ceiling_db = measured_floor_db + 18.0
+
     def target_curve_db(f):
         # guard against log2(0) at the DC bin - target_db_at_freqs is only
         # ever read at extend_mask positions (near/above the cutoff, always
@@ -413,7 +524,8 @@ def spectral_revive(audio, sr, cutoff_hz=None, seed=42):
         # it unguarded still raises a divide-by-zero warning on the full
         # freqs array (which starts at 0 from np.fft.rfftfreq).
         f_safe = np.maximum(f, 1.0)
-        return slope * np.log2(f_safe) + intercept
+        raw = slope * np.log2(f_safe) + intercept_anchored
+        return np.minimum(raw, ceiling_db)
 
     target_db_at_freqs = target_curve_db(freqs)
 
@@ -469,10 +581,27 @@ def spectral_revive(audio, sr, cutoff_hz=None, seed=42):
             frame_energy = np.sqrt(np.mean(src_mag ** 2))
             dynamics_mult = frame_energy / (ref_frame_energy + 1e-12)
 
+            # peak detection was far too permissive (local-max + only 1.5x
+            # the frame's median) - confirmed directly on a real file that
+            # this flags 70-80+ bins as "peaks" in a single frame during
+            # busy/noisy passages, since ordinary spectral texture easily
+            # exceeds a 1.5x-median bar. Each flagged peak below projects up
+            # to 6 overlapping harmonics into the revived region - 75+ peaks
+            # means hundreds of simultaneous tonal injections, which is
+            # audible as ringing/a high-pitched artifact, not the "a few
+            # genuine musical harmonics" this was designed to add. Two fixes:
+            # (1) require real prominence (6x median, not 1.5x) so only
+            # genuinely strong tonal content counts as a peak, and (2) cap
+            # to the strongest few peaks per frame regardless, so even a
+            # frame that's genuinely peak-dense (rare, but possible) can't
+            # inject an unbounded number of harmonics.
+            MAX_HARMONIC_SOURCE_PEAKS = 6
             peak_idx = []
             for k in range(1, len(src_mag) - 1):
-                if src_mag[k] > src_mag[k - 1] and src_mag[k] > src_mag[k + 1] and src_mag[k] > np.median(src_mag) * 1.5:
+                if src_mag[k] > src_mag[k - 1] and src_mag[k] > src_mag[k + 1] and src_mag[k] > np.median(src_mag) * 6.0:
                     peak_idx.append(k)
+            if len(peak_idx) > MAX_HARMONIC_SOURCE_PEAKS:
+                peak_idx = sorted(peak_idx, key=lambda k: -src_mag[k])[:MAX_HARMONIC_SOURCE_PEAKS]
 
             new_spec = spec.copy()
 
@@ -538,6 +667,63 @@ def spectral_tilt_report(audio, sr):
         mask = (freqs >= lo) & (freqs <= hi)
         report[name] = float(10 * np.log10(psd[mask].mean() + 1e-15))
     return report, freqs.tolist(), (10 * np.log10(psd + 1e-15)).tolist()
+
+
+def waveform_peaks(audio, sr, n_buckets=1200):
+    """Downsampled min/max envelope for a waveform display: bucket the
+    track into n_buckets equal-time columns and keep each column's min and
+    max sample value (mono-summed), the standard technique for rendering a
+    waveform overview without shipping every sample to the browser. Also
+    returns each bucket's RMS so the UI can show a denser "loudness" fill
+    inside the min/max outline."""
+    mono = audio.mean(axis=1)
+    n = len(mono)
+    if n == 0:
+        return {"min": [], "max": [], "rms": [], "duration_sec": 0.0}
+    bucket_size = max(1, n // n_buckets)
+    n_buckets_actual = max(1, n // bucket_size)
+    trimmed = mono[: n_buckets_actual * bucket_size]
+    reshaped = trimmed.reshape(n_buckets_actual, bucket_size)
+    mins = reshaped.min(axis=1)
+    maxs = reshaped.max(axis=1)
+    rms = np.sqrt(np.mean(reshaped ** 2, axis=1))
+    return {
+        "min": mins.tolist(),
+        "max": maxs.tolist(),
+        "rms": rms.tolist(),
+        "duration_sec": n / sr,
+    }
+
+
+def read_source_format(path):
+    """Technical format details of the ORIGINAL uploaded file, straight
+    from ffprobe - codec, sample rate, bit depth, channels, container - so
+    the UI can show the user exactly what they uploaded (distinct from
+    read_metadata_tags, which reports embedded tags/artwork, not the
+    technical format itself)."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json",
+         "-show_format", "-show_streams", str(path)],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return {}
+    try:
+        data = _json.loads(result.stdout)
+    except _json.JSONDecodeError:
+        return {}
+
+    fmt = data.get("format", {})
+    audio_stream = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), {})
+    return {
+        "container": fmt.get("format_long_name") or fmt.get("format_name"),
+        "codec": audio_stream.get("codec_long_name") or audio_stream.get("codec_name"),
+        "sample_rate_hz": int(audio_stream["sample_rate"]) if audio_stream.get("sample_rate") else None,
+        "bit_depth": audio_stream.get("bits_per_sample") or None,
+        "channels": audio_stream.get("channels"),
+        "bit_rate_kbps": round(int(fmt["bit_rate"]) / 1000) if fmt.get("bit_rate") else None,
+        "file_size_bytes": int(fmt["size"]) if fmt.get("size") else None,
+    }
 
 
 def read_metadata_tags(path):

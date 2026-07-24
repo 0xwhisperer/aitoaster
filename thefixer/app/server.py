@@ -80,21 +80,33 @@ def save_stereo(path, audio, sr=44100):
     sf.write(str(path), audio_clipped, sr, subtype="PCM_16")
 
 
-OUTPUT_FORMAT_EXTENSIONS = {"wav": ".wav", "mp3": ".mp3", "flac": ".flac"}
+OUTPUT_FORMAT_EXTENSIONS = {"wav": ".wav", "mp3": ".mp3", "flac": ".flac", "m4a": ".m4a"}
+
+
+# extensions this app can actually re-encode to for "same as source" -
+# anything outside this set (ogg, aiff, wma, opus, etc.) falls back to wav,
+# but resolve_output_format now reports that explicitly rather than
+# silently substituting a different format than what was actually promised.
+SAME_AS_SOURCE_SUPPORTED = {"mp3": "mp3", "flac": "flac", "m4a": "m4a", "aac": "m4a", "wav": "wav"}
 
 
 def resolve_output_format(requested_format, original_upload_path):
     """"same" means match the original upload's container; anything else is
-    taken literally. Falls back to wav if the source extension isn't one of
-    the formats this app knows how to encode to."""
+    taken literally. Returns (resolved_format, fallback_warning_or_None) -
+    fallback_warning is set only when "same" was requested but this app
+    can't encode to the source's actual format, so the caller can tell the
+    user honestly rather than silently deliver a different format than what
+    "same as source" implied. Confirmed as a real gap: an uploaded .m4a
+    with "same as source" selected was silently delivered as .wav with no
+    indication anything had changed from what was requested."""
     if requested_format != "same":
-        return requested_format
+        return requested_format, None
     ext = Path(original_upload_path).suffix.lower().lstrip(".")
-    if ext in ("mp3",):
-        return "mp3"
-    if ext in ("flac",):
-        return "flac"
-    return "wav"
+    resolved = SAME_AS_SOURCE_SUPPORTED.get(ext)
+    if resolved:
+        return resolved, None
+    return "wav", (f"the source file is .{ext}, which this app can't re-encode to - "
+                    f"delivering as .wav instead of matching the original format")
 
 
 def encode_final_output(audio, sr, out_format, dest_path_no_ext, mp3_mode="vbr0"):
@@ -137,6 +149,10 @@ def encode_final_output(audio, sr, out_format, dest_path_no_ext, mp3_mode="vbr0"
             cmd = ["ffmpeg", "-v", "quiet", "-y", "-i", str(tmp_wav),
                    "-map_metadata", "-1", "-codec:a", "flac",
                    str(final_path)]
+        elif out_format == "m4a":
+            cmd = ["ffmpeg", "-v", "quiet", "-y", "-i", str(tmp_wav),
+                   "-map_metadata", "-1", "-codec:a", "aac", "-b:a", "256k",
+                   "-f", "mp4", str(final_path)]
         else:
             raise ValueError(f"unknown output format: {out_format}")
         subprocess.run(cmd, check=True)
@@ -216,11 +232,13 @@ def upload():
         return jsonify({"error": "could not decode audio file"}), 400
 
     duration_sec = len(audio) / 44100
+    source_format = chain.read_source_format(saved_path)
     return jsonify({
         "file_id": file_id,
         "filename": f.filename,
         "duration_sec": round(duration_sec, 2),
         "samples": len(audio),
+        "source_format": source_format,
     })
 
 
@@ -256,6 +274,7 @@ def analyze(file_id):
     dc = audio.mean(axis=0)
     transients = chain.detect_transients(audio, 44100)
     tilt_report, freqs, psd_db = chain.spectral_tilt_report(audio, 44100)
+    waveform = chain.waveform_peaks(audio, 44100)
 
     _, silence_info = chain.trim_silence(audio, 44100)
 
@@ -308,6 +327,7 @@ def analyze(file_id):
         "transients": transients,
         "spectral_tilt": tilt_report,
         "spectrum": {"freqs": freqs, "psd_db": psd_db},
+        "waveform": waveform,
         "metadata": metadata,
         "provenance_tags_found": provenance_hits,
         "has_embedded_images": has_embedded_images,
@@ -334,11 +354,24 @@ def analyze(file_id):
 # ceiling. Both AI fixes already have their own last-resort peak clamp, but
 # that's a blunt sample-peak scale-down, not an inter-sample-peak-aware
 # limiter, so true_peak_limit still belongs after them as the real final stage.
+# cnn_fix runs BEFORE linear_fix, not after - flipped from the original
+# order based on evidence gathered across many production runs: cnn_fix is
+# the far more fragile, harder-to-converge fix (even after tightening its
+# sampling density, it's still only marginal on real files), while
+# linear_fix is fast, reliable, and already has a cheap, working post-chain
+# re-verification pass. Both fixes can disturb each other when run back to
+# back (documented separately for each direction: a verified linear score
+# regressing after cnn_fix ran on top of it, and a verified cnn_fix score
+# regressing after linear's re-verify pass ran on top of IT) - so ordering
+# alone can't fully solve this, but putting the fast/cheap-to-redo fix
+# (linear) LAST means ITS re-verify pass is the final safety net, rather
+# than leaving the slow/expensive fix (cnn) unprotected at the very end of
+# the chain, which is what the previous order did.
 TOOL_ORDER = [
     "strip_metadata", "trim_silence", "dc_offset", "fix_transients",
     "spectral_revive", "high_pass",
     "fix_phase", "normalize_lufs", "multiband_compress",
-    "linear_fix", "cnn_fix",
+    "cnn_fix", "linear_fix",
     "true_peak_limit",
 ]
 
@@ -401,6 +434,16 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                     "tags_found": all_tags,
                     "has_embedded_images": has_images,
                 }
+                if all_tags:
+                    tag_summary = ", ".join(f"{k}={v!r}" for k, v in all_tags.items())
+                    job_log(job_id, f"  found and removing tags: {tag_summary}")
+                else:
+                    job_log(job_id, "  no text tags found on the source file")
+                if has_images:
+                    n_images = sum(1 for s in metadata["streams"] if s["is_attached_image"])
+                    job_log(job_id, f"  found and removing {n_images} embedded image(s) (e.g. cover art)")
+                else:
+                    job_log(job_id, "  no embedded images found")
             elif tool == "trim_silence":
                 audio, info = chain.trim_silence(audio, sr)
                 # track how much was cut from the FRONT specifically, so any
@@ -432,12 +475,27 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
             elif tool == "cnn_fix":
                 from .cnn_fix import fix_cnn
                 cnn_max_steps = options.get("cnn_max_steps", 300)
+
+                def _cnn_step_cb(s, mx, surrogate_score, real_check_extra):
+                    # real_check_extra's values come from get_real_score_segment,
+                    # which returns numpy float32 - round() does not convert that
+                    # to a native python float, and Flask's json encoder can't
+                    # serialize numpy scalar types (this exact bug class already
+                    # hit twice earlier this session in other fields). float()
+                    # first, then round.
+                    extra = {"score_pct": round(float(surrogate_score) * 100, 4)}
+                    if real_check_extra is not None:
+                        extra["real_max_score_pct"] = round(float(real_check_extra["real_max_score"]) * 100, 4)
+                        extra["windows_failing"] = int(real_check_extra["n_windows_bad"])
+                        extra["windows_total"] = int(real_check_extra["n_windows"])
+                    job_set_sub_progress(job_id, s, mx, extra=extra)
+
                 audio, info = fix_cnn(audio, sr,
                                        max_steps=cnn_max_steps,
                                        min_steps=options.get("cnn_min_steps", 100),
-                                       hop_sec=options.get("cnn_hop_sec", 2.5),
+                                       hop_sec=options.get("cnn_hop_sec", 0.5),
                                        progress_cb=lambda m: job_log(job_id, m),
-                                       step_progress_cb=lambda s, mx: job_set_sub_progress(job_id, s, mx))
+                                       step_progress_cb=_cnn_step_cb)
             elif tool == "fix_phase":
                 audio, info = chain.fix_phase_issues(audio, sr)
             elif tool == "normalize_lufs":
@@ -507,6 +565,90 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 if recheck_path.exists():
                     recheck_path.unlink()
 
+            # CNN re-check must run UNCONDITIONALLY here, not only inside the
+            # "linear needed a redo" branch above - confirmed directly on a
+            # real production run where linear was ALREADY fine post-chain
+            # (0.155%, no redo triggered) and this whole check was skipped
+            # entirely, so nothing ever re-verified cnn after true_peak_limit
+            # ran. cnn_fix's own internal check had reached a genuine pass
+            # (1.09%), but the delivered file scored 99.7% - the limiter
+            # alone was enough to disturb it, independent of whether linear
+            # needed anything. This is the SAME class of bug fixed once
+            # before (a 48%-internal result shipping as 99.9% when linear DID
+            # need a redo) - that fix was scoped too narrowly and only closed
+            # half the gap. Always check the truly final audio, full stop.
+            cnn_recheck_path = OUTPUT_DIR / f"_cnn_recheck_{uuid.uuid4().hex[:8]}.wav"
+            try:
+                save_stereo(cnn_recheck_path, audio, sr)
+                cnn_recheck_score = scorer.cnn.predict(str(cnn_recheck_path))["probability"]
+                job_log(job_id, f"  post-chain cnn score: {cnn_recheck_score * 100:.3f}%")
+                # re-trigger at 0.08 (the optimizer's own real_target), not
+                # 0.5 (the model's raw pass/fail boundary) - waiting until a
+                # full regression back to "flagged" is exactly the gap that
+                # let a 48% result silently ship as 99.9%; catching any loss
+                # of safety margin, not just a full regression, is the point.
+                if cnn_recheck_score >= 0.08:
+                    job_log(job_id, "  cnn lost its safety margin (or regressed) after later chain stages - re-running cnn_fix once more on the final signal")
+                    from .cnn_fix import fix_cnn
+                    t0 = time.time()
+
+                    def _cnn_reverify_step_cb(s, mx, surrogate_score, real_check_extra):
+                        extra = {"score_pct": round(float(surrogate_score) * 100, 4)}
+                        if real_check_extra is not None:
+                            extra["real_max_score_pct"] = round(float(real_check_extra["real_max_score"]) * 100, 4)
+                            extra["windows_failing"] = int(real_check_extra["n_windows_bad"])
+                            extra["windows_total"] = int(real_check_extra["n_windows"])
+                        job_set_sub_progress(job_id, s, mx, extra=extra)
+
+                    audio, cnn_reverify_info = fix_cnn(
+                        audio, sr,
+                        max_steps=options.get("cnn_max_steps", 300),
+                        min_steps=options.get("cnn_min_steps", 100),
+                        hop_sec=options.get("cnn_hop_sec", 0.5),
+                        progress_cb=lambda m: job_log(job_id, m),
+                        step_progress_cb=_cnn_reverify_step_cb,
+                    )
+                    cnn_reverify_info["tool"] = "cnn_fix_reverify"
+                    cnn_reverify_info["label"] = "AI-detector fix: CNN model (re-verification pass)"
+                    cnn_reverify_info["elapsed_sec"] = round(time.time() - t0, 2)
+                    cnn_reverify_info["triggered_by"] = f"post-chain recheck showed {cnn_recheck_score * 100:.3f}%"
+                    steps.append(cnn_reverify_info)
+                    job_log(job_id, f"  done ({cnn_reverify_info['elapsed_sec']}s)")
+
+                    if "true_peak_limit" in tools:
+                        job_log(job_id, "re-running true-peak limiter after cnn re-verification pass")
+                        t0 = time.time()
+                        audio, limiter_info2 = chain.true_peak_limit(
+                            audio, sr, ceiling_db=options.get("ceiling_db", -1.0))
+                        limiter_info2["tool"] = "true_peak_limit_reverify_cnn"
+                        limiter_info2["label"] = "True-peak limiter (post-cnn-reverification safety pass)"
+                        limiter_info2["elapsed_sec"] = round(time.time() - t0, 2)
+                        steps.append(limiter_info2)
+                        job_log(job_id, f"  done ({limiter_info2['elapsed_sec']}s)")
+
+                    # this cnn re-run could, in turn, disturb linear again the
+                    # same way the ORIGINAL cnn_fix pass did (documented
+                    # above: a verified 1.56% became 9.65%) - rather than
+                    # ping-pong indefinitely between the two, do ONE final
+                    # cheap linear check (no re-optimization) and log honestly
+                    # if it regressed rather than silently shipping a result
+                    # nothing verified.
+                    final_linear_check_path = OUTPUT_DIR / f"_final_lincheck_{uuid.uuid4().hex[:8]}.wav"
+                    try:
+                        save_stereo(final_linear_check_path, audio, sr)
+                        final_linear_score = scorer.linear.predict(str(final_linear_check_path))["probability"]
+                        if final_linear_score >= 0.01:
+                            job_log(job_id, f"  WARNING: linear regressed to {final_linear_score * 100:.3f}% "
+                                             f"after the cnn re-verification pass - not re-running again to "
+                                             f"avoid an unbounded linear/cnn ping-pong; the delivered file may "
+                                             f"still be flagged by the linear model")
+                    finally:
+                        if final_linear_check_path.exists():
+                            final_linear_check_path.unlink()
+            finally:
+                if cnn_recheck_path.exists():
+                    cnn_recheck_path.unlink()
+
         # Final LUFS re-verification pass: normalize_lufs runs mid-chain, but
         # every stage after it (multiband compression, both AI-detector
         # fixes, the limiter) can shift overall loudness without anything
@@ -558,6 +700,25 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                     steps.append(limiter_info2)
                     job_log(job_id, f"  done ({limiter_info2['elapsed_sec']}s)")
 
+                # the limiter now does real dynamics limiting (only reduces
+                # gain where peaks actually exceed ceiling), which preserves
+                # LUFS far better than the old flat-scale approach - but on
+                # an extremely peaky/already-loud track, hitting the target
+                # LUFS AND the true-peak ceiling simultaneously can still be
+                # genuinely impossible (there's no amount of limiting that
+                # raises quiet passages without also raising the peaks that
+                # are already at the ceiling). Rather than silently deliver
+                # a file that's still off-target with no explanation, check
+                # the truly final LUFS and say so honestly if it didn't
+                # fully land on target.
+                actual_final_lufs = chain.measure_lufs(audio, sr)
+                if np.isfinite(actual_final_lufs) and abs(actual_final_lufs - target_lufs) > 0.5:
+                    job_log(job_id, f"  WARNING: delivered file is {actual_final_lufs:.1f} LUFS, "
+                                     f"still {abs(actual_final_lufs - target_lufs):.1f}dB from the "
+                                     f"{target_lufs:.1f} LUFS target - the true-peak ceiling "
+                                     f"({options.get('ceiling_db', -1.0):.1f}dBTP) doesn't leave enough "
+                                     f"headroom to reach both targets on this track")
+
         out_id = uuid.uuid4().hex[:12]
         # always keep a WAV copy for detector re-scoring regardless of the
         # chosen delivery format, since the scorer needs a file ffmpeg/
@@ -566,12 +727,26 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         scoring_wav_path = OUTPUT_DIR / f"{out_id}_score.wav"
         save_stereo(scoring_wav_path, audio, sr)
 
-        resolved_format = resolve_output_format(output_format, path)
+        resolved_format, format_fallback_warning = resolve_output_format(output_format, path)
+        if format_fallback_warning:
+            job_log(job_id, f"NOTE: {format_fallback_warning}")
         job_log(job_id, f"saving output file (format: {resolved_format})")
         out_path = encode_final_output(audio, sr, resolved_format, OUTPUT_DIR / out_id, mp3_mode=mp3_mode)
 
+        # align on the same underlying audio content before doing ANY
+        # before/after comparison - if silence was trimmed from the front,
+        # "audio" (the processed/delivered signal) starts later in the
+        # timeline than "original_audio" by lead_samples_trimmed samples.
+        # This must happen BEFORE saving the A/B playback "original" file
+        # too, not just before the SNR math - otherwise the A/B player's
+        # "A" (original) and "B" (fixed) sides are different lengths/offsets
+        # from each other, so a listener scrubbing to e.g. 1:30 in each is
+        # actually hearing two different moments in the song, and the
+        # shared playhead/timeline drifts out of sync between them.
+        aligned_original = original_audio[lead_samples_trimmed:]
+
         orig_path = OUTPUT_DIR / f"{out_id}_orig.wav"
-        save_stereo(orig_path, original_audio, sr)
+        save_stereo(orig_path, aligned_original, sr)
 
         job_log(job_id, "re-scoring with AI detectors")
         scores_after = scorer.score(str(scoring_wav_path))
@@ -584,20 +759,16 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 failing.append(f"cnn={scores_after['cnn_pct']:.1f}%")
             job_log(job_id, f"WARNING: final file still flagged by at least one model ({', '.join(failing)})")
 
-        # align on the same underlying audio content before comparing samples:
-        # if silence was trimmed from the front, "audio" starts later in the
-        # timeline than "original_audio" by lead_samples_trimmed samples -
-        # comparing raw [:n] slices without this offset would diff silence
-        # against the first real transient and produce a meaningless SNR.
-        aligned_original = original_audio[lead_samples_trimmed:]
         n = min(len(aligned_original), len(audio))
         delta = audio[:n, 0] - aligned_original[:n, 0]
         orig_rms = np.sqrt(np.mean(aligned_original[:n, 0] ** 2))
         delta_rms = np.sqrt(np.mean(delta ** 2))
         overall_snr = float(20 * np.log10(orig_rms / (delta_rms + 1e-12))) if delta_rms > 0 else None
 
-        tilt_before, freqs_b, psd_b = chain.spectral_tilt_report(original_audio, sr)
+        tilt_before, freqs_b, psd_b = chain.spectral_tilt_report(aligned_original, sr)
         tilt_after, freqs_a, psd_a = chain.spectral_tilt_report(audio, sr)
+        waveform_before = chain.waveform_peaks(aligned_original, sr)
+        waveform_after = chain.waveform_peaks(audio, sr)
 
         # the scoring WAV is redundant once re-scoring is done UNLESS the
         # delivered format IS wav (in which case out_path == scoring_wav_path
@@ -629,6 +800,8 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
             "lufs_after": chain.measure_lufs(audio, sr),
             "spectrum_before": {"freqs": freqs_b, "psd_db": psd_b, "tilt": tilt_before},
             "spectrum_after": {"freqs": freqs_a, "psd_db": psd_a, "tilt": tilt_after},
+            "waveform_before": waveform_before,
+            "waveform_after": waveform_after,
             "passes_both_after": scores_after["passes_both"],
             "duration_sec": n / sr,
         }

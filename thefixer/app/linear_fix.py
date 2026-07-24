@@ -77,7 +77,25 @@ def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=400,
     best_n = None
     best_attempt = None
 
-    cur_real_target = real_target
+    # the resample-to-native-rate transfer (16kHz mono analysis -> native
+    # stereo delivered file) reliably costs real accuracy on its own, even
+    # when the optimizer's internal 16kHz real-check already looks near-
+    # perfect. Confirmed directly on two independent production optimization
+    # runs on the same file: internal 16kHz score -> final post-transfer
+    # score was 0.00012 -> 0.03106 (258x) and 0.00005 -> 0.01406 (281x) - a
+    # consistent PROPORTIONAL multiplier (~260-280x), not a fixed additive
+    # loss. This is why most files need 2+ full attempts: attempt 1 aims at
+    # the nominal target, discovers only AFTER the expensive transfer that
+    # the real jump was ~270x worse, then attempt 2 has to redo the whole
+    # optimization with a tighter target. Dividing by the observed
+    # multiplier (rather than subtracting a flat margin, which undershot
+    # last time: 1.4% still missed the <1% bar) budgets attempt 1's
+    # internal target proportionally so it has a real shot at surviving
+    # the transfer. Capped at a floor so this doesn't demand an
+    # unreachably tiny target the optimizer can never actually hit within
+    # max_steps.
+    TRANSFER_LOSS_MULTIPLIER = 270.0  # observed ~258-281x across two real runs
+    cur_real_target = max(0.00005, min(real_target, ACCEPT_THRESHOLD / TRANSFER_LOSS_MULTIPLIER))
     for attempt in range(max_retries + 1):
         if progress_cb:
             progress_cb(f"linear: attempt {attempt + 1} of {max_retries + 1} - optimizing (the live "
@@ -93,7 +111,8 @@ def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=400,
                 step_progress_cb(step, mx, cur_score, _attempt + 1, max_retries + 1)
 
         delta_t, best_real_score = _optimize_linear(audio_t, target=target, real_target=cur_real_target,
-                                                      max_steps=max_steps, verbose=False, progress_cb=_on_step)
+                                                      max_steps=max_steps, verbose=False, progress_cb=_on_step,
+                                                      retry_index=attempt)
         if delta_t is None:
             if attempt < max_retries:
                 cur_real_target = min(0.5, cur_real_target * 3)
@@ -140,7 +159,8 @@ def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=400,
             progress_cb(f"linear: attempt {attempt + 1} result checked against the REAL detector "
                         f"(not the fast estimate) on the actual delivered audio: {final_score * 100:.3f}%")
 
-        if final_score < best_final_score:
+        improved = final_score < best_final_score
+        if improved:
             best_final_score = final_score
             best_out = out
             best_n = n
@@ -158,12 +178,27 @@ def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=400,
                 "attempts": attempt + 1,
             }
 
+        # a retry only has a shot at doing better if it's actually being asked
+        # to hit a tighter target than the previous attempt - once cur_real_target
+        # has bottomed out at its floor (0.002), a further retry starts from the
+        # same conditions and reliably reproduces the same result (confirmed on
+        # a real production run: attempts 3 and 4 both landed on 1.178% exactly),
+        # so stop rather than burn ~2-7 minutes on a repeat that cannot improve.
+        at_target_floor = cur_real_target <= 0.002 + 1e-9
+        stalled = attempt > 0 and not improved and at_target_floor
         if progress_cb:
-            if attempt < max_retries:
+            if attempt < max_retries and not stalled:
                 progress_cb(f"linear: real score {final_score * 100:.2f}% is above the <{ACCEPT_THRESHOLD*100:.0f}% target - retrying with a stricter internal target")
+            elif stalled:
+                progress_cb(f"linear: real score {final_score * 100:.2f}% is above the <{ACCEPT_THRESHOLD*100:.0f}% target and did not "
+                            f"improve on the previous attempt at the same internal target floor - further retries would repeat this "
+                            f"result, so stopping early after {attempt + 1} of {max_retries + 1} attempts and shipping the best-scoring "
+                            f"attempt found")
             else:
                 progress_cb(f"linear: real score {final_score * 100:.2f}% is above the <{ACCEPT_THRESHOLD*100:.0f}% target "
                             f"after all {max_retries + 1} attempts - shipping the best-scoring attempt found and continuing to the next tool")
+        if stalled:
+            break
         cur_real_target = max(0.002, cur_real_target * 0.3)
         target = max(0.001, target * 0.3)
 

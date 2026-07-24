@@ -60,9 +60,22 @@ def _silence_guard(delta_1d, original_1d, win_sec=0.02, sr=None):
 
 
 def perceptual_penalty(delta_1d, original_1d):
-    # apply the absolute time-domain silence gate FIRST so the STFT-domain
-    # penalty below is scored against what would actually be audible, not
-    # against the raw (still-silence-violating) delta
+    """Returns a scalar penalty for how audible delta_1d is likely to be.
+
+    CRITICAL: this must NOT be a flat .mean() over the whole track's STFT
+    frames. Confirmed as the actual root cause of CNN's fix failing on every
+    full-length track this session while succeeding on a short 47s clip: a
+    flat mean lets a LOCALLY loud/aggressive correction (which is exactly
+    what the optimizer needs on windows the real model still flags) hide
+    behind a long quiet average elsewhere in the track - the penalty barely
+    rises even though a human (or the real detector, checking short 10s
+    windows independently) would notice that one loud region just fine.
+    Using the WORST local window's mean penalty (grouped into ~1s chunks,
+    close to the real detector's own analysis granularity) instead of a
+    single track-wide average means a locally loud correction is penalized
+    at full strength regardless of how long or quiet the rest of the track
+    is - matching how both a human ear and the real per-window detector
+    actually judge audibility (by the worst moment, not the average)."""
     gated_delta = _silence_guard(delta_1d, original_1d)
 
     window = torch.hann_window(STFT_WIN)
@@ -77,8 +90,23 @@ def perceptual_penalty(delta_1d, original_1d):
     masking_mult = 0.05 + 0.65 * masking_mult
 
     pw = _PERCEPTUAL_WEIGHT.unsqueeze(1)
-    weighted_power = (d_mag ** 2) * pw * masking_mult
-    return weighted_power.mean()
+    weighted_power = (d_mag ** 2) * pw * masking_mult  # [freq, time]
+    return _worst_chunk_mean(weighted_power)
+
+
+def _worst_chunk_mean(power_ft, chunk_frames=44):
+    """Mean penalty per ~1-second chunk of STFT frames (chunk_frames=44 at
+    STFT_WIN=1024, hop=256, SR=16000: 256/16000*44 ~= 0.70s - close enough
+    to the real detector's per-window granularity to catch local problems),
+    then take the WORST chunk rather than averaging over all chunks - see
+    perceptual_penalty's docstring for why this matters."""
+    n_freq, n_time = power_ft.shape
+    if n_time <= chunk_frames:
+        return power_ft.mean()
+    n_chunks = n_time // chunk_frames
+    trimmed = power_ft[:, : n_chunks * chunk_frames]
+    per_chunk_mean = trimmed.reshape(n_freq, n_chunks, chunk_frames).mean(dim=(0, 2))
+    return per_chunk_mean.max()
 
 
 def apply_silence_guard_to_delta(delta_1d, original_1d, win_sec=0.02, sr=None):
@@ -92,26 +120,44 @@ def apply_silence_guard_to_delta(delta_1d, original_1d, win_sec=0.02, sr=None):
 def band_limit_penalty(delta_1d, lo_hz, hi_hz, sr, n_fft=2048):
     """Penalize energy outside the model's actual analysis band (500-8000Hz
     per config.yaml's cqt.fmin=500). Guard band added to avoid penalizing
-    the exact edges needed to influence boundary bins."""
+    the exact edges needed to influence boundary bins. Uses worst-chunk
+    (not whole-track-mean) for the same reason as perceptual_penalty - a
+    long track's average otherwise hides a local out-of-band spike."""
     window = torch.hann_window(n_fft)
     D = torch.stft(delta_1d, n_fft=n_fft, hop_length=n_fft // 4, window=window, return_complex=True)
     freqs = torch.fft.rfftfreq(n_fft, 1 / sr)
     out_of_band = (freqs < lo_hz) | (freqs > hi_hz)
-    d_mag = D.abs()
-    return (d_mag[out_of_band] ** 2).mean()
+    d_power = D.abs() ** 2
+    d_power_oob = d_power[out_of_band]
+    if d_power_oob.shape[0] == 0:
+        return torch.tensor(0.0)
+    return _worst_chunk_mean(d_power_oob)
 
 
-def tonality_penalty(delta_1d, n_fft=1024):
+def tonality_penalty(delta_1d, n_fft=1024, chunk_frames=44):
     """Discourage energy concentrating into a few narrow bins (audible
-    whine/ring) via an inverse-participation-ratio style concentration measure."""
+    whine/ring) via an inverse-participation-ratio style concentration
+    measure. Computed per ~1s time-chunk and the WORST (most concentrated,
+    most tonal-sounding) chunk is used, not one measure over the whole
+    track's time-averaged spectrum - a brief tonal whine partway through a
+    long track would otherwise average out against the rest of the track's
+    broadband noise and barely register, the same track-length-dilution
+    problem fixed in perceptual_penalty/band_limit_penalty above."""
     window = torch.hann_window(n_fft)
     D = torch.stft(delta_1d, n_fft=n_fft, hop_length=n_fft // 4, window=window, return_complex=True)
-    d_power = D.abs() ** 2
-    freq_energy = d_power.mean(dim=1)
-    total = freq_energy.sum() + 1e-12
-    normalized = freq_energy / total
-    concentration = (normalized ** 2).sum()
-    return concentration
+    d_power = D.abs() ** 2  # [freq, time]
+    n_freq, n_time = d_power.shape
+    if n_time <= chunk_frames:
+        freq_energy = d_power.mean(dim=1)
+        total = freq_energy.sum() + 1e-12
+        return ((freq_energy / total) ** 2).sum()
+    n_chunks = n_time // chunk_frames
+    trimmed = d_power[:, : n_chunks * chunk_frames]
+    chunked = trimmed.reshape(n_freq, n_chunks, chunk_frames).mean(dim=2)  # [freq, n_chunks]
+    totals = chunked.sum(dim=0) + 1e-12  # [n_chunks]
+    normalized = chunked / totals.unsqueeze(0)
+    concentration_per_chunk = (normalized ** 2).sum(dim=0)  # [n_chunks]
+    return concentration_per_chunk.max()
 
 
 def optimize_segment(

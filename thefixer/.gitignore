@@ -3,3 +3,6 @@ outputs/
 venv
 __pycache__/
 *.pyc
+
+electron/node_modules
+electron/dist

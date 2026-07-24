@@ -16,6 +16,7 @@
   --warn: #e8a33d;
   --crit: #e0544f;
   --good: #5ec9a8;
+  --before: #e0762e;
   --input-bg: #101215;
   --focus: #7fd9ba;
 }
@@ -33,6 +34,7 @@
   --warn: #b3711a;
   --crit: #c23c37;
   --good: #1f8f6f;
+  --before: #c05f14;
   --input-bg: #ffffff;
   --focus: #16694f;
 }
@@ -51,6 +53,7 @@
     --warn: #b3711a;
     --crit: #c23c37;
     --good: #1f8f6f;
+    --before: #c05f14;
     --input-bg: #ffffff;
     --focus: #16694f;
   }
@@ -139,6 +142,20 @@ header {
   background: transparent; color: var(--text-dim); cursor: pointer; font-size: 13px;
 }
 .docs-close:hover { color: var(--crit); border-color: var(--crit); }
+.info-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 15px; height: 15px; border-radius: 50%; border: 1px solid var(--text-faint);
+  color: var(--text-faint); background: transparent; cursor: pointer;
+  font-size: 10px; font-style: italic; font-family: Georgia, serif; line-height: 1;
+  padding: 0; margin-left: 5px; vertical-align: middle; flex: none;
+}
+.info-btn:hover { border-color: var(--accent); color: var(--accent); }
+.info-modal-body p { margin: 0 0 12px; line-height: 1.55; color: var(--text-dim); font-size: 13px; }
+.info-modal-body p:last-child { margin-bottom: 0; }
+.info-modal-body .good-bad { display: flex; gap: 10px; margin-top: 4px; }
+.info-modal-body .good-bad div { flex: 1; padding: 8px 10px; border-radius: 7px; font-size: 12px; }
+.info-modal-body .good-bad .good { background: color-mix(in srgb, var(--good) 12%, transparent); color: var(--good); }
+.info-modal-body .good-bad .bad { background: color-mix(in srgb, var(--crit) 12%, transparent); color: var(--crit); }
 .docs-modal-body { padding: 8px 24px 24px; overflow-y: auto; }
 .docs-section { padding-top: 20px; }
 .docs-section h2 {
@@ -184,13 +201,19 @@ header {
 .workspace.active { display: flex; }
 
 .file-strip {
-  display: flex; align-items: center; gap: 14px;
+  display: flex; flex-direction: column; gap: 10px;
   background: var(--panel); border: 1px solid var(--rack-line);
   border-radius: 10px; padding: 12px 16px;
   font-size: 13px;
 }
-.file-strip .name { font-weight: 600; }
-.file-strip .meta { color: var(--text-faint); font-size: 12px; }
+.file-strip-top { display: flex; align-items: center; gap: 14px; }
+.file-strip .name { font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.original-badge {
+  font-weight: 600; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--text-faint); background: var(--input-bg); border: 1px solid var(--rack-line);
+  border-radius: 5px; padding: 2px 7px;
+}
+.file-strip .meta { color: var(--text-faint); font-size: 12px; margin-top: 2px; }
 .file-strip button.new-file {
   margin-left: auto;
   background: transparent; border: 1px solid var(--rack-line);
@@ -198,6 +221,8 @@ header {
   font-size: 12px; cursor: pointer;
 }
 .file-strip button.new-file:hover { border-color: var(--accent); color: var(--accent); }
+.file-strip audio#originalPlayer { width: 100%; height: 32px; display: none; }
+.file-strip audio#originalPlayer.active { display: block; }
 
 /* ---------- Grid: analysis (left) + tool chain (right) ---------- */
 .grid {
@@ -224,7 +249,30 @@ header {
   font-size: 11.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
   color: var(--text-dim);
 }
+.check-all-btn {
+  margin-left: auto;
+  background: transparent; border: 1px solid var(--rack-line);
+  color: var(--text-dim); border-radius: 7px; padding: 5px 11px;
+  font-size: 11.5px; cursor: pointer;
+}
+.check-all-btn:hover { border-color: var(--accent); color: var(--accent); }
 .panel-body { padding: 16px; }
+
+.chain-group {
+  border: 1px solid var(--rack-line); border-radius: 8px; margin-top: 10px; overflow: hidden;
+}
+.chain-group:first-child { margin-top: 0; }
+.chain-group-header {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  background: var(--panel-raised); border: none; padding: 9px 12px;
+  font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--text-dim); cursor: pointer; text-align: left;
+}
+.chain-group-header .count { margin-left: auto; font-weight: 500; text-transform: none; letter-spacing: normal; color: var(--text-faint); }
+.chain-group-header .chevron { transition: transform 0.15s ease; color: var(--text-faint); font-size: 10px; }
+.chain-group-header[aria-expanded="false"] .chevron { transform: rotate(-90deg); }
+.chain-group-body { padding: 10px; }
+.chain-group-header[aria-expanded="false"] + .chain-group-body { display: none; }
 
 /* ---------- Score meters ---------- */
 .score-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
@@ -254,15 +302,18 @@ header {
 }
 .pill.good { background: var(--accent-glow); color: var(--good); }
 .pill.crit { background: rgba(224,84,79,0.15); color: var(--crit); }
+.pill.warn { background: rgba(232,163,61,0.15); color: var(--warn); }
 .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.pill.small { margin-top: 0; padding: 2px 7px; font-size: 10px; }
 
 .stat-list { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 4px; }
 .stat {
   background: var(--panel-raised); border: 1px solid var(--rack-line);
   border-radius: 8px; padding: 10px 12px;
 }
-.stat .k { font-size: 10.5px; color: var(--text-faint); text-transform: uppercase; letter-spacing: .05em; }
-.stat .v { font-size: 15px; font-weight: 600; margin-top: 2px; }
+.stat .k { font-size: 10.5px; color: var(--text-faint); text-transform: uppercase; letter-spacing: .05em; display: flex; align-items: center; gap: 4px; }
+.stat .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 2px; }
+.stat .v { font-size: 15px; font-weight: 600; }
 .stat .v.flag { color: var(--warn); }
 
 /* ---------- spectrum canvas ---------- */
@@ -275,12 +326,26 @@ canvas#spectrumCanvas {
   width: 100%; height: 140px; display: block;
   background: var(--input-bg); border-radius: 8px; border: 1px solid var(--rack-line);
 }
+canvas#waveformOverviewCanvas {
+  width: 100%; height: 100px; display: block;
+  background: var(--input-bg); border-radius: 8px; border: 1px solid var(--rack-line);
+}
 .spectrum-legend {
   display: none; gap: 16px; margin-bottom: 6px; font-size: 11px; color: var(--text-dim);
 }
 .spectrum-legend.active { display: flex; }
 .spectrum-legend .item { display: flex; align-items: center; gap: 5px; }
 .spectrum-legend .swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+
+.chart-view-row { display: none; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.chart-view-row.active { display: flex; }
+.chart-view-switch { display: flex; gap: 4px; margin-left: auto; }
+.chart-view-switch button {
+  background: transparent; border: 1px solid var(--rack-line); color: var(--text-faint);
+  border-radius: 6px; padding: 3px 9px; font-size: 10.5px; cursor: pointer;
+}
+.chart-view-switch button.active { background: var(--accent); color: #0c1210; border-color: var(--accent); }
+.chart-view-switch button:not(.active):hover { border-color: var(--accent-dim); color: var(--text); }
 
 /* ---------- Tool chain list ---------- */
 .chain-list { display: flex; flex-direction: column; gap: 8px; }
@@ -379,13 +444,42 @@ canvas#spectrumCanvas {
   animation: barpulse 1.6s linear infinite;
 }
 @keyframes barpulse { 0% { background-position: 0% 0; } 100% { background-position: -200% 0; } }
+.analyzing-state {
+  display: none; align-items: center; gap: 10px;
+  padding: 10px 0 16px 0; color: var(--text-faint); font-size: 13px;
+}
+.analyzing-state.active { display: flex; }
+.analyzing-bar-track {
+  flex: 1; height: 6px; border-radius: 3px; background: var(--input-bg);
+  border: 1px solid var(--rack-line); overflow: hidden;
+}
+.analyzing-bar-fill {
+  height: 100%; width: 40%; border-radius: 3px;
+  background: linear-gradient(90deg, var(--accent-dim), var(--accent));
+  background-size: 200% 100%;
+  animation: barpulse 1.6s linear infinite, analyzing-slide 1.8s ease-in-out infinite;
+}
+@keyframes analyzing-slide {
+  0% { margin-left: 0%; width: 30%; }
+  50% { margin-left: 60%; width: 35%; }
+  100% { margin-left: 0%; width: 30%; }
+}
 .log-box {
   background: var(--input-bg); border: 1px solid var(--rack-line); border-radius: 8px;
   padding: 10px 12px; height: 160px; overflow-y: auto;
   font-size: 11.5px; line-height: 1.6; color: var(--text-dim);
 }
-.log-box .line { white-space: pre-wrap; word-break: break-word; }
+.log-box .line { white-space: pre-wrap; word-break: break-word; margin-bottom: 3px; }
 .log-box .line.err { color: var(--crit); }
+.log-box .line-raw { color: var(--text-faint); font-size: 10.5px; opacity: 0.75; margin-top: 1px; }
+.log-box .line-main { display: flex; align-items: center; gap: 8px; }
+.log-badge {
+  display: inline-flex; align-items: center; font-size: 9.5px; font-weight: 700;
+  letter-spacing: 0.04em; padding: 1px 6px; border-radius: 4px; flex: none;
+}
+.log-badge.pass { background: var(--accent-glow); color: var(--good); }
+.log-badge.retry { background: rgba(232,163,61,0.15); color: var(--warn); }
+.log-badge.fail { background: rgba(224,84,79,0.15); color: var(--crit); }
 
 /* ---------- Results ---------- */
 .results { display: none; flex-direction: column; gap: 20px; }
@@ -450,6 +544,19 @@ canvas#spectrumCanvas {
   background: var(--accent); color: #0c1210; font-size: 15px; cursor: pointer;
   flex: none; display: flex; align-items: center; justify-content: center;
 }
+.transport button.restart {
+  width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--rack-line);
+  background: transparent; color: var(--text-dim); font-size: 13px; cursor: pointer;
+  flex: none; display: flex; align-items: center; justify-content: center;
+}
+.transport button.restart:hover { border-color: var(--accent); color: var(--accent); }
+.volume-control { display: flex; align-items: center; gap: 6px; flex: none; }
+.volume-control button {
+  width: 26px; height: 26px; border-radius: 6px; border: none; background: transparent;
+  color: var(--text-dim); cursor: pointer; font-size: 13px; display: flex; align-items: center; justify-content: center;
+}
+.volume-control button:hover { color: var(--accent); }
+.volume-control input[type="range"] { width: 64px; accent-color: var(--accent); cursor: pointer; }
 .timeline {
   flex: 1; height: 34px; position: relative; cursor: pointer;
   background: var(--input-bg); border: 1px solid var(--rack-line); border-radius: 8px;
@@ -492,11 +599,15 @@ footer {
   <div class="workspace" id="workspace">
 
     <div class="file-strip">
-      <div>
-        <div class="name" id="fileName">—</div>
-        <div class="meta mono" id="fileMeta">—</div>
+      <div class="file-strip-top">
+        <div>
+          <div class="name"><span class="mono" id="fileName">—</span><span class="original-badge">Original (unchanged)</span></div>
+          <div class="meta mono" id="fileMeta">—</div>
+          <div class="meta mono" id="fileFormatMeta"></div>
+        </div>
+        <button class="new-file" id="newFileBtn">Analyze a different file</button>
       </div>
-      <button class="new-file" id="newFileBtn">Analyze a different file</button>
+      <audio id="originalPlayer" controls preload="none"></audio>
     </div>
 
     <div class="grid">
@@ -504,15 +615,19 @@ footer {
       <div class="panel">
         <div class="panel-head"><span class="title">Detector Analysis</span></div>
         <div class="panel-body">
+          <div class="analyzing-state" id="analyzingState">
+            <span id="analyzingLabel">Analyzing audio (running AI detectors, spectral checks)…</span>
+            <div class="analyzing-bar-track"><div class="analyzing-bar-fill"></div></div>
+          </div>
           <div class="score-row">
             <div class="score-card">
-              <div class="label">Linear model</div>
+              <div class="label">Linear model<button class="info-btn" data-info="linear_passes" title="What's this?" type="button">i</button></div>
               <div class="value mono" id="linearScore">—</div>
               <div class="meter-track"><div class="meter-fill" id="linearMeter" style="width:0%"></div></div>
               <div id="linearPill"></div>
             </div>
             <div class="score-card">
-              <div class="label">CNN model</div>
+              <div class="label">CNN model<button class="info-btn" data-info="cnn_passes" title="What's this?" type="button">i</button></div>
               <div class="value mono" id="cnnScore">—</div>
               <div class="meter-track"><div class="meter-fill" id="cnnMeter" style="width:0%"></div></div>
               <div id="cnnPill"></div>
@@ -522,25 +637,66 @@ footer {
           <div class="stat-list" id="statList"></div>
 
           <div class="spectrum-wrap">
-            <div class="caption"><span>Spectrum (avg. power)</span><span>20Hz&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;20kHz</span></div>
-            <div class="spectrum-legend" id="spectrumLegend"></div>
+            <div class="caption"><span>Spectrum (avg. power, dB)</span><span>20Hz&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;20kHz</span></div>
+            <div class="chart-view-row">
+              <div class="spectrum-legend" id="spectrumLegend"></div>
+              <div class="chart-view-switch" id="spectrumViewSwitch">
+                <button data-view="before">Before</button>
+                <button data-view="after">After</button>
+                <button data-view="both" class="active">Both</button>
+              </div>
+            </div>
             <canvas id="spectrumCanvas" width="700" height="140"></canvas>
+          </div>
+
+          <div class="spectrum-wrap">
+            <div class="caption"><span>Waveform (amplitude)</span><span id="waveformDuration"></span></div>
+            <div class="chart-view-row">
+              <div class="spectrum-legend" id="waveformLegend"></div>
+              <div class="chart-view-switch" id="waveformViewSwitch">
+                <button data-view="before">Before</button>
+                <button data-view="after">After</button>
+                <button data-view="both" class="active">Both</button>
+              </div>
+            </div>
+            <canvas id="waveformOverviewCanvas" width="700" height="100"></canvas>
           </div>
         </div>
       </div>
 
       <!-- RIGHT: tool chain -->
       <div class="panel">
-        <div class="panel-head"><span class="title">Signal Chain</span></div>
+        <div class="panel-head">
+          <span class="title">Signal Chain</span>
+          <button class="check-all-btn" id="checkAllBtn">Check all</button>
+        </div>
         <div class="panel-body">
-          <div class="chain-group-label">Cleanup</div>
-          <div class="chain-list" id="chainGroupCleanup"></div>
+          <div class="chain-group">
+            <button class="chain-group-header" data-target="chainGroupCleanup" aria-expanded="true">
+              <span class="chevron">▾</span>Cleanup<span class="count" id="countCleanup"></span>
+            </button>
+            <div class="chain-group-body">
+              <div class="chain-list" id="chainGroupCleanup"></div>
+            </div>
+          </div>
 
-          <div class="chain-group-label">AI-detector fixes</div>
-          <div class="chain-list" id="chainGroupAI"></div>
+          <div class="chain-group">
+            <button class="chain-group-header" data-target="chainGroupAI" aria-expanded="true">
+              <span class="chevron">▾</span>AI-detector fixes<span class="count" id="countAI"></span>
+            </button>
+            <div class="chain-group-body">
+              <div class="chain-list" id="chainGroupAI"></div>
+            </div>
+          </div>
 
-          <div class="chain-group-label">Mastering</div>
-          <div class="chain-list" id="chainGroupMaster"></div>
+          <div class="chain-group">
+            <button class="chain-group-header" data-target="chainGroupMaster" aria-expanded="true">
+              <span class="chevron">▾</span>Mastering<span class="count" id="countMaster"></span>
+            </button>
+            <div class="chain-group-body">
+              <div class="chain-list" id="chainGroupMaster"></div>
+            </div>
+          </div>
 
           <div class="chain-group-label">Output filename</div>
           <input type="text" class="filename-input mono" id="outputNameInput" placeholder="e.g. northstar_fixed.wav" />
@@ -613,6 +769,7 @@ footer {
             <button id="abFixed">B · Fixed</button>
           </div>
           <div class="transport">
+            <button class="restart" id="restartBtn" title="Restart from beginning">⏮</button>
             <button class="play" id="playBtn">▶</button>
             <span class="time-label mono" id="timeCur">0:00</span>
             <div class="timeline" id="timeline">
@@ -620,6 +777,10 @@ footer {
               <div class="playhead" id="playhead" style="left:0%"></div>
             </div>
             <span class="time-label mono" id="timeTotal">0:00</span>
+            <div class="volume-control">
+              <button id="muteBtn" title="Mute/unmute">🔊</button>
+              <input type="range" id="volumeSlider" min="0" max="100" value="100" title="Volume">
+            </div>
           </div>
           <div class="download-row">
             <button class="btn secondary" id="downloadOrig">Download original</button>
@@ -637,6 +798,16 @@ footer {
 
 <audio id="audioOrig" preload="auto"></audio>
 <audio id="audioFixed" preload="auto"></audio>
+
+<div class="docs-overlay" id="infoOverlay">
+  <div class="docs-modal" style="width:min(480px,100%)">
+    <div class="docs-modal-head">
+      <span class="title" id="infoModalTitle">Info</span>
+      <button class="docs-close" id="infoCloseBtn" title="Close">✕</button>
+    </div>
+    <div class="docs-modal-body" id="infoModalBody"></div>
+  </div>
+</div>
 
 <div class="docs-overlay" id="docsOverlay">
   <div class="docs-modal">
