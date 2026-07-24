@@ -125,6 +125,12 @@
       body: `<p>A final safety ceiling at -1dBTP (true-peak decibels, accounting for peaks that can appear between samples after digital-to-analog conversion, not just the samples themselves). This is the last line of defense against clipping/distortion on playback systems that are sensitive to true peaks, like streaming platforms and hardware DACs.</p>
              <p>It uses real dynamics limiting (pulling down only the moments that actually exceed the ceiling), not a flat volume reduction - so it doesn't quietly undo a loudness target that was already correctly set elsewhere in the chain.</p>`,
     },
+    cnn_mode: {
+      title: "CNN fix mode: Simple vs. Shift-robust vs. Thorough",
+      body: `<p><strong>Simple</strong> optimizes ONLY the exact 5 fixed positions the real CNN detector itself checks (an even spread across the track, skipping the first/last 5 seconds) - what an off-the-shelf, uncustomized deployment of this detector would actually test against. Fastest, but the resulting fix can be fragile: it's tuned to that exact spot and can fail if the delivered file's exact alignment drifts by even a fraction of a second.</p>
+             <p><strong>Shift-robust</strong> (recommended, default) optimizes the same 5 positions, but trains the fix to hold up across small (±0.5s) shifts around each one, not just the exact spot - directly targeting why Simple can be fragile, at a modest extra cost (~5-6x Simple, still far cheaper than Thorough).</p>
+             <p><strong>Thorough</strong> optimizes a dense window every 0.5 seconds across the ENTIRE track - far more coverage than the standard 5-position check. Much slower (can take 10+ minutes on a full track) and, in testing, not necessarily more reliable than Shift-robust - kept available for comparison.</p>`,
+    },
   };
 
   function infoBtn(key) {
@@ -180,6 +186,7 @@
     waveData: null,
     outputFormat: "same",
     mp3Mode: "vbr0",
+    cnnMode: "eot",
   };
 
   // ---------- output format switch ----------
@@ -195,6 +202,13 @@
     btn.addEventListener("click", () => {
       state.mp3Mode = btn.dataset.mp3mode;
       document.querySelectorAll("#mp3ModeSwitch button").forEach(b => b.classList.toggle("active", b === btn));
+    });
+  });
+
+  document.querySelectorAll("#cnnModeSwitch button").forEach(btn => {
+    btn.addEventListener("click", () => {
+      state.cnnMode = btn.dataset.cnnmode;
+      document.querySelectorAll("#cnnModeSwitch button").forEach(b => b.classList.toggle("active", b === btn));
     });
   });
 
@@ -219,6 +233,7 @@
   });
 
   function resetWorkspace() {
+    if (typeof stopElapsedTimer === "function") stopElapsedTimer();
     state = { ...state, fileId: null, analysis: null, selected: new Set(), jobId: null, result: null,
               lastResult: null, spectrumViewMode: "both", waveformViewMode: "both" };
     $("workspace").classList.remove("active");
@@ -261,6 +276,16 @@
       const origPlayer = $("originalPlayer");
       origPlayer.src = `/api/audio/upload/${data.file_id}`;
       origPlayer.classList.add("active");
+      // playing the original-file player should stop the A/B player, and
+      // vice versa (wired on the A/B side's own play handler) - otherwise
+      // both can play simultaneously with no indication anything's wrong
+      origPlayer.onplay = () => {
+        const ao = $("audioOrig"), af = $("audioFixed");
+        if (ao && !ao.paused) ao.pause();
+        if (af && !af.paused) af.pause();
+        const playBtn = $("playBtn");
+        if (playBtn) playBtn.textContent = "▶";
+      };
 
       const stem = data.filename.replace(/\.[^.]+$/, "");
       $("outputNameInput").value = `${stem}_fixed.wav`;
@@ -378,7 +403,7 @@
       </div>`).join("");
 
     drawSpectrum($("spectrumCanvas"), data.spectrum.freqs, data.spectrum.psd_db);
-    drawWaveformOverview($("waveformOverviewCanvas"), data.waveform);
+    drawWaveformOverview($("waveformOverviewCanvas"), data.waveform, null, "both", data.transients);
     $("waveformDuration").textContent = fmtDuration(data.waveform.duration_sec);
     $("waveformLegend").classList.remove("active");
   }
@@ -394,7 +419,16 @@
     const rackLine = styles.getPropertyValue("--rack-line").trim();
     const textFaint = styles.getPropertyValue("--text-faint").trim();
 
-    const minDb = -100, maxDb = 20;
+    // -100dB was too narrow a floor - confirmed directly on a real
+    // production spectrum that legitimate content (both the source's own
+    // measured noise floor AND the spectral-revival fill-in, which is
+    // deliberately anchored just above that same floor) regularly sits at
+    // -130 to -150dB up near 20-22kHz. Anything below the old -100dB floor
+    // was silently clamped flat to the chart's bottom edge, which visually
+    // read as "the after-curve rolls off/dies earlier than before" even
+    // though the underlying data showed the fix correctly adding +23dB of
+    // real content in that exact region - the chart was lying, not the fix.
+    const minDb = -150, maxDb = 20;
     const logMin = Math.log10(20), logMax = Math.log10(20000);
 
     // grid + dB axis labels - power spectral density in dB (higher = more
@@ -533,19 +567,16 @@
     // transient/pop flags: small triangle markers at each detected glitch's
     // exact timestamp, so it's visible ON the waveform where a problem was
     // found, not just as a bare count in the stats panel
+    canvas._transientMarkers = [];
     if (markers && markers.length) {
       const crit = styles.getPropertyValue("--crit").trim();
       const durationSec = (wave && wave.duration_sec) || (overlayWave && overlayWave.duration_sec) || 0;
       if (durationSec > 0) {
-        ctx.fillStyle = crit;
         for (const m of markers) {
           const x = (m.time_sec / durationSec) * w;
-          ctx.beginPath();
-          ctx.moveTo(x - 4, 0);
-          ctx.lineTo(x + 4, 0);
-          ctx.lineTo(x, 7);
-          ctx.closePath();
-          ctx.fill();
+          canvas._transientMarkers.push({ x, time_sec: m.time_sec });
+
+          // vertical guide line through the whole waveform
           ctx.strokeStyle = crit;
           ctx.lineWidth = 1;
           ctx.globalAlpha = 0.5;
@@ -554,6 +585,30 @@
           ctx.lineTo(x, h);
           ctx.stroke();
           ctx.globalAlpha = 1;
+
+          // flag marker at the top
+          ctx.fillStyle = crit;
+          ctx.beginPath();
+          ctx.moveTo(x - 4, 0);
+          ctx.lineTo(x + 4, 0);
+          ctx.lineTo(x, 7);
+          ctx.closePath();
+          ctx.fill();
+
+          // always-visible timestamp label so the marker is self-explanatory
+          // without requiring a hover - the legend explains WHAT the flag
+          // means, this shows WHERE/WHEN
+          const label = fmtDuration(m.time_sec);
+          ctx.font = "9px ui-monospace, monospace";
+          const labelWidth = ctx.measureText(label).width;
+          const labelX = Math.min(Math.max(x - labelWidth / 2, 2), w - labelWidth - 2);
+          ctx.fillStyle = crit;
+          ctx.globalAlpha = 0.12;
+          ctx.fillRect(labelX - 2, 9, labelWidth + 4, 11);
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = crit;
+          ctx.textBaseline = "top";
+          ctx.fillText(label, labelX, 10);
         }
       }
     }
@@ -604,6 +659,7 @@
 
     $("runCount").textContent = `${state.selected.size} selected`;
     $("checkAllBtn").textContent = TOOLS.every(t => state.selected.has(t.id)) ? "Uncheck all" : "Check all";
+    $("cnnModeRow").classList.toggle("hidden", !state.selected.has("cnn_fix"));
   }
 
   $("selectRecBtn").addEventListener("click", () => {
@@ -625,7 +681,41 @@
     });
   });
 
+  $("copyLogBtn").addEventListener("click", async () => {
+    const lines = Array.from($("logBox").querySelectorAll(".line")).map(
+      line => line.dataset.raw || line.textContent
+    );
+    const text = lines.join("\n");
+    const btn = $("copyLogBtn");
+    try {
+      await navigator.clipboard.writeText(text);
+      btn.textContent = "Copied";
+      btn.classList.add("copied");
+    } catch (err) {
+      btn.textContent = "Copy failed";
+    }
+    setTimeout(() => {
+      btn.textContent = "Copy log";
+      btn.classList.remove("copied");
+    }, 1500);
+  });
+
   // ---------- run pipeline ----------
+  let elapsedTimer = null;
+  function startElapsedTimer() {
+    const startedAt = performance.now();
+    stopElapsedTimer();
+    elapsedTimer = setInterval(() => {
+      const secs = Math.floor((performance.now() - startedAt) / 1000);
+      const m = Math.floor(secs / 60);
+      const s = secs % 60;
+      $("elapsedTime").textContent = `${m}:${String(s).padStart(2, "0")} elapsed`;
+    }, 1000);
+  }
+  function stopElapsedTimer() {
+    if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
+  }
+
   $("runBtn").addEventListener("click", async () => {
     if (!state.fileId || state.selected.size === 0) return;
     $("progressPanel").classList.add("active");
@@ -633,13 +723,15 @@
     $("logBox").innerHTML = "";
     $("progressFill").style.width = "6%";
     $("runBtn").disabled = true;
+    $("elapsedTime").textContent = "0:00 elapsed";
+    startElapsedTimer();
 
     const outputName = $("outputNameInput").value.trim();
     const res = await fetch(`/api/process/${state.fileId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        tools: Array.from(state.selected), options: {},
+        tools: Array.from(state.selected), options: { cnn_mode: state.cnnMode },
         output_name: outputName || undefined,
         output_format: state.outputFormat,
         mp3_mode: state.mp3Mode,
@@ -680,18 +772,34 @@
     $("progressFill").style.width = `${pct}%`;
 
     $("progressStepLabel").textContent = data.current_step_name || data.progress_msg || "Working…";
+
+    // Two genuinely different counters were being smashed into one run-on
+    // sentence: idx/total is which TOOL in the selected chain is running
+    // (e.g. tool 12 of 12 selected tools), while sub_progress is that one
+    // tool's OWN internal optimization loop (e.g. gradient step 90 of 300)
+    // - a user reported this as unreadable ("this makes no sense"), and
+    // reading it back it's easy to see why: "Step 12 of 12 (optimization
+    // step 90 of 300...)" looks like one counter contradicting itself, not
+    // two different things. Render them as two separate lines instead.
+    let stepText = `Tool ${idx + 1} of ${total}`;
     let subText = "";
     if (data.sub_progress && data.sub_progress.total) {
       const sp = data.sub_progress;
-      subText = ` (optimization step ${sp.current} of ${sp.total}`;
-      if (sp.attempt && sp.max_attempts) subText += `, attempt ${sp.attempt}/${sp.max_attempts}`;
-      if (sp.score_pct !== undefined) subText += `, live estimate ${sp.score_pct}% AI`;
+      subText = `Optimization step ${sp.current} of ${sp.total}`;
+      if (sp.attempt && sp.max_attempts) subText += ` · attempt ${sp.attempt}/${sp.max_attempts}`;
+      if (sp.score_pct !== undefined) subText += ` · live estimate ${sp.score_pct}% AI`;
       if (sp.windows_total !== undefined) {
-        subText += `, real-model check: ${sp.windows_failing}/${sp.windows_total} windows still above target (${sp.real_max_score_pct}% AI)`;
+        // "windows" is internal jargon (the optimizer's overlapping analysis
+        // segments, not anything the user selected or can see) - rephrase
+        // in terms of what the user actually cares about: how close is the
+        // real detector check to fully passing.
+        const passing = sp.windows_total - sp.windows_failing;
+        subText += ` · real-detector check: ${passing}/${sp.windows_total} spots passing (worst spot ${sp.real_max_score_pct}% AI)`;
       }
-      subText += ")";
     }
-    $("progressStepCount").textContent = `Step ${idx + 1} of ${total}${subText}`;
+    $("progressStepCount").innerHTML = subText
+      ? `${stepText}<br><span class="sub-progress-detail">${subText}</span>`
+      : stepText;
   }
 
   // translates the technical pipeline log into a plain-language line for
@@ -712,6 +820,11 @@
     [/^linear: real score [\d.]+% is above the <1% target after all \d+ attempts.*$/, () => ({ text: "Didn't fully clear 1% after all attempts - shipping the best result found", badge: "fail" })],
     [/^cnn: optimizing ([\d.]+)s of audio.*$/, (m) => `AI-detector fix (CNN model): working through ${Math.round(m[1])}s of audio - this one takes a while…`],
     [/^cnn: verifying final transferred stereo output against the real model$/, () => "Double-checking the CNN fix on the actual file you'll receive"],
+    [/^cnn: worst window after transfer scored ([\d.]+)% AI$/, (m) => {
+      const pct = Number(m[1]);
+      return { text: `Checked against the real detector: worst window ${m[1]}% AI-likely`, badge: pct < 8 ? "pass" : "retry" };
+    }],
+    [/^cnn: no windows survived the post-transfer check.*$/, () => ({ text: "Could not verify any window after transfer - track may be too short", badge: "fail" })],
     [/^re-verifying linear model after full chain.*$/, () => "Double-checking the linear fix still holds after mastering"],
     [/^\s*post-chain linear score: ([\d.]+)%$/, (m) => {
       const pct = Number(m[1]);
@@ -753,22 +866,23 @@
     const friendlyText = result && typeof result === "object" ? result.text : result;
     const badge = result && typeof result === "object" ? result.badge : null;
     if (friendlyText && friendlyText !== msg) {
-      const main = document.createElement("div");
-      main.className = "line-main";
+      // friendly translation only - no raw line underneath. Showing both
+      // (as an earlier version did) doubled the visual volume of every
+      // single log event across a job that can run 20+ minutes and emit
+      // hundreds of lines - confirmed too noisy in practice, not just in
+      // theory. Raw text is still in data-raw for anyone who wants to
+      // inspect it (e.g. via devtools), just not rendered by default.
+      line.className += " line-main";
+      line.dataset.raw = msg;
       const textSpan = document.createElement("span");
       textSpan.textContent = friendlyText;
-      main.appendChild(textSpan);
+      line.appendChild(textSpan);
       if (badge) {
         const badgeSpan = document.createElement("span");
         badgeSpan.className = `log-badge ${badge}`;
         badgeSpan.textContent = LOG_BADGE_LABEL[badge] || badge;
-        main.appendChild(badgeSpan);
+        line.appendChild(badgeSpan);
       }
-      const raw = document.createElement("div");
-      raw.className = "line-raw";
-      raw.textContent = msg;
-      line.appendChild(main);
-      line.appendChild(raw);
     } else {
       line.textContent = msg;
     }
@@ -792,10 +906,12 @@
       if (data.status === "running") {
         state.pollTimer = setTimeout(pollJob, 1200);
       } else if (data.status === "done") {
+        stopElapsedTimer();
         $("runBtn").disabled = false;
         state.result = data.result;
         renderResults(data.result);
       } else if (data.status === "error") {
+        stopElapsedTimer();
         appendLog(`Failed: ${data.error}`, true);
         $("runBtn").disabled = false;
       }
@@ -810,6 +926,7 @@
     $("results").classList.add("active");
 
     const passBanner = $("verdictBanner");
+    $("verdictFilename").textContent = state.filename || "";
     if (result.passes_both_after) {
       passBanner.className = "verdict-banner pass";
       $("verdictIcon").textContent = "✓";
@@ -822,25 +939,55 @@
       $("verdictSub").textContent = `Linear ${result.scores_after.linear_pct.toFixed(3)}% · CNN ${result.scores_after.cnn_pct.toFixed(1)}% — try selecting the AI-detector fix tools`;
     }
 
+    const dcMaxBefore = result.dc_offset_before ? Math.max(Math.abs(result.dc_offset_before.l), Math.abs(result.dc_offset_before.r)) : null;
+    const dcMaxAfter = result.dc_offset_after ? Math.max(Math.abs(result.dc_offset_after.l), Math.abs(result.dc_offset_after.r)) : null;
     const rows = [
       ["Linear model score", `${result.scores_before.linear_pct.toFixed(3)}%`, `${result.scores_after.linear_pct.toFixed(3)}%`, result.scores_after.passes_linear, "linear_passes"],
       ["CNN model score", `${result.scores_before.cnn_pct.toFixed(1)}%`, `${result.scores_after.cnn_pct.toFixed(1)}%`, result.scores_after.passes_cnn, "cnn_passes"],
-      ["Integrated LUFS", `${result.lufs_before.toFixed(1)}`, `${result.lufs_after.toFixed(1)}`, null, "lufs"],
+      ["Integrated LUFS", `${result.lufs_before.toFixed(1)}`, `${result.lufs_after.toFixed(1)}`,
+       (result.lufs_after >= -16 && result.lufs_after <= -12) ? "good" : (result.lufs_after < -20 || result.lufs_after > -8) ? "bad" : "warn", "lufs"],
+      ["Stereo correlation", result.stereo_correlation_before != null ? result.stereo_correlation_before.toFixed(2) : "—",
+       result.stereo_correlation_after != null ? result.stereo_correlation_after.toFixed(2) : "—",
+       result.stereo_correlation_after != null ? result.stereo_correlation_after >= 0.1 : null, "stereo_correlation"],
+      ["DC offset (max L/R)", dcMaxBefore != null ? dcMaxBefore.toFixed(5) : "—", dcMaxAfter != null ? dcMaxAfter.toFixed(5) : "—",
+       dcMaxAfter != null ? dcMaxAfter < 0.001 : null, "dc_offset"],
+      ["Transients detected", result.transients_found ? (result.transients_found.length + (result.transients_found.length ? " (fixed)" : "")) : "—",
+       result.transients_after_count != null ? result.transients_after_count : "—",
+       result.transients_after_count != null ? result.transients_after_count === 0 : null, "transients"],
       ["Duration", fmtDuration(result.duration_sec), fmtDuration(result.duration_sec), null, null],
       ["Signal-to-noise (original vs. fixed)", "n/a (reference)", result.overall_snr_db ? `${result.overall_snr_db.toFixed(1)} dB` : "unchanged", null, "snr"],
     ];
+    if (result.spectrum_before && result.spectrum_before.tilt && result.spectrum_after && result.spectrum_after.tilt) {
+      const tb = result.spectrum_before.tilt, ta = result.spectrum_after.tilt;
+      const fmtTilt = t => `${t["low (20-250Hz)"].toFixed(0)} / ${t["mid (250-4000Hz)"].toFixed(0)} / ${t["high (4000-20000Hz)"].toFixed(0)} dB`;
+      rows.push(["Spectral tilt (low/mid/high)", fmtTilt(tb), fmtTilt(ta), null, "spectral_tilt"]);
+    }
+    function statusPill(status) {
+      // supports two shapes: boolean (existing pass/fail rows - linear,
+      // cnn, stereo correlation, dc offset, transients) and a "good"/
+      // "warn"/"bad" string (LUFS, which has a real middle ground - close
+      // to target but not exact isn't a hard fail, unlike a boolean would
+      // force it to render as).
+      if (status === null || status === undefined) return "—";
+      if (status === true) return '<span class="pill good">pass</span>';
+      if (status === false) return '<span class="pill crit">flagged</span>';
+      if (status === "good") return '<span class="pill good">pass</span>';
+      if (status === "warn") return '<span class="pill warn">check</span>';
+      if (status === "bad") return '<span class="pill crit">flagged</span>';
+      return "—";
+    }
     $("compareTable").innerHTML = `
       <thead><tr><th>Metric</th><th>Before</th><th>After</th><th>Status</th></tr></thead>
       <tbody>
       ${rows.map(([k, before, after, pass, info]) => `
         <tr>
           <td>${k}${info ? infoBtn(info) : ""}</td><td>${before}</td><td>${after}</td>
-          <td>${pass === null ? "—" : pass ? '<span class="pill good">pass</span>' : '<span class="pill crit">flagged</span>'}</td>
+          <td>${statusPill(pass)}</td>
         </tr>`).join("")}
       </tbody>`;
 
     $("stepsList").innerHTML = result.steps.map(s => {
-      const warning = stepWarningText(s);
+      const warning = stepWarningText(s, result);
       return `
       <div class="step-item">
         <div class="dot${warning ? " warn" : ""}"></div>
@@ -868,9 +1015,11 @@
       renderWaveformView();
       $("waveformDuration").textContent = fmtDuration(result.waveform_after.duration_sec);
       $("waveformLegend").classList.add("active");
+      const hasTransientMarkers = result.transients_found && result.transients_found.length > 0;
       $("waveformLegend").innerHTML = `
         <div class="item"><span class="swatch" style="background: var(--before)"></span>Before</div>
         <div class="item"><span class="swatch" style="background: var(--accent)"></span>After</div>
+        ${hasTransientMarkers ? `<div class="item"><span class="swatch" style="background: var(--crit)"></span>Fixed transient/pop (hover for time)</div>` : ""}
       `;
       document.querySelector("#waveformOverviewCanvas").closest(".spectrum-wrap").querySelector(".chart-view-row").classList.add("active");
     }
@@ -890,7 +1039,7 @@
     const result = state.lastResult;
     if (!result || !result.waveform_before || !result.waveform_after) return;
     const mode = state.waveformViewMode;
-    drawWaveformOverview($("waveformOverviewCanvas"), result.waveform_before, result.waveform_after, mode);
+    drawWaveformOverview($("waveformOverviewCanvas"), result.waveform_before, result.waveform_after, mode, result.transients_found);
   }
 
   document.querySelectorAll("#spectrumViewSwitch button").forEach(btn => {
@@ -925,10 +1074,18 @@
     else if (s.tool === "true_peak_limit") text = ` — reduced ${Math.abs(s.gain_reduction_db).toFixed(1)}dB`;
     else if (s.tool === "linear_fix" || s.tool === "linear_fix_reverify")
       text = ` — SNR ${s.snr_db.toFixed(1)}dB` + (s.final_real_score !== undefined ? `, ${(s.final_real_score * 100).toFixed(3)}% AI` : "");
-    else if (s.tool === "cnn_fix") {
+    else if (s.tool === "cnn_fix" || s.tool === "cnn_fix_reverify") {
       text = ` — SNR ${s.snr_db.toFixed(1)}dB`;
       if (s.worst_score_after_transfer !== undefined && s.worst_score_after_transfer !== null) {
-        text += `, worst of ${s.n_windows || "all"} optimization windows: ${(s.worst_score_after_transfer * 100).toFixed(1)}% AI`;
+        // This is a deliberately pessimistic ROBUSTNESS check, not the real
+        // detector's actual verdict: it scans a small window around each of
+        // the 5 real evaluation spots and reports the worst score found
+        // ANYWHERE nearby, as a safety margin against the file shifting
+        // slightly. The real detector's own verdict (checked later, after
+        // the rest of the chain, at its own exact positions) is what
+        // actually determines pass/fail - see the CNN model score row
+        // below and the verdict banner above, not this number.
+        text += `, safety-margin check (worst nearby spot): ${(s.worst_score_after_transfer * 100).toFixed(1)}% AI`;
       }
     }
     else if (s.tool === "fix_transients") text = ` — ${s.count} anomal${s.count === 1 ? "y" : "ies"} found`;
@@ -942,13 +1099,29 @@
     return text;
   }
 
-  function stepWarningText(s) {
+  function stepWarningText(s, result) {
     // Surface the honesty-signal fields that mean "this fix didn't fully
     // reach its target" - these are set specifically so a partial fix is
     // never silently reported as a full success.
     if (s.warning) return s.warning;
-    if (s.tool === "cnn_fix" && s.verified_after_transfer === false) {
-      return `Not all analysis windows converged - worst window still scored ${(s.worst_score_after_transfer * 100).toFixed(1)}% AI after transfer.`;
+    if ((s.tool === "cnn_fix" || s.tool === "cnn_fix_reverify") && s.verified_after_transfer === false) {
+      // verified_after_transfer is keyed to 0.08 - a deliberately tighter
+      // safety margin than the real detector's own 0.5 pass/fail boundary,
+      // used so the optimizer keeps pushing for comfortable headroom rather
+      // than a knife's-edge pass. That means this CAN legitimately read
+      // "not verified" here while the real detector, checked later against
+      // its own actual positions (median of 5, not worst-of-nearby), still
+      // passes comfortably - confirmed happening in practice (worst nearby
+      // spot 8.3%, real final CNN score 0.1%). Only surface this as a
+      // warning if the actual final verdict agrees something is wrong;
+      // otherwise this step earned real safety margin even if not the full
+      // margin it was aiming for, and flagging it here just contradicts the
+      // pass shown in the verdict banner a few inches away for no reason.
+      const finalCnnPct = result && result.scores_after ? result.scores_after.cnn_pct : null;
+      if (finalCnnPct === null || finalCnnPct >= 50) {
+        return `Worst nearby spot still scored ${(s.worst_score_after_transfer * 100).toFixed(1)}% AI after transfer, and the final detector check agrees - this file may still get flagged.`;
+      }
+      return null;
     }
     return null;
   }
@@ -1006,6 +1179,10 @@
 
     $("playBtn").onclick = () => {
       if (activeEl().paused) {
+        // starting A/B playback should stop the original-file player at
+        // the top of the page too - otherwise both can play at once
+        const origPlayer = $("originalPlayer");
+        if (origPlayer && !origPlayer.paused) origPlayer.pause();
         audioOrig.currentTime = audioFixed.currentTime = activeEl().currentTime;
         audioOrig.play();
         audioFixed.play();

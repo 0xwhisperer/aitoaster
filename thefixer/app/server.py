@@ -490,12 +490,16 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                         extra["windows_total"] = int(real_check_extra["n_windows"])
                     job_set_sub_progress(job_id, s, mx, extra=extra)
 
+                cnn_mode = options.get("cnn_mode", "eot")
+                if cnn_mode not in ("simple", "eot", "thorough"):
+                    cnn_mode = "eot"
                 audio, info = fix_cnn(audio, sr,
                                        max_steps=cnn_max_steps,
                                        min_steps=options.get("cnn_min_steps", 100),
                                        hop_sec=options.get("cnn_hop_sec", 0.5),
                                        progress_cb=lambda m: job_log(job_id, m),
-                                       step_progress_cb=_cnn_step_cb)
+                                       step_progress_cb=_cnn_step_cb,
+                                       mode=cnn_mode)
             elif tool == "fix_phase":
                 audio, info = chain.fix_phase_issues(audio, sr)
             elif tool == "normalize_lufs":
@@ -600,6 +604,9 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                             extra["windows_total"] = int(real_check_extra["n_windows"])
                         job_set_sub_progress(job_id, s, mx, extra=extra)
 
+                    _cnn_reverify_mode = options.get("cnn_mode", "eot")
+                    if _cnn_reverify_mode not in ("simple", "eot", "thorough"):
+                        _cnn_reverify_mode = "eot"
                     audio, cnn_reverify_info = fix_cnn(
                         audio, sr,
                         max_steps=options.get("cnn_max_steps", 300),
@@ -607,6 +614,7 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                         hop_sec=options.get("cnn_hop_sec", 0.5),
                         progress_cb=lambda m: job_log(job_id, m),
                         step_progress_cb=_cnn_reverify_step_cb,
+                        mode=_cnn_reverify_mode,
                     )
                     cnn_reverify_info["tool"] = "cnn_fix_reverify"
                     cnn_reverify_info["label"] = "AI-detector fix: CNN model (re-verification pass)"
@@ -770,6 +778,30 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         waveform_before = chain.waveform_peaks(aligned_original, sr)
         waveform_after = chain.waveform_peaks(audio, sr)
 
+        # the results panel only ever showed a 5-row before/after table even
+        # though the pre-processing analysis panel shows a much richer set
+        # of stats (stereo correlation, DC offset, transients, spectral
+        # tilt) - compute the equivalent AFTER-state numbers here (mirroring
+        # exactly what /api/analyze already computes for the before state)
+        # so the results panel can show the same depth, not a stripped-down
+        # subset of it.
+        correlation_before = chain.stereo_correlation(aligned_original)
+        correlation_after = chain.stereo_correlation(audio)
+        dc_before = aligned_original.mean(axis=0)
+        dc_after = audio.mean(axis=0)
+        transients_after = chain.detect_transients(audio, sr)
+
+        # surface WHERE each fixed transient/pop was found, for the results
+        # panel's waveform chart to mark - fix_transients' own step already
+        # records each one's time_sec in its "details" list (from
+        # chain.fix_transient's return dict), just not as a flat top-level
+        # array the frontend can hand straight to the chart.
+        transients_found = [
+            {"time_sec": d["time_sec"]}
+            for s in steps if s.get("tool") == "fix_transients"
+            for d in s.get("details", []) if "time_sec" in d
+        ]
+
         # the scoring WAV is redundant once re-scoring is done UNLESS the
         # delivered format IS wav (in which case out_path == scoring_wav_path
         # already covers it) - only remove the extra copy when they differ
@@ -802,6 +834,12 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
             "spectrum_after": {"freqs": freqs_a, "psd_db": psd_a, "tilt": tilt_after},
             "waveform_before": waveform_before,
             "waveform_after": waveform_after,
+            "transients_found": transients_found,
+            "stereo_correlation_before": float(correlation_before),
+            "stereo_correlation_after": float(correlation_after),
+            "dc_offset_before": {"l": float(dc_before[0]), "r": float(dc_before[1])},
+            "dc_offset_after": {"l": float(dc_after[0]), "r": float(dc_after[1])},
+            "transients_after_count": len(transients_after),
             "passes_both_after": scores_after["passes_both"],
             "duration_sec": n / sr,
         }

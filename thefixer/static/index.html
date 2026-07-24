@@ -249,6 +249,7 @@ header {
   font-size: 11.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
   color: var(--text-dim);
 }
+.elapsed-time { margin-left: auto; font-size: 12px; color: var(--text-faint); }
 .check-all-btn {
   margin-left: auto;
   background: transparent; border: 1px solid var(--rack-line);
@@ -256,6 +257,8 @@ header {
   font-size: 11.5px; cursor: pointer;
 }
 .check-all-btn:hover { border-color: var(--accent); color: var(--accent); }
+.copy-log-btn { margin-left: 0; }
+.copy-log-btn.copied { border-color: var(--good, #3fa06e); color: var(--good, #3fa06e); }
 .panel-body { padding: 16px; }
 
 .chain-group {
@@ -405,10 +408,25 @@ canvas#waveformOverviewCanvas {
   border: 1px solid var(--rack-line); background: var(--input-bg);
   color: var(--text-dim); border-radius: 7px; padding: 8px 10px;
   font-size: 12px; font-weight: 600; cursor: pointer;
+  line-height: 1.3;
 }
 .format-switch button.active { background: var(--accent); color: #0c1210; border-color: var(--accent); }
 .mp3-mode-row { margin-top: 10px; }
 .format-switch button:not(.active):hover { border-color: var(--accent-dim); color: var(--text); }
+/* three-way switches (e.g. CNN fix mode) need their own column count -
+   the shared 1fr-1fr grid above wraps a 3rd button onto its own orphaned
+   row instead of giving it a proportional column, and long labels like
+   "Shift-robust (5 positions, recommended)" then wrap mid-phrase inside
+   the remaining narrow cell. */
+.format-switch.cols-3 {
+  grid-template-columns: 1fr 1fr 1fr;
+}
+.format-switch.cols-3 button {
+  font-size: 11px; padding: 8px 8px;
+}
+.cnn-mode-hint {
+  font-size: 11px; color: var(--text-faint); margin-top: 8px; line-height: 1.4;
+}
 
 .run-bar { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-top: 1px solid var(--rack-line); }
 .btn {
@@ -432,7 +450,8 @@ canvas#waveformOverviewCanvas {
   font-size: 12.5px; margin-bottom: 8px;
 }
 .progress-step-row #progressStepLabel { color: var(--text); font-weight: 600; }
-.progress-step-row #progressStepCount { color: var(--text-faint); }
+.progress-step-row #progressStepCount { color: var(--text-faint); text-align: right; }
+.sub-progress-detail { font-size: 11px; opacity: 0.8; }
 .progress-bar-track {
   height: 8px; border-radius: 4px; background: var(--input-bg);
   border: 1px solid var(--rack-line); overflow: hidden; margin-bottom: 12px;
@@ -493,6 +512,11 @@ canvas#waveformOverviewCanvas {
 .verdict-banner.pass { background: var(--accent-glow); border-color: var(--accent-dim); }
 .verdict-banner.fail { background: rgba(224,84,79,0.12); border-color: var(--crit); }
 .verdict-banner .icon { font-size: 26px; }
+.verdict-banner .verdict-filename {
+  font-size: 11px; font-weight: 600; letter-spacing: 0.02em;
+  color: var(--text-faint); margin-bottom: 3px;
+  overflow-wrap: anywhere;
+}
 .verdict-banner .title { font-size: 15.5px; font-weight: 700; }
 .verdict-banner .sub { font-size: 12.5px; color: var(--text-dim); margin-top: 2px; }
 
@@ -686,6 +710,16 @@ footer {
             </button>
             <div class="chain-group-body">
               <div class="chain-list" id="chainGroupAI"></div>
+
+              <div id="cnnModeRow" class="mp3-mode-row hidden">
+                <div class="chain-group-label">CNN fix mode<button class="info-btn" data-info="cnn_mode" title="What's this?" type="button">i</button></div>
+                <div class="format-switch cols-3" id="cnnModeSwitch">
+                  <button data-cnnmode="simple">Simple</button>
+                  <button data-cnnmode="eot" class="active">Shift-robust</button>
+                  <button data-cnnmode="thorough">Thorough</button>
+                </div>
+                <div class="cnn-mode-hint" id="cnnModeHint">Recommended - trains the fix to hold up even if the check lands slightly off-position.</div>
+              </div>
             </div>
           </div>
 
@@ -726,7 +760,11 @@ footer {
     </div>
 
     <div class="panel progress-panel" id="progressPanel">
-      <div class="panel-head"><span class="title">Processing</span></div>
+      <div class="panel-head">
+        <span class="title">Processing</span>
+        <span class="mono elapsed-time" id="elapsedTime"></span>
+        <button class="check-all-btn copy-log-btn" id="copyLogBtn" type="button">Copy log</button>
+      </div>
       <div class="panel-body">
         <div class="progress-step-row">
           <span class="mono" id="progressStepLabel">—</span>
@@ -742,6 +780,7 @@ footer {
       <div class="verdict-banner" id="verdictBanner">
         <div class="icon" id="verdictIcon">—</div>
         <div>
+          <div class="verdict-filename" id="verdictFilename"></div>
           <div class="title" id="verdictTitle">—</div>
           <div class="sub" id="verdictSub">—</div>
         </div>

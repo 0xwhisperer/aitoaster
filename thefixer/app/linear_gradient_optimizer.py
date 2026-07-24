@@ -28,15 +28,27 @@ def build_perceptual_weight(sr, n_fft):
 PERCEPTUAL_WEIGHT = build_perceptual_weight(SAMPLE_RATE, STFT_WIN)
 
 
-def perceptual_penalty(delta_1d, original_1d):
+def compute_masking_mult(original_1d):
+    """The masking multiplier depends ONLY on the ORIGINAL audio, which
+    never changes across an entire optimization run (only delta changes
+    step to step) - independently verified (external code review) as a
+    real, free speedup: recomputing this every single step was redoing
+    identical work ~19% of that step's total cost, hundreds of times per
+    attempt, for a value that's constant the whole time. Call this ONCE
+    before the optimization loop starts and pass the result into
+    perceptual_penalty every step instead."""
     window = torch.hann_window(STFT_WIN)
-    D = torch.stft(delta_1d, n_fft=STFT_WIN, hop_length=STFT_WIN // 4, window=window, return_complex=True)
     O = torch.stft(original_1d, n_fft=STFT_WIN, hop_length=STFT_WIN // 4, window=window, return_complex=True)
-    d_mag = D.abs()
     o_mag = O.abs().detach()
     o_db = 20 * torch.log10(o_mag + 1e-6)
     o_db_norm = torch.clamp((o_db - o_db.min()) / (o_db.max() - o_db.min() + 1e-6), 0, 1)
-    masking_mult = 1.0 - 0.7 * o_db_norm  # loud original -> more masking -> lower penalty
+    return 1.0 - 0.7 * o_db_norm  # loud original -> more masking -> lower penalty
+
+
+def perceptual_penalty(delta_1d, masking_mult):
+    window = torch.hann_window(STFT_WIN)
+    D = torch.stft(delta_1d, n_fft=STFT_WIN, hop_length=STFT_WIN // 4, window=window, return_complex=True)
+    d_mag = D.abs()
     pw = PERCEPTUAL_WEIGHT.unsqueeze(1)
     weighted_power = (d_mag ** 2) * pw * masking_mult
     energy_penalty = weighted_power.mean()
@@ -95,7 +107,7 @@ def _real_score_for_delta(delta, audio_orig):
 
 
 def optimize(audio_orig, lambda_perceptual=2000.0, lambda_band=5000.0, lambda_tonality=50.0,
-             target=0.01, real_target=0.05, max_steps=400, lr=0.00002,
+             target=0.01, real_target=0.05, max_steps=225, lr=0.00002,
              real_check_interval=50, verbose=True, progress_cb=None, retry_index=0):
     """Full per-sample gradient optimization: delta is a free-form waveform
     perturbation (not constrained to any fixed set of frequencies), optimized
@@ -126,18 +138,39 @@ def optimize(audio_orig, lambda_perceptual=2000.0, lambda_band=5000.0, lambda_to
     best_real_score = 1.0
     best_delta_norm = float("inf")
     extra_steps = 0
+    # BUG FIX (adversarial review, verified directly): max_steps used to be
+    # mutated in place by the extension logic below, and the periodic real
+    # check only ever landed on multiples of real_check_interval (default
+    # 50). With max_steps=225, the last check before the loop's natural end
+    # fires at step 200; the extension condition `step + 1 >= max_steps`
+    # then evaluates 201 >= 225, which is FALSE, so the extension never
+    # triggers and the loop silently runs out to 225 with zero further real
+    # verification - exactly the "surrogate says done, real model never
+    # asked again" failure this function's whole design exists to prevent.
+    # Fix: keep the caller's cap immutable, always force a real check
+    # exactly AT the cap (not just at interval multiples), and drive any
+    # extension off a separate absolute ceiling instead of mutating the
+    # loop bound mid-run.
+    absolute_max_steps = max_steps * 4  # was "max_steps * 3" extra budget on
+    # top of a moving cap, which - per the same bug - was never actually
+    # reachable; 4x the ORIGINAL cap here is the true, fixed ceiling.
 
     # target the logit directly (has real gradients everywhere) rather than
     # the sigmoid score, which saturates to exactly 1.0 (zero gradient) when
     # the model is very confident - as it is on a raw, unmodified AI track
     logit_target = torch.logit(torch.tensor(target), eps=1e-6)
 
+    # computed ONCE here, not every step - audio_orig never changes across
+    # the whole optimization run, only delta does (see compute_masking_mult
+    # docstring for the measured cost this saves).
+    masking_mult = compute_masking_mult(audio_orig)
+
     step = 0
     while step < max_steps:
         optimizer.zero_grad()
         perturbed = audio_orig + delta
         logit = forward_logit_differentiable(perturbed)
-        percep = perceptual_penalty(delta, audio_orig)
+        percep = perceptual_penalty(delta, masking_mult)
         band_penalty = band_limit_penalty(delta, sr=16000, lo_hz=800, hi_hz=8000)
         tonal_penalty = tonality_penalty(delta)
         # push logit down toward (and past) the target threshold's logit value
@@ -157,8 +190,13 @@ def optimize(audio_orig, lambda_perceptual=2000.0, lambda_band=5000.0, lambda_to
             print(f"  step {step:3d}: surrogate_score={cur_score:.5f}  percep_penalty={percep.item():.6f}  band_penalty={band_penalty.item():.6f}  SNR={snr:.1f}dB")
 
         # periodically verify against the REAL model - this is the only
-        # source of truth for whether we can actually stop or call a delta "best"
-        if cur_score < target * 0.5 and step > 0 and step % real_check_interval == 0:
+        # source of truth for whether we can actually stop or call a delta "best".
+        # Also force a check on the LAST step of the current budget even if it
+        # doesn't land on a real_check_interval multiple - otherwise a run whose
+        # cap isn't itself a multiple of real_check_interval can end without ever
+        # having its final state verified at all.
+        at_budget_end = (step == max_steps - 1)
+        if cur_score < target * 0.5 and step > 0 and (step % real_check_interval == 0 or at_budget_end):
             real_score = _real_score_for_delta(delta, audio_orig)
             cur_norm = delta.norm().item()
             if verbose:
@@ -177,11 +215,16 @@ def optimize(audio_orig, lambda_perceptual=2000.0, lambda_band=5000.0, lambda_to
                 break
             if real_score >= real_target:
                 # surrogate thinks we're done but the real model disagrees -
-                # keep optimizing past max_steps rather than silently
-                # returning a delta that doesn't actually work
+                # keep optimizing past the original cap rather than silently
+                # returning a delta that doesn't actually work. Compare against
+                # the CURRENT (possibly already-extended) max_steps, not the
+                # frozen initial_max_steps, so this can keep extending on
+                # successive failed checks - but only up to absolute_max_steps,
+                # which is fixed once at the start and never moves, so this
+                # loop is guaranteed to terminate.
                 extra_steps += real_check_interval
-                if step + 1 >= max_steps and extra_steps <= max_steps * 3:
-                    max_steps = step + 1 + real_check_interval
+                if step + 1 >= max_steps and max_steps < absolute_max_steps:
+                    max_steps = min(absolute_max_steps, step + 1 + real_check_interval)
 
         step += 1
 

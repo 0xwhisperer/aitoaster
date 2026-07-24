@@ -42,10 +42,29 @@ def _score_stereo_array(stereo_audio, sr):
 ACCEPT_THRESHOLD = 0.01  # the user's actual bar is <1% AI, not just "under 50%"
 
 
-def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=400,
+def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=225,
                 max_retries=3, progress_cb=None, step_progress_cb=None):
     """Apply the gradient-based linear-model fix. stereo_audio: [N,2] float32
     at native sr (typically 44100). Returns (fixed_stereo, info).
+
+    max_steps was 400; lowered to 225 (independently reviewed and measured:
+    ~794ms/step on a 300s track, so 400 steps was ~318s/attempt even when
+    convergence happened much earlier). Safe to lower because
+    linear_gradient_optimizer.optimize() has its own adaptive safety net
+    independent of this starting value: it breaks out early via real-model
+    verification once genuinely converged (as early as step 150), forces a
+    real check at whatever step the budget actually ends on (not just at
+    real_check_interval multiples - an earlier version could miss this,
+    verified: with max_steps=225 and real_check_interval=50 the last check
+    landed at step 200, and the never-satisfied `step+1 >= max_steps`
+    condition meant the loop silently ran out with no further verification
+    - fixed by forcing a check at the true final step and driving extension
+    off a separate fixed absolute_max_steps instead of a mutated max_steps),
+    and extends itself past the cap (up to 4x the original) if the real
+    model still disagrees when the budget ends - so lowering the starting
+    cap only cuts wasted steps on runs that would have converged early
+    anyway; harder files still get as many steps as they actually need via
+    the extension path.
 
     Verifies the REAL detector score on the final transferred (resampled,
     stereo) output - not just the surrogate's score during optimization -
@@ -180,11 +199,16 @@ def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=400,
 
         # a retry only has a shot at doing better if it's actually being asked
         # to hit a tighter target than the previous attempt - once cur_real_target
-        # has bottomed out at its floor (0.002), a further retry starts from the
-        # same conditions and reliably reproduces the same result (confirmed on
-        # a real production run: attempts 3 and 4 both landed on 1.178% exactly),
+        # has bottomed out at its floor, a further retry starts from the same
+        # conditions and reliably reproduces the same result (confirmed on a
+        # real production run: attempts 3 and 4 both landed on 1.178% exactly),
         # so stop rather than burn ~2-7 minutes on a repeat that cannot improve.
-        at_target_floor = cur_real_target <= 0.002 + 1e-9
+        # Floor value must track the min()-based retry step above (0.00001) -
+        # this used to reference a stale 0.002 floor left over from before
+        # TRANSFER_LOSS_MULTIPLIER dropped the initial target to 0.00005,
+        # which meant this check could never actually trigger against the
+        # real floor the retry step was using.
+        at_target_floor = cur_real_target <= 0.00001 + 1e-9
         stalled = attempt > 0 and not improved and at_target_floor
         if progress_cb:
             if attempt < max_retries and not stalled:
@@ -199,8 +223,17 @@ def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=400,
                             f"after all {max_retries + 1} attempts - shipping the best-scoring attempt found and continuing to the next tool")
         if stalled:
             break
-        cur_real_target = max(0.002, cur_real_target * 0.3)
-        target = max(0.001, target * 0.3)
+        # BUG FIX (adversarial review, verified directly): the 0.002 floor
+        # here predates TRANSFER_LOSS_MULTIPLIER dropping the INITIAL target
+        # down to 0.00005 - once that happened, max(0.002, 0.00005*0.3)
+        # evaluates to 0.002, a target 40x LOOSER than attempt 1 even though
+        # the log line right above claims "retrying with a stricter internal
+        # target." A retry is only useful if it's actually harder than the
+        # attempt that just failed. Floor removed in favor of an explicit
+        # min() against the current value, so this can now only ever move
+        # the same direction the log message promises.
+        cur_real_target = min(cur_real_target, max(0.00001, cur_real_target * 0.3))
+        target = min(target, max(0.0001, target * 0.3))
 
     # exhausted retries: ship whichever attempt scored BEST across the whole
     # loop, not whatever the last attempt happened to produce - a later retry

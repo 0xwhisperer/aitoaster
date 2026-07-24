@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from .cnn_differentiable_v2 import (
     forward_logit_differentiable, forward_score_differentiable,
-    get_real_score_segment, SR, SEGMENT_SAMPLES,
+    get_real_score_segment, get_real_evaluator_segments, SR, SEGMENT_SAMPLES,
 )
 from .cnn_gradient_optimizer_v2 import perceptual_penalty, band_limit_penalty, tonality_penalty, apply_silence_guard_to_delta
 
@@ -111,6 +111,17 @@ def optimize_whole_track_verified(
 
     verbose=True,
     progress_cb=None,
+    mode="thorough",  # "thorough" (default): dense overlapping windows every
+    # hop_sec across the WHOLE track, covering far more than any real
+    # detector deployment would actually check - built to be robust against
+    # a checker sampling differently than expected. "simple": optimize ONLY
+    # the exact 5 fixed positions the real detector itself checks
+    # (CNNDetector.predict's own n_segments=5 logic, reproduced exactly via
+    # get_real_evaluator_segments) - i.e. what a standard, uncustomized
+    # deployment of this detector would actually test against, nothing
+    # more. Added specifically to let "simple" be tested in isolation
+    # against "thorough" to see whether the extra coverage is worth its
+    # much higher cost, rather than always paying for the expensive version.
 ):
     """Same joint multi-window optimization as before, but periodically checks
     the REAL (librosa-based) score at each window and, for any window where
@@ -133,9 +144,16 @@ def optimize_whole_track_verified(
         padded[:n_real] = audio_np
         audio_np = padded
     n = len(audio_np)
-    positions, seg_len = build_sliding_windows(n, hop_sec=hop_sec)
-    print(f"track length: {n/SR:.1f}s, {len(positions)} overlapping windows "
-          f"(hop={hop_sec}s, window={seg_len/SR:.1f}s)")
+    if mode == "simple":
+        seg_len = SEGMENT_SAMPLES
+        positions = get_real_evaluator_segments(audio_np, n_segments=5)
+        print(f"track length: {n/SR:.1f}s, SIMPLE mode: optimizing only the "
+              f"real detector's own 5 fixed evaluation positions "
+              f"(window={seg_len/SR:.1f}s)")
+    else:
+        positions, seg_len = build_sliding_windows(n, hop_sec=hop_sec)
+        print(f"track length: {n/SR:.1f}s, {len(positions)} overlapping windows "
+              f"(hop={hop_sec}s, window={seg_len/SR:.1f}s)")
 
     audio = torch.tensor(audio_np, dtype=torch.float32)
     delta = torch.zeros_like(audio, requires_grad=True)
@@ -300,6 +318,250 @@ def optimize_whole_track_verified(
     # hard guarantee (not just a training-time penalty): zero out the delta
     # in genuinely near-silent passages of the ORIGINAL track, regardless of
     # what the optimizer converged to.
-    best_delta = apply_silence_guard_to_delta(best_delta, audio)
+    #
+    # BUG FIX (adversarial review, verified directly): this used to mutate
+    # best_delta with no re-check after it had already been selected and
+    # validated above - the same "certified, then silently changed" gap
+    # found in optimize_eot_verified. Re-check every position on the
+    # POST-guard delta before returning, so the reported score matches what
+    # actually ships.
+    guarded_delta = apply_silence_guard_to_delta(best_delta, audio)
+    with torch.no_grad():
+        guarded_perturbed_np = (audio + guarded_delta).numpy()
+    post_guard_scores = [
+        get_real_score_segment(guarded_perturbed_np[pos:pos + seg_len])
+        for pos in positions
+    ]
+    post_guard_worst = max(post_guard_scores) if post_guard_scores else 1.0
+    print(f"  post-silence-guard worst real score: {post_guard_worst:.4f} "
+          f"(pre-guard best_real_max was {best_real_max:.4f})")
+    if post_guard_worst > best_real_max + 1e-6:
+        print("  WARNING: silence guard degraded the certified score - "
+              "this is exactly why this re-check exists")
 
-    return best_delta.numpy(), positions, seg_len
+    return guarded_delta.numpy(), positions, seg_len, post_guard_worst
+
+
+def _worst_shift_score(perturbed_np, center_pos, seg_len, n, shift_range_sec=1.0,
+                        shift_step_sec=0.05, sr=SR):
+    """Scan the REAL (non-differentiable) score across a range of small time
+    shifts around center_pos and return the worst (highest) one found - the
+    metric Fable's review specifically recommended adopting instead of a
+    single-point check: passing at exactly zero-shift is exactly the lie
+    that's been shipping all session (a delta that scores 0% at its exact
+    optimized position but 90%+ just 0.25s away is NOT actually fixed, even
+    though a single-point check would have called it a pass)."""
+    shift_samples = int(shift_range_sec * sr)
+    step_samples = max(1, int(shift_step_sec * sr))
+    worst = 0.0
+    for offset in range(-shift_samples, shift_samples + 1, step_samples):
+        pos = center_pos + offset
+        if pos < 0 or pos + seg_len > n:
+            continue
+        seg = perturbed_np[pos:pos + seg_len]
+        s = get_real_score_segment(seg)
+        if s > worst:
+            worst = s
+    return worst
+
+
+def optimize_eot_verified(
+    audio_np,
+    target=0.05,
+    real_target=0.08,
+    lambda_perceptual=2000.0,
+    lambda_band=5000.0,
+    lambda_tonality=50.0,
+    lr=0.00002,
+    max_steps=300,
+    min_steps=60,
+    eot_samples=6,       # random shift samples averaged per step per region
+    eot_jitter_sec=0.5,  # +-0.5s jitter range, matching the actual measured
+                          # instability period found earlier this session
+                          # (score oscillation period ~0.8-0.9s on corrected
+                          # audio - +-0.5s comfortably covers a full cycle)
+    real_check_interval=10,
+    n_segments=5,         # optimize the REAL detector's own fixed positions,
+                          # not a dense whole-track grid - see module-level
+                          # docstring below for why
+    verbose=True,
+    progress_cb=None,
+):
+    """Expectation-over-Transformation (EOT) optimizer: fixes an architectural
+    problem in optimize_whole_track_verified, not just a tuning issue,
+    identified via an independent design review (see project history) after
+    that approach proved unreliable even after multiple rounds of tuning.
+
+    THE ROOT CAUSE optimize_whole_track_verified doesn't address: gradient
+    descent against a fixed audio position finds a MINIMAL-NORM, NON-ROBUST
+    perturbation - a classic adversarial-example failure mode, not a bug.
+    Verified directly and repeatedly this session: the real detector's score
+    on CNN-corrected audio swings wildly (0% to 99.99%+) within a QUARTER
+    SECOND of the position the delta was optimized at, while the SAME scan
+    on unmodified source audio is rock-stable regardless of offset. The old
+    approach's response - densely tile the whole track with overlapping
+    windows so no checked position is missed - treats the SYMPTOM (gaps
+    between brittle points) with brute force, at 5-10x the cost, and still
+    doesn't reliably transfer once the file goes through resample/encode
+    (which shifts exactly where the real detector's fixed positions land).
+
+    THE FIX: don't discover a brittle point and then try to cover the gaps
+    around it - make the point itself robust to being off by up to
+    eot_jitter_sec, by training against RANDOM shifted samples every step
+    (Expectation-over-Transformation, a standard adversarial-robustness
+    technique). This also lets us go back to optimizing only the ~5 real
+    positions the deployed detector actually checks (score = median of 5,
+    so only 3 of 5 need to pass) instead of hundreds of windows across the
+    whole track - a delta that's robust across +-0.5s at 5 positions is a
+    much easier, cheaper target than "every possible 10s window everywhere,
+    with zero robustness margin at any of them."
+
+    Cost: n_segments x eot_samples forward/backward passes per step
+    (5 x 6 = 30 by default) vs. hundreds of windows in the old approach -
+    roughly an order of magnitude cheaper per step, on top of directly
+    targeting the actual failure mode instead of working around it.
+
+    Convergence uses _worst_shift_score (max real score across a +-1s scan
+    at each position), not a single-point check - passing only at the exact
+    optimized position is precisely the false convergence this session kept
+    hitting."""
+    n_real = len(audio_np)
+    if n_real < SEGMENT_SAMPLES:
+        padded = np.zeros(SEGMENT_SAMPLES, dtype=audio_np.dtype)
+        padded[:n_real] = audio_np
+        audio_np = padded
+    n = len(audio_np)
+    seg_len = SEGMENT_SAMPLES
+    positions = get_real_evaluator_segments(audio_np, n_segments=n_segments)
+    print(f"track length: {n/SR:.1f}s, EOT mode: optimizing the real detector's "
+          f"{len(positions)} fixed positions with +-{eot_jitter_sec}s shift "
+          f"robustness ({eot_samples} shift samples/step)", flush=True)
+
+    audio = torch.tensor(audio_np, dtype=torch.float32)
+    delta = torch.zeros_like(audio, requires_grad=True)
+    optimizer = torch.optim.Adam([delta], lr=lr)
+
+    logit_target = torch.logit(torch.tensor(target), eps=1e-6)
+    jitter_samples = int(eot_jitter_sec * SR)
+
+    window_weight = {pos: 1.0 for pos in positions}
+
+    best_delta = None
+    best_worst_shift_max = 1.0
+    rng = np.random.default_rng(1234)
+
+    for step in range(max_steps):
+        optimizer.zero_grad()
+        perturbed = audio + delta
+
+        total_logit_loss = 0.0
+        max_surrogate_score = 0.0
+        for pos in positions:
+            w = window_weight[pos]
+            for _ in range(eot_samples):
+                jitter = int(rng.integers(-jitter_samples, jitter_samples + 1))
+                shifted_pos = max(0, min(n - seg_len, pos + jitter))
+                seg = perturbed[shifted_pos:shifted_pos + seg_len]
+                logit = forward_logit_differentiable(seg.unsqueeze(0))
+                margin_term = logit - logit_target + 1.0
+                # same leaky-relu fix as optimize_whole_track_verified - a
+                # plain relu here would have the identical zero-gradient
+                # stalling problem that fix addressed.
+                total_logit_loss = total_logit_loss + (w / eot_samples) * F.leaky_relu(margin_term, negative_slope=0.02)
+                with torch.no_grad():
+                    s = torch.sigmoid(logit).item()
+                    max_surrogate_score = max(max_surrogate_score, s)
+
+        percep = perceptual_penalty(delta, audio)
+        band_pen = band_limit_penalty(delta, lo_hz=400, hi_hz=8000, sr=SR)
+        tonal_pen = tonality_penalty(delta)
+
+        loss = total_logit_loss + lambda_perceptual * percep + lambda_band * band_pen + lambda_tonality * tonal_pen
+        loss.backward()
+
+        if delta.grad is None or not torch.isfinite(delta.grad).all():
+            raise ValueError(
+                "gradient became non-finite during CNN EOT optimization - this can happen on "
+                "very short tracks padded with a large proportion of silence; the CNN fix "
+                "is not currently reliable on tracks this short"
+            )
+
+        optimizer.step()
+
+        if progress_cb is not None:
+            progress_cb(step, max_steps, max_surrogate_score, None)
+
+        if verbose and step % 5 == 0:
+            snr = 20 * torch.log10(audio.norm() / (delta.norm() + 1e-8)).item()
+            print(f"  step {step:3d}: max_surrogate_score={max_surrogate_score:.4f}  "
+                  f"total_logit_loss={total_logit_loss.item():.2f}  SNR={snr:.1f}dB", flush=True)
+
+        if step > 0 and step % real_check_interval == 0:
+            with torch.no_grad():
+                perturbed_np = (audio + delta).numpy()
+            # worst-shift score per position (Fable-recommended metric) - not
+            # just the exact-position score, which is precisely the check
+            # that let non-robust deltas look converged all session.
+            worst_shift_scores = {}
+            for pos in positions:
+                worst_shift_scores[pos] = _worst_shift_score(
+                    perturbed_np, pos, seg_len, n,
+                    shift_range_sec=eot_jitter_sec, shift_step_sec=0.1, sr=SR)
+            worst_shift_max = max(worst_shift_scores.values())
+            n_bad = sum(1 for v in worst_shift_scores.values() if v > real_target)
+            if verbose:
+                print(f"    [real check @ step {step}] worst_shift_max={worst_shift_max:.4f}, "
+                      f"{n_bad}/{len(positions)} positions still above real_target={real_target} "
+                      f"(checked across +-{eot_jitter_sec}s shifts, not just exact position)", flush=True)
+            if progress_cb is not None:
+                progress_cb(step, max_steps, max_surrogate_score, {
+                    "real_max_score": worst_shift_max, "n_windows_bad": n_bad, "n_windows": len(positions),
+                })
+
+            for pos in positions:
+                if worst_shift_scores[pos] > real_target:
+                    window_weight[pos] = min(window_weight[pos] * 1.5, 20.0)
+                else:
+                    window_weight[pos] = max(window_weight[pos] * 0.9, 1.0)
+
+            if worst_shift_max < best_worst_shift_max:
+                best_worst_shift_max = worst_shift_max
+                best_delta = delta.detach().clone()
+
+            if worst_shift_max < real_target and step >= min_steps:
+                print(f"  converged (shift-robust, real-verified) at step {step}")
+                break
+
+    if best_delta is None:
+        best_delta = delta.detach().clone()
+        print("  WARNING: shift-robust real verification never confirmed full convergence, using best available")
+    else:
+        print(f"  best worst-shift real score achieved during search: {best_worst_shift_max:.4f}")
+
+    # BUG FIX (adversarial review, verified directly): best_delta was
+    # selected and worst-shift-VALIDATED above, then MUTATED by the silence
+    # guard below with no re-check - so a delta that passed certification
+    # could ship with samples zeroed out afterward in a region that had been
+    # load-bearing for that passing score, and nothing would ever know. This
+    # is the exact "looked converged, wasn't" failure class EOT itself was
+    # built to fix, reintroduced one step later. Re-run the same worst-shift
+    # scan on the POST-guard delta before returning, so the number this
+    # function reports (and that cnn_fix.py uses to decide whether to accept
+    # the result) reflects what's actually being shipped, not a pre-mutation
+    # snapshot.
+    guarded_delta = apply_silence_guard_to_delta(best_delta, audio)
+    with torch.no_grad():
+        guarded_perturbed_np = (audio + guarded_delta).numpy()
+    post_guard_worst = max(
+        (_worst_shift_score(guarded_perturbed_np, pos, seg_len, n,
+                             shift_range_sec=eot_jitter_sec, shift_step_sec=0.1, sr=SR)
+         for pos in positions),
+        default=1.0,
+    )
+    print(f"  post-silence-guard worst-shift real score: {post_guard_worst:.4f} "
+          f"(pre-guard was {best_worst_shift_max:.4f})")
+    if post_guard_worst > best_worst_shift_max + 1e-6:
+        print("  WARNING: silence guard degraded the certified score - "
+              "this is exactly why this re-check exists")
+
+    return guarded_delta.numpy(), positions, seg_len, post_guard_worst
