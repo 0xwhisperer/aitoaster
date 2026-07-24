@@ -40,6 +40,22 @@ def _score_stereo_array(stereo_audio, sr):
 
 
 ACCEPT_THRESHOLD = 0.01  # the user's actual bar is <1% AI, not just "under 50%"
+REAL_TARGET_FLOOR = 0.00001
+SURROGATE_TARGET_FLOOR = 0.0001
+
+
+def _tighten_retry_targets(real_target, surrogate_target):
+    """Tighten both retry targets monotonically, using role-specific floors.
+
+    The real-model gate can use a smaller floor because it is only an
+    acceptance measurement. The surrogate target shapes every optimization
+    step; forcing its logit toward still smaller values after 1e-4 adds
+    optimization pressure without demonstrated transfer benefit.
+    """
+    return (
+        min(real_target, max(REAL_TARGET_FLOOR, real_target * 0.3)),
+        min(surrogate_target, max(SURROGATE_TARGET_FLOOR, surrogate_target * 0.3)),
+    )
 
 
 def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=225,
@@ -208,7 +224,7 @@ def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=225,
         # TRANSFER_LOSS_MULTIPLIER dropped the initial target to 0.00005,
         # which meant this check could never actually trigger against the
         # real floor the retry step was using.
-        at_target_floor = cur_real_target <= 0.00001 + 1e-9
+        at_target_floor = cur_real_target <= REAL_TARGET_FLOOR + 1e-9
         stalled = attempt > 0 and not improved and at_target_floor
         if progress_cb:
             if attempt < max_retries and not stalled:
@@ -232,8 +248,7 @@ def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=225,
         # attempt that just failed. Floor removed in favor of an explicit
         # min() against the current value, so this can now only ever move
         # the same direction the log message promises.
-        cur_real_target = min(cur_real_target, max(0.00001, cur_real_target * 0.3))
-        target = min(target, max(0.0001, target * 0.3))
+        cur_real_target, target = _tighten_retry_targets(cur_real_target, target)
 
     # exhausted retries: ship whichever attempt scored BEST across the whole
     # loop, not whatever the last attempt happened to produce - a later retry

@@ -203,6 +203,20 @@ def job_set_sub_progress(job_id, current, total, extra=None):
         job["sub_progress"] = payload
 
 
+class JobCancelled(Exception):
+    """Raised when a job's cancel_requested flag is set, checked at safe
+    points between pipeline stages and from the progress callbacks used by
+    the long-running optimizers. A slow real-model scoring call can still
+    delay the next callback, so cancellation is cooperative, not instant."""
+
+
+def check_cancelled(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is not None and job.get("cancel_requested"):
+            raise JobCancelled()
+
+
 @app.route("/")
 def index():
     return send_from_directory(STATIC_DIR, "index.html")
@@ -372,6 +386,7 @@ TOOL_ORDER = [
     "spectral_revive", "high_pass",
     "fix_phase", "normalize_lufs", "multiband_compress",
     "cnn_fix", "linear_fix",
+    "temporal_normalize",
     "true_peak_limit",
 ]
 
@@ -384,6 +399,7 @@ TOOL_LABELS = {
     "high_pass": "High-pass filter (rumble removal)",
     "linear_fix": "AI-detector fix: linear model",
     "cnn_fix": "AI-detector fix: CNN model",
+    "temporal_normalize": "Temporal pattern denormalization",
     "fix_phase": "Stereo phase/correlation correction",
     "normalize_lufs": "LUFS loudness normalization",
     "multiband_compress": "Multiband tonal-balance compression",
@@ -408,8 +424,25 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         ordered_tools = [t for t in TOOL_ORDER if t in tools]
         lead_samples_trimmed = 0
         total_steps = len(ordered_tools)
+        late_mutation_after_temporal = False
+
+        def _cancel_aware_log(message):
+            check_cancelled(job_id)
+            job_log(job_id, message)
+
+        def _linear_step_cb(step, mx, score, attempt, max_attempts):
+            check_cancelled(job_id)
+            job_set_sub_progress(
+                job_id, step, mx,
+                extra={
+                    "score_pct": round(float(score) * 100, 4),
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                },
+            )
 
         for step_idx, tool in enumerate(ordered_tools):
+            check_cancelled(job_id)
             job_set_step(job_id, step_idx, total_steps, TOOL_LABELS.get(tool, tool))
             job_log(job_id, f"running: {TOOL_LABELS.get(tool, tool)}")
             t0 = time.time()
@@ -453,6 +486,12 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 lead_samples_trimmed = info.get("lead_samples", 0)
             elif tool == "dc_offset":
                 audio, info = chain.fix_dc_offset(audio, sr)
+                # thresholds match the results table's own pass/fail logic
+                # (statusPill in app.js) exactly - this is the same "under
+                # 0.001 = pass" bar shown after the fact, just surfaced
+                # live too now instead of only in the final table.
+                dc_after_max = max(abs(info.get("dc_l_after", 0.0)), abs(info.get("dc_r_after", 0.0))) if info.get("applied") else 0.0
+                job_log(job_id, f"dc_offset: {'pass' if dc_after_max < 0.001 else 'check'} (max L/R after: {dc_after_max:.5f})")
             elif tool == "fix_transients":
                 transients = chain.detect_transients(audio, sr)
                 info = {"applied": len(transients) > 0, "count": len(transients), "details": []}
@@ -460,6 +499,7 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                     audio, tinfo = chain.fix_transient(audio, sr, t["time_sec"],
                                                          target_peak=options.get("transient_target_peak"))
                     info["details"].append(tinfo)
+                job_log(job_id, f"fix_transients: processed ({len(transients)} anomal{'y' if len(transients) == 1 else 'ies'} found)")
             elif tool == "spectral_revive":
                 audio, info = chain.spectral_revive(audio, sr, cutoff_hz=options.get("spectral_revive_cutoff_hz"))
             elif tool == "high_pass":
@@ -468,15 +508,15 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 from .linear_fix import fix_linear
                 audio, info = fix_linear(
                     audio, sr, target=options.get("linear_target", 0.01),
-                    progress_cb=lambda m: job_log(job_id, m),
-                    step_progress_cb=lambda s, mx, score, att, mxatt: job_set_sub_progress(
-                        job_id, s, mx, extra={"score_pct": round(score * 100, 4), "attempt": att, "max_attempts": mxatt}),
+                    progress_cb=_cancel_aware_log,
+                    step_progress_cb=_linear_step_cb,
                 )
             elif tool == "cnn_fix":
                 from .cnn_fix import fix_cnn
                 cnn_max_steps = options.get("cnn_max_steps", 300)
 
                 def _cnn_step_cb(s, mx, surrogate_score, real_check_extra):
+                    check_cancelled(job_id)
                     # real_check_extra's values come from get_real_score_segment,
                     # which returns numpy float32 - round() does not convert that
                     # to a native python float, and Flask's json encoder can't
@@ -497,15 +537,82 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                                        max_steps=cnn_max_steps,
                                        min_steps=options.get("cnn_min_steps", 100),
                                        hop_sec=options.get("cnn_hop_sec", 0.5),
-                                       progress_cb=lambda m: job_log(job_id, m),
+                                       progress_cb=_cancel_aware_log,
                                        step_progress_cb=_cnn_step_cb,
                                        mode=cnn_mode)
             elif tool == "fix_phase":
-                audio, info = chain.fix_phase_issues(audio, sr)
+                # Use the same 0.1 safety bar the results table uses, so a
+                # weakly-positive 0.05 correlation is not called "no change
+                # needed" here and then shown as failing in the final table.
+                audio, info = chain.fix_phase_issues(audio, sr, min_correlation=0.1)
+                if not info.get("applied"):
+                    corr_after = info.get("correlation")
+                    job_log(job_id, f"fix_phase: pass (no change needed; correlation: {corr_after:.2f})")
+                else:
+                    corr_after = info.get("correlation_after")
+                    # >= 0.1 matches the results table's own stereo-correlation
+                    # pass bar (statusPill in app.js)
+                    job_log(job_id, f"fix_phase: {'pass' if corr_after >= 0.1 else 'check'} (correlation: {corr_after:.2f})")
             elif tool == "normalize_lufs":
                 audio, info = chain.normalize_lufs(audio, sr, target_lufs=options.get("lufs_target", -14.0))
+                lufs_after = info.get("lufs_after")
+                # -16 to -12 matches the results table's own LUFS pass bar
+                # (statusPill in app.js)
+                if lufs_after is not None:
+                    lufs_ok = -16 <= lufs_after <= -12
+                    job_log(job_id, f"normalize_lufs: {'pass' if lufs_ok else 'check'} ({lufs_after:.1f} LUFS)")
             elif tool == "multiband_compress":
                 audio, info = chain.multiband_compress(audio, sr)
+            elif tool == "temporal_normalize":
+                # EXPERIMENTAL - see app/timewarp.py's module docstring for
+                # the full rationale and what has/hasn't been verified.
+                # Must run BEFORE the unconditional watermark stage further
+                # down this function. The measured five-seed comparison only
+                # established that watermarking first and warping afterward
+                # degrades mark recovery; it did not benchmark every possible
+                # late re-verification combination. Linear/CNN/LUFS safety
+                # passes can still run between this warp and the watermark,
+                # but the watermark remains the final signal mutation, so
+                # nothing ever warps an already-embedded mark.
+                #
+                # Applies the SAME warp curve identically to every channel
+                # (never independent per-channel curves) - verified directly
+                # that independent curves would desync L/R against each
+                # other, a much larger and more obviously audible problem
+                # than the warp itself.
+                from .timewarp import generate_warp_curve
+                from scipy.interpolate import interp1d
+                n = len(audio)
+                max_drift_ms = options.get("temporal_max_drift_ms", 8.0)
+                # The shipped UI intentionally does not send temporal_seed:
+                # production warps use OS entropy and are non-reproducible so
+                # a fixed curve does not itself become a repeated signature.
+                # An explicit seed remains accepted for internal experiments.
+                temporal_seed = options.get("temporal_seed")
+                offsets = generate_warp_curve(n, sr, seed=temporal_seed,
+                                               max_drift_ms=max_drift_ms)
+                original_t = np.arange(n) / sr
+                warped_t = np.clip(original_t + offsets, original_t[0], original_t[-1])
+                warped = np.zeros_like(audio)
+                for ch in range(audio.shape[1]):
+                    interpolator = interp1d(original_t, audio[:, ch], kind="cubic",
+                                             bounds_error=False, fill_value=0.0)
+                    warped[:, ch] = interpolator(warped_t)
+                audio = warped.astype(np.float32)
+                info = {
+                    "applied": True,
+                    "max_drift_ms": max_drift_ms,
+                    "seed_mode": "random" if temporal_seed is None else "explicit",
+                    "note": "not verified against any real fingerprinting/pattern-matching service",
+                }
+                # "pass" here means the operation completed and produced
+                # valid audio - NOT a claim of verified effectiveness
+                # against any real detector/fingerprinting service (there
+                # is no such verification available - see the module
+                # docstring). Matches what's actually knowable at this
+                # point in the pipeline, same honesty standard as
+                # everything else in this app.
+                job_log(job_id, f"temporal_normalize: applied (max drift: {max_drift_ms:.0f}ms)")
             elif tool == "true_peak_limit":
                 audio, info = chain.true_peak_limit(audio, sr, ceiling_db=options.get("ceiling_db", -1.0))
             else:
@@ -516,6 +623,11 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
             info["elapsed_sec"] = round(time.time() - t0, 2)
             steps.append(info)
             job_log(job_id, f"  done ({info['elapsed_sec']}s)")
+
+        # The blocks below sit outside TOOL_ORDER, so the loop's top-of-stage
+        # checkpoint cannot cover them. Check here and again before every
+        # potentially expensive re-verification call.
+        check_cancelled(job_id)
 
         # Final re-verification pass: cnn_fix's own correction can disturb
         # linear_fix's precise spectral tuning even when linear_fix ran first
@@ -533,14 +645,18 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 recheck_score = scorer.linear.predict(str(recheck_path))["probability"]
                 job_log(job_id, f"  post-chain linear score: {recheck_score * 100:.3f}%")
                 if recheck_score >= 0.01:
+                    check_cancelled(job_id)
                     job_log(job_id, "  above target - re-running linear_fix once more on the final signal")
                     from .linear_fix import fix_linear
                     t0 = time.time()
                     audio, reverify_info = fix_linear(
                         audio, sr, target=options.get("linear_target", 0.01),
-                        progress_cb=lambda m: job_log(job_id, m),
-                        step_progress_cb=lambda s, mx, score, att, mxatt: job_set_sub_progress(
-                            job_id, s, mx, extra={"score_pct": round(score * 100, 4), "attempt": att, "max_attempts": mxatt}),
+                        progress_cb=_cancel_aware_log,
+                        step_progress_cb=_linear_step_cb,
+                    )
+                    late_mutation_after_temporal = (
+                        late_mutation_after_temporal
+                        or ("temporal_normalize" in tools and reverify_info.get("applied"))
                     )
                     reverify_info["tool"] = "linear_fix_reverify"
                     reverify_info["label"] = "AI-detector fix: linear model (re-verification pass)"
@@ -581,6 +697,7 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
             # before (a 48%-internal result shipping as 99.9% when linear DID
             # need a redo) - that fix was scoped too narrowly and only closed
             # half the gap. Always check the truly final audio, full stop.
+            check_cancelled(job_id)
             cnn_recheck_path = OUTPUT_DIR / f"_cnn_recheck_{uuid.uuid4().hex[:8]}.wav"
             try:
                 save_stereo(cnn_recheck_path, audio, sr)
@@ -592,11 +709,13 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 # let a 48% result silently ship as 99.9%; catching any loss
                 # of safety margin, not just a full regression, is the point.
                 if cnn_recheck_score >= 0.08:
+                    check_cancelled(job_id)
                     job_log(job_id, "  cnn lost its safety margin (or regressed) after later chain stages - re-running cnn_fix once more on the final signal")
                     from .cnn_fix import fix_cnn
                     t0 = time.time()
 
                     def _cnn_reverify_step_cb(s, mx, surrogate_score, real_check_extra):
+                        check_cancelled(job_id)
                         extra = {"score_pct": round(float(surrogate_score) * 100, 4)}
                         if real_check_extra is not None:
                             extra["real_max_score_pct"] = round(float(real_check_extra["real_max_score"]) * 100, 4)
@@ -612,9 +731,13 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                         max_steps=options.get("cnn_max_steps", 300),
                         min_steps=options.get("cnn_min_steps", 100),
                         hop_sec=options.get("cnn_hop_sec", 0.5),
-                        progress_cb=lambda m: job_log(job_id, m),
+                        progress_cb=_cancel_aware_log,
                         step_progress_cb=_cnn_reverify_step_cb,
                         mode=_cnn_reverify_mode,
+                    )
+                    late_mutation_after_temporal = (
+                        late_mutation_after_temporal
+                        or ("temporal_normalize" in tools and cnn_reverify_info.get("applied"))
                     )
                     cnn_reverify_info["tool"] = "cnn_fix_reverify"
                     cnn_reverify_info["label"] = "AI-detector fix: CNN model (re-verification pass)"
@@ -641,6 +764,7 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                     # cheap linear check (no re-optimization) and log honestly
                     # if it regressed rather than silently shipping a result
                     # nothing verified.
+                    check_cancelled(job_id)
                     final_linear_check_path = OUTPUT_DIR / f"_final_lincheck_{uuid.uuid4().hex[:8]}.wav"
                     try:
                         save_stereo(final_linear_check_path, audio, sr)
@@ -667,6 +791,7 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         # pass right before delivery (not a full re-run of normalize_lufs,
         # which would re-measure and target the same way - just a direct
         # final trim to the actual requested target).
+        check_cancelled(job_id)
         if "normalize_lufs" in tools:
             target_lufs = options.get("lufs_target", -14.0)
             final_lufs = chain.measure_lufs(audio, sr)
@@ -677,6 +802,9 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 gain_db = target_lufs - final_lufs
                 gain_linear = 10 ** (gain_db / 20)
                 audio = audio * gain_linear
+                late_mutation_after_temporal = (
+                    late_mutation_after_temporal or "temporal_normalize" in tools
+                )
                 peak = np.abs(audio).max()
                 if peak > 0.999:
                     audio = audio * (0.999 / peak)
@@ -727,13 +855,64 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                                      f"({options.get('ceiling_db', -1.0):.1f}dBTP) doesn't leave enough "
                                      f"headroom to reach both targets on this track")
 
+        check_cancelled(job_id)
+        if late_mutation_after_temporal:
+            job_log(
+                job_id,
+                "temporal_normalize: note (a corrective post-chain stage ran after the warp; "
+                "the watermark is still applied last, but this exact combination is unbenchmarked)",
+            )
+
         out_id = uuid.uuid4().hex[:12]
         # always keep a WAV copy for detector re-scoring regardless of the
         # chosen delivery format, since the scorer needs a file ffmpeg/
         # librosa can decode and re-scoring must reflect the exact audio
-        # that was actually processed
+        # that was actually processed. Saved BEFORE the watermark stage
+        # below, on purpose: the watermark's notches sit at 10-16kHz,
+        # outside the linear detector's 1-8kHz analysis band and outside
+        # the CNN detector's own CQT range, so it shouldn't affect AI-
+        # detector scoring either way - but re-scoring against the
+        # pre-watermark signal removes any doubt rather than relying on
+        # that reasoning alone.
         scoring_wav_path = OUTPUT_DIR / f"{out_id}_score.wav"
         save_stereo(scoring_wav_path, audio, sr)
+
+        # product watermark: applied unconditionally to every delivered
+        # file, not a user-selectable tool in TOOL_ORDER - this is
+        # intentional (see app/watermark.py's module docstring for the
+        # full design rationale). Runs after all real processing/AI-
+        # detector work and after the scoring copy above, right before
+        # final encode, so it's the last thing to touch the signal and
+        # nothing downstream can disturb it.
+        job_log(job_id, "running: wm")
+        try:
+            from .watermark import embed_watermark, detect_watermark
+            mono_for_mark = audio.mean(axis=1)
+            marked_mono = embed_watermark(mono_for_mark, sr)
+            mark_delta = marked_mono - mono_for_mark
+            audio = audio.copy()
+            audio[:, 0] += mark_delta
+            audio[:, 1] += mark_delta
+            audio = np.clip(audio, -1.0, 1.0)
+
+            # verify it actually round-trips on the just-marked signal,
+            # the same "verify, don't just trust the write path" pattern
+            # already used for the linear/CNN detector fixes elsewhere in
+            # this pipeline - proves the mark is really recoverable on
+            # THIS file, not just in isolated module testing.
+            wm_found, wm_version, wm_detail = detect_watermark(audio.mean(axis=1), sr)
+            if wm_found:
+                job_log(job_id, f"wm: pass (version {wm_version}, "
+                                 f"{wm_detail.get('match_fraction', 0) * 100:.0f}% confidence, "
+                                 f"method={wm_detail.get('method')})")
+            else:
+                job_log(job_id, "wm: fail (embedded but could not be re-verified on this file - "
+                                 "shipping anyway, footprint measurement only, not a delivery gate)")
+        except Exception as e:
+            # never let the watermark stage block a user's actual delivery -
+            # this is a footprint-measurement feature, not a core function;
+            # if it fails for any reason, log it and ship the file anyway.
+            job_log(job_id, f"wm: error, shipping without it ({e})")
 
         resolved_format, format_fallback_warning = resolve_output_format(output_format, path)
         if format_fallback_warning:
@@ -790,6 +969,13 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         dc_before = aligned_original.mean(axis=0)
         dc_after = audio.mean(axis=0)
         transients_after = chain.detect_transients(audio, sr)
+        if "fix_transients" in tools:
+            transient_status = "pass" if len(transients_after) == 0 else "check"
+            job_log(
+                job_id,
+                f"fix_transients: final {transient_status} "
+                f"({len(transients_after)} anomal{'y' if len(transients_after) == 1 else 'ies'} after full chain)",
+            )
 
         # surface WHERE each fixed transient/pop was found, for the results
         # panel's waveform chart to mark - fix_transients' own step already
@@ -849,6 +1035,11 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
             JOBS[job_id]["result"] = result
         job_log(job_id, "complete")
 
+    except JobCancelled:
+        with JOBS_LOCK:
+            JOBS[job_id]["status"] = "cancelled"
+        job_log(job_id, "cancelled by user")
+
     except Exception as e:
         traceback.print_exc()
         with JOBS_LOCK:
@@ -879,6 +1070,7 @@ def process(file_id):
         JOBS[job_id] = {
             "status": "running", "log": [], "result": None, "error": None, "progress_msg": "",
             "current_step_idx": None, "total_steps": None, "current_step_name": None, "sub_progress": None,
+            "cancel_requested": False,
         }
 
     thread = threading.Thread(target=run_pipeline, args=(job_id, file_id, tools, options, output_name, output_format, mp3_mode), daemon=True)
@@ -904,6 +1096,21 @@ def job_status(job_id):
             "result": job["result"],
             "error": job["error"],
         })
+
+
+@app.route("/api/job/<job_id>/cancel", methods=["POST"])
+def cancel_job(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is None:
+            return jsonify({"error": "unknown job_id"}), 404
+        if job["status"] != "running":
+            return jsonify({"error": f"job is already {job['status']}, cannot cancel"}), 400
+        job["cancel_requested"] = True
+    # Cancellation is cooperative, not instant. Pipeline boundaries and the
+    # optimizers' progress callbacks observe this flag; a real-model scoring
+    # call already in progress must return before its next callback can abort.
+    return jsonify({"status": "cancel_requested"})
 
 
 def _safe_download_name(name, fallback, ext=".wav"):

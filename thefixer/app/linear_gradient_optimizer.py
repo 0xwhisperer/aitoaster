@@ -125,6 +125,11 @@ def optimize(audio_orig, lambda_perceptual=2000.0, lambda_band=5000.0, lambda_to
     3-4 landed on bit-identical scores despite a tightened target. Nudging
     the init and the loss weights slightly per retry_index makes each retry
     an actually different search instead of a near-repeat of the last one."""
+    if max_steps < 1:
+        raise ValueError("max_steps must be at least 1")
+    if real_check_interval < 1:
+        raise ValueError("real_check_interval must be at least 1")
+
     if retry_index > 0:
         gen = torch.Generator().manual_seed(1000 + retry_index)
         delta = (torch.randn(audio_orig.shape, generator=gen) * 1e-5).requires_grad_(True)

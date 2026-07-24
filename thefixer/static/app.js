@@ -35,7 +35,14 @@
     cnn_passes: {
       title: "What is the \"CNN model\"?",
       body: `<p>The second of two AI-detectors this tool checks against - a neural network (CNN = convolutional neural network) that looks at a more detailed time-frequency representation of the audio (a "CQT cepstrum," a way of laying out pitch and texture over time) and learned, from training examples, what AI-generated audio tends to look like in that representation. It's a deeper, more pattern-based check than the linear model's simpler frequency-fingerprint approach - and, in practice, meaningfully harder to correct without introducing audible change.</p>
-             <p><strong>Why it shows so many step counts:</strong> it lays a new 10-second analysis window down every 2.5 seconds across the ENTIRE track, so the count scales with the song's length - a 3-minute track gets around 65-70 overlapping windows, a 5-minute track around 105-110. All of them share one correction, optimized together. Every 10-15 steps it re-checks itself against the real detector to see which windows still fail, and pushes harder on just those - that's the periodic "X/Y windows still above target" updates you see during a single pass.</p>`,
+             <p><strong>Why it shows so many step counts:</strong> the recommended shift-robust mode repeatedly trains and checks the detector's five real 10-second evaluation positions across small timing shifts. Every 10 steps it re-checks against the real detector and reports how many positions still miss the safety target. Thorough mode instead tiles dense overlapping windows across the whole track and is substantially slower.</p>`,
+    },
+    temporal_normalize: {
+      title: "What is \"temporal pattern denormalization\"?",
+      body: `<p>The linear and CNN models above both look at the audio's spectral content - what frequencies are present. This is a different idea: some AI-generated audio can carry unnaturally precise, machine-regular timing underneath the music itself - a kind of rigid internal grid that's a byproduct of how the audio was generated, distinct from anything a spectral classifier looks at.</p>
+             <p>This step smooths that timing very slightly and unevenly across the track - never more than a few milliseconds of drift at any single moment, varying slowly and smoothly rather than as one flat speed change (a flat change would be trivial to detect and undo; this instead nudges the internal timing map itself).</p>
+             <p><strong>What's actually been verified:</strong> the 8ms default was judged inaudible in a human listening check on one tested clip, and a simplified local landmark proxy measured timing movement. That is evidence the local mechanism does something, not a broad audibility study.</p>
+             <p><strong>What has NOT been verified:</strong> values above 8ms have not had the same listening check, and this tool has no access to any real commercial audio-fingerprinting or pattern-matching service. There is no evidence it affects any specific real-world system. Each production run deliberately uses a fresh random warp rather than a user-visible fixed seed. It's offered as an extra layer, off by default, not a proven fix.</p>`,
     },
     snr: {
       title: "Signal-to-noise ratio (SNR)",
@@ -166,7 +173,8 @@
     { id: "spectral_revive", group: "chainGroupCleanup", name: "High-frequency fill-in (17kHz+)", desc: "Detects an artificial cutoff (common in lossy encoding or low-quality AI generation) and fills content above it using only this track's own rolloff slope, harmonics, and dynamics - no external reference.", info: "tool_spectral_revive" },
     { id: "high_pass", group: "chainGroupCleanup", name: "High-pass filter", desc: "Removes inaudible sub-30Hz rumble that eats into headroom.", info: "tool_high_pass" },
     { id: "linear_fix", group: "chainGroupAI", name: "Linear model fix", desc: "Gradient-optimized correction targeting the fakeprint logistic-regression detector.", info: "linear_passes" },
-    { id: "cnn_fix", group: "chainGroupAI", name: "CNN model fix", desc: "Whole-track joint optimization targeting the CQT-cepstrum CNN detector. Slower.", info: "cnn_passes" },
+    { id: "cnn_fix", group: "chainGroupAI", name: "CNN model fix", desc: "Shift-robust optimization targeting the CQT-cepstrum CNN detector. Slower.", info: "cnn_passes" },
+    { id: "temporal_normalize", group: "chainGroupAI", name: "Temporal pattern denormalization", desc: "Applies a tiny, smooth, non-uniform timing shift that's inaudible in testing so far. Its effect against real commercial audio-fingerprinting services is unverified - off by default.", info: "temporal_normalize" },
     { id: "fix_phase", group: "chainGroupMaster", name: "Stereo phase correction", desc: "Corrects out-of-phase content that would cancel out in mono playback.", info: "tool_fix_phase" },
     { id: "normalize_lufs", group: "chainGroupMaster", name: "LUFS loudness normalization", desc: "Targets -14 LUFS, the standard streaming-platform loudness reference.", info: "lufs" },
     { id: "multiband_compress", group: "chainGroupMaster", name: "Multiband compression", desc: "Gentle 3-band dynamics smoothing for tonal balance.", info: "tool_multiband_compress" },
@@ -187,6 +195,7 @@
     outputFormat: "same",
     mp3Mode: "vbr0",
     cnnMode: "eot",
+    temporalMaxDriftMs: 8,
   };
 
   // ---------- output format switch ----------
@@ -205,12 +214,11 @@
     });
   });
 
-  document.querySelectorAll("#cnnModeSwitch button").forEach(btn => {
-    btn.addEventListener("click", () => {
-      state.cnnMode = btn.dataset.cnnmode;
-      document.querySelectorAll("#cnnModeSwitch button").forEach(b => b.classList.toggle("active", b === btn));
-    });
-  });
+  // cnnModeSwitch/temporalDriftSlider are rendered dynamically inside
+  // renderToolChain() now (attached directly under their own tool's card,
+  // not as page-load-time fixed elements) - listeners for them are wired
+  // via delegation in renderToolChain() itself, right alongside the
+  // tool-row click handler, since both need re-attaching every render.
 
   // ---------- upload ----------
   const uploadZone = $("uploadZone");
@@ -624,12 +632,36 @@
       $(groupId).innerHTML = tools.map(t => {
         const checked = state.selected.has(t.id);
         const recommended = rec.has(t.id);
+        let settingsRow = "";
+        if (t.id === "cnn_fix" && checked) {
+          settingsRow = `
+          <div class="tool-settings-row">
+            <div class="chain-group-label">CNN fix mode<button class="info-btn" data-info="cnn_mode" title="What's this?" type="button">i</button></div>
+            <div class="format-switch cols-3" id="cnnModeSwitch">
+              <button data-cnnmode="simple" class="${state.cnnMode === "simple" ? "active" : ""}">Simple</button>
+              <button data-cnnmode="eot" class="${state.cnnMode === "eot" ? "active" : ""}">Shift-robust</button>
+              <button data-cnnmode="thorough" class="${state.cnnMode === "thorough" ? "active" : ""}">Thorough</button>
+            </div>
+            <div class="cnn-mode-hint" id="cnnModeHint">Recommended - trains the fix to hold up even if the check lands slightly off-position.</div>
+          </div>`;
+        } else if (t.id === "temporal_normalize" && checked) {
+          settingsRow = `
+          <div class="tool-settings-row">
+            <div class="chain-group-label">Max timing drift</div>
+            <div class="slider-row">
+              <input type="range" id="temporalDriftSlider" min="2" max="15" step="1" value="${state.temporalMaxDriftMs}">
+              <span class="slider-value mono" id="temporalDriftValue">${state.temporalMaxDriftMs}ms</span>
+            </div>
+            <div class="cnn-mode-hint">Higher values are untested for audibility - lower this if you notice anything.</div>
+          </div>`;
+        }
         return `
         <div class="tool-row ${checked ? "checked" : ""}" data-tool="${t.id}">
           <div class="box"></div>
           <div class="info">
             <div class="name">${t.name}${t.info ? infoBtn(t.info) : ""}${recommended ? `<span class="rec-badge">Recommended</span>` : ""}</div>
             <div class="desc">${t.desc}</div>
+            ${settingsRow}
           </div>
         </div>`;
       }).join("");
@@ -637,19 +669,43 @@
 
     document.querySelectorAll(".tool-row").forEach(row => {
       row.addEventListener("click", (e) => {
-        // clicking the info (i) button should only open its popup, not
-        // also toggle the tool's checkbox - this listener is attached
-        // directly on the row (fires before the global document-level
-        // info-btn handler even sees the bubbled event), so stopPropagation
-        // inside that later handler is too late to prevent this one from
-        // already running. Bail out here directly instead.
-        if (e.target.closest(".info-btn")) return;
+        // clicking the info (i) button, or interacting with a tool's own
+        // inline settings row (CNN mode switch, temporal drift slider),
+        // should never also toggle the tool's checkbox - this listener is
+        // attached directly on the row (fires before the global document-
+        // level info-btn handler even sees the bubbled event), so
+        // stopPropagation inside that later handler is too late to prevent
+        // this one from already running. Bail out here directly instead.
+        if (e.target.closest(".info-btn") || e.target.closest(".tool-settings-row")) return;
         const id = row.dataset.tool;
         if (state.selected.has(id)) state.selected.delete(id);
         else state.selected.add(id);
         renderToolChain();
       });
     });
+
+    // cnnModeSwitch/temporalDriftSlider are re-created every render (they
+    // only exist inside their own tool's card while that tool is checked),
+    // so their listeners must be re-attached every render too, not once at
+    // page load.
+    const cnnModeSwitchEl = document.getElementById("cnnModeSwitch");
+    if (cnnModeSwitchEl) {
+      cnnModeSwitchEl.querySelectorAll("button").forEach(btn => {
+        btn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          state.cnnMode = btn.dataset.cnnmode;
+          cnnModeSwitchEl.querySelectorAll("button").forEach(b => b.classList.toggle("active", b === btn));
+        });
+      });
+    }
+    const temporalSliderEl = document.getElementById("temporalDriftSlider");
+    if (temporalSliderEl) {
+      temporalSliderEl.addEventListener("input", (e) => {
+        state.temporalMaxDriftMs = Number(e.target.value);
+        document.getElementById("temporalDriftValue").textContent = `${state.temporalMaxDriftMs}ms`;
+      });
+      temporalSliderEl.addEventListener("click", (e) => e.stopPropagation());
+    }
 
     const countIds = { chainGroupCleanup: "countCleanup", chainGroupAI: "countAI", chainGroupMaster: "countMaster" };
     for (const [groupId, tools] of Object.entries(groups)) {
@@ -659,7 +715,6 @@
 
     $("runCount").textContent = `${state.selected.size} selected`;
     $("checkAllBtn").textContent = TOOLS.every(t => state.selected.has(t.id)) ? "Uncheck all" : "Check all";
-    $("cnnModeRow").classList.toggle("hidden", !state.selected.has("cnn_fix"));
   }
 
   $("selectRecBtn").addEventListener("click", () => {
@@ -723,6 +778,7 @@
     $("logBox").innerHTML = "";
     $("progressFill").style.width = "6%";
     $("runBtn").disabled = true;
+    $("cancelJobBtn").classList.remove("hidden");
     $("elapsedTime").textContent = "0:00 elapsed";
     startElapsedTimer();
 
@@ -731,16 +787,36 @@
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        tools: Array.from(state.selected), options: { cnn_mode: state.cnnMode },
+        tools: Array.from(state.selected), options: { cnn_mode: state.cnnMode, temporal_max_drift_ms: state.temporalMaxDriftMs },
         output_name: outputName || undefined,
         output_format: state.outputFormat,
         mp3_mode: state.mp3Mode,
       }),
     });
     const data = await res.json();
-    if (data.error) { appendLog(data.error, true); $("runBtn").disabled = false; return; }
+    if (data.error) {
+      appendLog(data.error, true);
+      $("runBtn").disabled = false;
+      $("cancelJobBtn").classList.add("hidden");
+      return;
+    }
     state.jobId = data.job_id;
     pollJob();
+  });
+
+  $("cancelJobBtn").addEventListener("click", async () => {
+    if (!state.jobId) return;
+    $("cancelJobBtn").disabled = true;
+    try {
+      const res = await fetch(`/api/job/${state.jobId}/cancel`, { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `request failed (${res.status})`);
+      appendLog("Cancelling… optimizers now check between iterations, but a real-model scoring pass already in progress may still take a little while.");
+    } catch (err) {
+      appendLog(`Could not cancel: ${err}`, true);
+    } finally {
+      $("cancelJobBtn").disabled = false;
+    }
   });
 
   function updateProgress(data) {
@@ -809,8 +885,14 @@
   // debugging.
   const LOG_TRANSLATIONS = [
     [/^loading .+$/, () => "Loading your file…"],
+    [/^running: wm$/, () => "Applying product watermark"],
     [/^running: (.+)$/, (m) => `Starting: ${m[1]}`],
     [/^\s*done \(([\d.]+)s\)$/, (m) => `Done (${m[1]}s)`],
+    [/^wm: pass \(version (\d+), (\d+)% confidence, method=(\w+)\)$/, (m) =>
+      ({ text: `Watermark (wm): embedded and verified — ${m[2]}% confidence`, badge: "pass" })],
+    [/^wm: fail.*$/, () => ({ text: "Watermark (wm): embedded but could not be re-verified", badge: "fail" })],
+    [/^temporal_normalize: applied \(max drift: (\d+)ms\)$/, (m) => ({ text: `Temporal pattern denormalization: applied (max drift: ${m[1]}ms)`, badge: "pass" })],
+    [/^wm: error.*$/, () => ({ text: "Watermark (wm): step failed, file shipped without it", badge: "fail" })],
     [/^linear: attempt (\d+) of (\d+) - optimizing.*$/, (m) => `AI-detector fix (linear model): trying attempt ${m[1]} of ${m[2]}…`],
     [/^linear: attempt \d+ result checked against the REAL detector.*: ([\d.]+)%$/, (m) => {
       const pct = Number(m[1]);
@@ -836,6 +918,16 @@
       return { text: `CNN model result: ${m[1]}% AI-likely`, badge: pct < 8 ? "pass" : "retry" };
     }],
     [/^\s*cnn lost its safety margin.*$/, () => ({ text: "The CNN fix slipped after a later step - running it again", badge: "retry" })],
+    [/^dc_offset: (pass|check) \(max L\/R after: ([\d.]+)\)$/, (m) => ({ text: `DC offset correction: max L/R ${m[2]}`, badge: m[1] === "pass" ? "pass" : "retry" })],
+    [/^fix_transients: processed \((\d+) anomal(?:y|ies) found\)$/, (m) => `Transient/pop fix: processed ${m[1]} anomal${m[1] === "1" ? "y" : "ies"}; final check runs after the full chain`],
+    [/^fix_transients: final (pass|check) \((\d+) anomal(?:y|ies) after full chain\)$/, (m) => ({
+      text: `Transient/pop fix: ${m[2]} anomal${m[2] === "1" ? "y" : "ies"} remain after the full chain`,
+      badge: m[1] === "pass" ? "pass" : "retry",
+    })],
+    [/^temporal_normalize: note .*$/, () => "Temporal denormalization stayed in place; a later safety correction ran before the final watermark (this exact combination is unbenchmarked)"],
+    [/^fix_phase: (pass|check) \(correlation: ([\-\d.]+)\)$/, (m) => ({ text: `Stereo phase correction: correlation ${m[2]}`, badge: m[1] === "pass" ? "pass" : "retry" })],
+    [/^fix_phase: pass \(no change needed; correlation: ([\-\d.]+)\)$/, (m) => ({ text: `Stereo phase correction: already fine at ${m[1]}, no change needed`, badge: "pass" })],
+    [/^normalize_lufs: (pass|check) \(([\-\d.]+) LUFS\)$/, (m) => ({ text: `Loudness normalization: ${m[2]} LUFS`, badge: m[1] === "pass" ? "pass" : "retry" })],
     [/^re-running true-peak limiter.*$/, () => "Re-checking the loudness ceiling after that last change"],
     [/^post-chain LUFS check: ([\-\d.]+) vs target ([\-\d.]+).*$/, (m) => `Loudness drifted to ${m[1]} (target ${m[2]}) - correcting`],
     [/^\s*corrected to ([\-\d.]+) LUFS.*$/, (m) => `Loudness corrected to ${m[1]}`],
@@ -845,6 +937,7 @@
     [/^\s*WARNING: linear regressed.*$/, () => ({ text: "Heads up: the linear score slipped a bit after a later step", badge: "fail" })],
     [/^\s*WARNING: delivered file is ([\-\d.]+) LUFS.*$/, (m) => `Heads up: couldn't fully reach the loudness target (landed at ${m[1]} LUFS) without exceeding the peak safety ceiling`],
     [/^complete$/, () => "All done"],
+    [/^cancelled by user$/, () => ({ text: "Job cancelled", badge: "fail" })],
     [/^ERROR: (.+)$/, (m) => `Something went wrong: ${m[1]}`],
   ];
 
@@ -908,12 +1001,19 @@
       } else if (data.status === "done") {
         stopElapsedTimer();
         $("runBtn").disabled = false;
+        $("cancelJobBtn").classList.add("hidden");
         state.result = data.result;
         renderResults(data.result);
       } else if (data.status === "error") {
         stopElapsedTimer();
         appendLog(`Failed: ${data.error}`, true);
         $("runBtn").disabled = false;
+        $("cancelJobBtn").classList.add("hidden");
+      } else if (data.status === "cancelled") {
+        stopElapsedTimer();
+        appendLog("Job cancelled.", true);
+        $("runBtn").disabled = false;
+        $("cancelJobBtn").classList.add("hidden");
       }
     } catch (err) {
       appendLog(String(err), true);

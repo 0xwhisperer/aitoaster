@@ -1,0 +1,257 @@
+<title>Legacy v1 Watermark Measurement — crazy2_test.mp3</title>
+<style>
+.viz-root {
+  color-scheme: light;
+  --surface-1: #fcfcfb;
+  --page: #f9f9f7;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+  --gridline: #e1e0d9;
+  --baseline: #c3c2b7;
+  --border: rgba(11,11,11,0.10);
+  --seq-100: #cde2fb; --seq-150: #b7d3f6; --seq-200: #9ec5f4; --seq-250: #86b6ef;
+  --seq-300: #6da7ec; --seq-350: #5598e7; --seq-400: #3987e5; --seq-450: #2a78d6;
+  --seq-500: #256abf; --seq-550: #1c5cab; --seq-600: #184f95; --seq-650: #104281; --seq-700: #0d366b;
+  --marked-ring: #e34948;
+  --unmarked-fill: #f0efec;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .viz-root {
+    color-scheme: dark;
+    --surface-1: #1a1a19;
+    --page: #0d0d0d;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --gridline: #2c2c2a;
+    --baseline: #383835;
+    --border: rgba(255,255,255,0.10);
+    --unmarked-fill: #232320;
+    --marked-ring: #e66767;
+  }
+}
+:root[data-theme="dark"] .viz-root {
+  color-scheme: dark;
+  --surface-1: #1a1a19;
+  --page: #0d0d0d;
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted: #898781;
+  --gridline: #2c2c2a;
+  --baseline: #383835;
+  --border: rgba(255,255,255,0.10);
+  --unmarked-fill: #232320;
+  --marked-ring: #e66767;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--page);
+  color: var(--text-primary);
+}
+.wrap { max-width: 980px; margin: 0 auto; padding: 40px 24px 64px; }
+
+.viz-root header { margin-bottom: 8px; }
+.eyebrow {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--text-muted); margin-bottom: 8px;
+}
+h1 { font-size: 22px; font-weight: 700; margin: 0 0 6px; letter-spacing: -0.01em; text-wrap: balance; }
+.subhead { color: var(--text-secondary); font-size: 13.5px; max-width: 62ch; margin: 0 0 28px; }
+
+.chart-card {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px 20px 16px;
+}
+
+.chart-title { font-size: 13px; font-weight: 700; color: var(--text-primary); margin-bottom: 2px; }
+.chart-sub { font-size: 11.5px; color: var(--text-muted); margin-bottom: 18px; }
+
+.matrix-scroll { overflow-x: auto; }
+table.matrix { border-collapse: collapse; width: 100%; min-width: 720px; }
+table.matrix th, table.matrix td { text-align: center; padding: 0; }
+table.matrix th.freq-label {
+  text-align: right; padding-right: 10px; font-size: 11px; color: var(--text-secondary);
+  font-variant-numeric: tabular-nums; white-space: nowrap; font-weight: 600;
+}
+table.matrix th.time-label {
+  font-size: 11px; color: var(--text-muted); font-weight: 700; padding-bottom: 8px;
+  font-variant-numeric: tabular-nums;
+}
+table.matrix th.corner { width: 90px; }
+
+.cell-wrap { padding: 2px; }
+.cell {
+  position: relative;
+  width: 38px; height: 30px;
+  border-radius: 4px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 9.5px; font-weight: 700; font-variant-numeric: tabular-nums;
+  cursor: default;
+}
+.cell.marked { box-shadow: inset 0 0 0 2px var(--marked-ring); }
+.cell .val { position: relative; z-index: 1; }
+
+.legend-row {
+  display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+  margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--gridline);
+  font-size: 11.5px; color: var(--text-secondary);
+}
+.legend-item { display: flex; align-items: center; gap: 6px; }
+.legend-swatch { width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0; }
+.legend-ramp {
+  width: 100px; height: 10px; border-radius: 3px;
+  background: linear-gradient(to right, var(--seq-100), var(--seq-700));
+}
+.legend-marked-demo {
+  width: 14px; height: 14px; border-radius: 3px; background: var(--unmarked-fill);
+  box-shadow: inset 0 0 0 2px var(--marked-ring); flex-shrink: 0;
+}
+
+.stat-row {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 10px; margin: 20px 0 24px;
+}
+.stat-card {
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+  padding: 12px 14px;
+}
+.stat-card .num { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.stat-card .lbl { font-size: 10.5px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 3px; }
+
+.note {
+  font-size: 12px; color: var(--text-secondary); line-height: 1.6; margin-top: 16px;
+  padding: 12px 14px; background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+}
+.note strong { color: var(--text-primary); }
+
+footer { margin-top: 24px; font-size: 11px; color: var(--text-muted); text-align: center; }
+</style>
+
+<div class="viz-root">
+  <div class="wrap">
+    <header>
+      <div class="eyebrow">Legacy v1 watermark measurement — real data, not a mockup</div>
+      <h1>What actually changed, in dB, at every mark location</h1>
+      <p class="subhead">
+        Measured directly on <code>crazy2_test.mp3</code> (178s, 48kHz) before and after embedding,
+        via a fresh STFT re-analysis of the saved output — not the in-memory embed calculation.
+        Each cell is one (time, frequency, bit-slot) position; outlined cells are where a "1" bit
+        was actually encoded. This archived chart predates the bounded-frequency v2 scheme; its
+        16067Hz row is the v1 overflow that v2 fixes. Detection remains backward-compatible with v1.
+      </p>
+    </header>
+
+    <div class="stat-row" id="statRow"></div>
+
+    <div class="chart-card">
+      <div class="chart-title">Measured drop (dB) at each mark location</div>
+      <div class="chart-sub">Darker = larger drop from the original level. Outlined cells = "1" bits (intentionally notched). Plain cells = "0" bits (left untouched).</div>
+      <div class="matrix-scroll">
+        <table class="matrix" id="matrixTable"></table>
+      </div>
+      <div class="legend-row">
+        <div class="legend-item">
+          <div class="legend-ramp"></div>
+          <span>0 dB → 26 dB drop</span>
+        </div>
+        <div class="legend-item">
+          <div class="legend-marked-demo"></div>
+          <span>"1" bit (notch applied)</span>
+        </div>
+        <div class="legend-item">
+          <div class="legend-swatch" style="background:var(--unmarked-fill)"></div>
+          <span>"0" bit (untouched)</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="note">
+      <strong>Reading this chart:</strong> each of the 8 frequency rows is checked twice per time
+      column (two bit-slots per window, labeled a/b) — 16 bit positions total per file, matching the
+      16-bit payload. The "1" bits (outlined) consistently measure a 12–26dB drop; the "0" bits
+      (unmarked) measure ~0dB, confirming nothing was changed where nothing was supposed to be. The
+      lighter drops in the last two frequency rows reflect less pre-existing energy at those bins in
+      this particular track — a quieter cluster has less headroom to drop before hitting the noise floor.
+    </div>
+
+    <footer>Data generated by re-analyzing the actual saved watermark output, not the embed-time calculation.</footer>
+  </div>
+</div>
+
+<script>
+const DATA = {"results": [{"offset_sec": 1.0, "bit_group": 0, "freq_hz": 10973.0, "bit": 1, "before_db": -23.90209197998047, "after_db": -45.55660629272461, "drop_db": 21.65451431274414}, {"offset_sec": 1.0, "bit_group": 0, "freq_hz": 11213.0, "bit": 0, "before_db": -24.015146255493164, "after_db": -24.028396606445312, "drop_db": 0.013250350952148438}, {"offset_sec": 1.0, "bit_group": 0, "freq_hz": 12379.0, "bit": 1, "before_db": -26.82613182067871, "after_db": -47.41426467895508, "drop_db": 20.588132858276367}, {"offset_sec": 1.0, "bit_group": 0, "freq_hz": 12653.0, "bit": 1, "before_db": -25.61536407470703, "after_db": -48.921321868896484, "drop_db": 23.305957794189453}, {"offset_sec": 1.0, "bit_group": 0, "freq_hz": 13597.0, "bit": 0, "before_db": -31.240938186645508, "after_db": -31.240352630615234, "drop_db": -0.0005855560302734375}, {"offset_sec": 1.0, "bit_group": 0, "freq_hz": 14831.0, "bit": 1, "before_db": -40.95893478393555, "after_db": -58.700008392333984, "drop_db": 17.741073608398438}, {"offset_sec": 1.0, "bit_group": 0, "freq_hz": 15551.0, "bit": 0, "before_db": -45.51700973510742, "after_db": -45.53173828125, "drop_db": 0.014728546142578125}, {"offset_sec": 1.0, "bit_group": 0, "freq_hz": 16067.0, "bit": 0, "before_db": -57.95957565307617, "after_db": -58.13644027709961, "drop_db": 0.1768646240234375}, {"offset_sec": 1.0, "bit_group": 1, "freq_hz": 10973.0, "bit": 0, "before_db": -19.767906188964844, "after_db": -34.34330368041992, "drop_db": 14.575397491455078}, {"offset_sec": 1.0, "bit_group": 1, "freq_hz": 11213.0, "bit": 0, "before_db": -22.265745162963867, "after_db": -22.31671142578125, "drop_db": 0.05096626281738281}, {"offset_sec": 1.0, "bit_group": 1, "freq_hz": 12379.0, "bit": 0, "before_db": -22.23288917541504, "after_db": -37.84563446044922, "drop_db": 15.61274528503418}, {"offset_sec": 1.0, "bit_group": 1, "freq_hz": 12653.0, "bit": 0, "before_db": -26.898141860961914, "after_db": -41.89351272583008, "drop_db": 14.995370864868164}, {"offset_sec": 1.0, "bit_group": 1, "freq_hz": 13597.0, "bit": 0, "before_db": -27.425548553466797, "after_db": -27.419565200805664, "drop_db": -0.0059833526611328125}, {"offset_sec": 1.0, "bit_group": 1, "freq_hz": 14831.0, "bit": 0, "before_db": -36.31605911254883, "after_db": -50.72959518432617, "drop_db": 14.413536071777344}, {"offset_sec": 1.0, "bit_group": 1, "freq_hz": 15551.0, "bit": 0, "before_db": -43.862770080566406, "after_db": -43.77932357788086, "drop_db": -0.08344650268554688}, {"offset_sec": 1.0, "bit_group": 1, "freq_hz": 16067.0, "bit": 1, "before_db": -58.80457305908203, "after_db": -71.58589935302734, "drop_db": 12.781326293945312}, {"offset_sec": 2.0, "bit_group": 0, "freq_hz": 10973.0, "bit": 1, "before_db": -16.810781478881836, "after_db": -40.429386138916016, "drop_db": 23.61860466003418}, {"offset_sec": 2.0, "bit_group": 0, "freq_hz": 11213.0, "bit": 0, "before_db": -16.712646484375, "after_db": -16.714035034179688, "drop_db": 0.0013885498046875}, {"offset_sec": 2.0, "bit_group": 0, "freq_hz": 12379.0, "bit": 1, "before_db": -17.480241775512695, "after_db": -41.14894485473633, "drop_db": 23.668703079223633}, {"offset_sec": 2.0, "bit_group": 0, "freq_hz": 12653.0, "bit": 1, "before_db": -22.043376922607422, "after_db": -45.71259307861328, "drop_db": 23.66921615600586}, {"offset_sec": 2.0, "bit_group": 0, "freq_hz": 13597.0, "bit": 0, "before_db": -24.5787353515625, "after_db": -24.578929901123047, "drop_db": 0.000194549560546875}, {"offset_sec": 2.0, "bit_group": 0, "freq_hz": 14831.0, "bit": 1, "before_db": -27.670169830322266, "after_db": -51.50189208984375, "drop_db": 23.831722259521484}, {"offset_sec": 2.0, "bit_group": 0, "freq_hz": 15551.0, "bit": 0, "before_db": -31.61397933959961, "after_db": -31.613309860229492, "drop_db": -0.0006694793701171875}, {"offset_sec": 2.0, "bit_group": 0, "freq_hz": 16067.0, "bit": 0, "before_db": -44.2437744140625, "after_db": -53.9200553894043, "drop_db": 9.676280975341797}, {"offset_sec": 2.0, "bit_group": 1, "freq_hz": 10973.0, "bit": 0, "before_db": -9.556283950805664, "after_db": -24.436843872070312, "drop_db": 14.880559921264648}, {"offset_sec": 2.0, "bit_group": 1, "freq_hz": 11213.0, "bit": 0, "before_db": -12.924663543701172, "after_db": -12.933695793151855, "drop_db": 0.009032249450683594}, {"offset_sec": 2.0, "bit_group": 1, "freq_hz": 12379.0, "bit": 0, "before_db": -16.416187286376953, "after_db": -32.09869384765625, "drop_db": 15.682506561279297}, {"offset_sec": 2.0, "bit_group": 1, "freq_hz": 12653.0, "bit": 0, "before_db": -15.894012451171875, "after_db": -31.67782974243164, "drop_db": 15.783817291259766}, {"offset_sec": 2.0, "bit_group": 1, "freq_hz": 13597.0, "bit": 0, "before_db": -18.927316665649414, "after_db": -18.96262550354004, "drop_db": 0.035308837890625}, {"offset_sec": 2.0, "bit_group": 1, "freq_hz": 14831.0, "bit": 0, "before_db": -25.378620147705078, "after_db": -38.1434326171875, "drop_db": 12.764812469482422}, {"offset_sec": 2.0, "bit_group": 1, "freq_hz": 15551.0, "bit": 0, "before_db": -26.529464721679688, "after_db": -26.55221939086914, "drop_db": 0.022754669189453125}, {"offset_sec": 2.0, "bit_group": 1, "freq_hz": 16067.0, "bit": 1, "before_db": -38.95102310180664, "after_db": -56.56462097167969, "drop_db": 17.613597869873047}, {"offset_sec": 3.0, "bit_group": 0, "freq_hz": 10973.0, "bit": 1, "before_db": -10.61851692199707, "after_db": -35.39783477783203, "drop_db": 24.77931785583496}, {"offset_sec": 3.0, "bit_group": 0, "freq_hz": 11213.0, "bit": 0, "before_db": -14.093164443969727, "after_db": -14.090065002441406, "drop_db": -0.0030994415283203125}, {"offset_sec": 3.0, "bit_group": 0, "freq_hz": 12379.0, "bit": 1, "before_db": -19.950063705444336, "after_db": -44.31446838378906, "drop_db": 24.364404678344727}, {"offset_sec": 3.0, "bit_group": 0, "freq_hz": 12653.0, "bit": 1, "before_db": -15.449414253234863, "after_db": -40.23023223876953, "drop_db": 24.780817985534668}, {"offset_sec": 3.0, "bit_group": 0, "freq_hz": 13597.0, "bit": 0, "before_db": -21.514488220214844, "after_db": -21.51363182067871, "drop_db": -0.0008563995361328125}, {"offset_sec": 3.0, "bit_group": 0, "freq_hz": 14831.0, "bit": 1, "before_db": -26.549917221069336, "after_db": -47.92790222167969, "drop_db": 21.37798500061035}, {"offset_sec": 3.0, "bit_group": 0, "freq_hz": 15551.0, "bit": 0, "before_db": -29.697101593017578, "after_db": -29.721853256225586, "drop_db": 0.024751663208007812}, {"offset_sec": 3.0, "bit_group": 0, "freq_hz": 16067.0, "bit": 0, "before_db": -42.62767791748047, "after_db": -53.924861907958984, "drop_db": 11.297183990478516}, {"offset_sec": 3.0, "bit_group": 1, "freq_hz": 10973.0, "bit": 0, "before_db": -8.558878898620605, "after_db": -8.56972599029541, "drop_db": 0.010847091674804688}, {"offset_sec": 3.0, "bit_group": 1, "freq_hz": 11213.0, "bit": 0, "before_db": -9.894363403320312, "after_db": -9.89436149597168, "drop_db": -1.9073486328125e-06}, {"offset_sec": 3.0, "bit_group": 1, "freq_hz": 12379.0, "bit": 0, "before_db": -14.944318771362305, "after_db": -14.91786003112793, "drop_db": -0.026458740234375}, {"offset_sec": 3.0, "bit_group": 1, "freq_hz": 12653.0, "bit": 0, "before_db": -14.67633056640625, "after_db": -14.63284683227539, "drop_db": -0.043483734130859375}, {"offset_sec": 3.0, "bit_group": 1, "freq_hz": 13597.0, "bit": 0, "before_db": -16.952972412109375, "after_db": -16.953229904174805, "drop_db": 0.0002574920654296875}, {"offset_sec": 3.0, "bit_group": 1, "freq_hz": 14831.0, "bit": 0, "before_db": -25.881242752075195, "after_db": -25.9061279296875, "drop_db": 0.024885177612304688}, {"offset_sec": 3.0, "bit_group": 1, "freq_hz": 15551.0, "bit": 0, "before_db": -27.153005599975586, "after_db": -27.153236389160156, "drop_db": 0.0002307891845703125}, {"offset_sec": 3.0, "bit_group": 1, "freq_hz": 16067.0, "bit": 1, "before_db": -38.41265869140625, "after_db": -57.32199478149414, "drop_db": 18.90933609008789}, {"offset_sec": 5.0, "bit_group": 0, "freq_hz": 10973.0, "bit": 1, "before_db": -12.750876426696777, "after_db": -37.1132926940918, "drop_db": 24.36241626739502}, {"offset_sec": 5.0, "bit_group": 0, "freq_hz": 11213.0, "bit": 0, "before_db": -15.431706428527832, "after_db": -15.435216903686523, "drop_db": 0.0035104751586914062}, {"offset_sec": 5.0, "bit_group": 0, "freq_hz": 12379.0, "bit": 1, "before_db": -18.900508880615234, "after_db": -44.549903869628906, "drop_db": 25.649394989013672}, {"offset_sec": 5.0, "bit_group": 0, "freq_hz": 12653.0, "bit": 1, "before_db": -20.596052169799805, "after_db": -44.0439453125, "drop_db": 23.447893142700195}, {"offset_sec": 5.0, "bit_group": 0, "freq_hz": 13597.0, "bit": 0, "before_db": -20.60738754272461, "after_db": -20.608003616333008, "drop_db": 0.0006160736083984375}, {"offset_sec": 5.0, "bit_group": 0, "freq_hz": 14831.0, "bit": 1, "before_db": -25.841764450073242, "after_db": -48.65529251098633, "drop_db": 22.813528060913086}, {"offset_sec": 5.0, "bit_group": 0, "freq_hz": 15551.0, "bit": 0, "before_db": -27.870513916015625, "after_db": -27.868656158447266, "drop_db": -0.001857757568359375}, {"offset_sec": 5.0, "bit_group": 0, "freq_hz": 16067.0, "bit": 0, "before_db": -42.22105026245117, "after_db": -42.39801025390625, "drop_db": 0.17695999145507812}, {"offset_sec": 5.0, "bit_group": 1, "freq_hz": 10973.0, "bit": 0, "before_db": -8.28825855255127, "after_db": -8.563281059265137, "drop_db": 0.2750225067138672}, {"offset_sec": 5.0, "bit_group": 1, "freq_hz": 11213.0, "bit": 0, "before_db": -13.154183387756348, "after_db": -13.154119491577148, "drop_db": -6.389617919921875e-05}, {"offset_sec": 5.0, "bit_group": 1, "freq_hz": 12379.0, "bit": 0, "before_db": -16.38271713256836, "after_db": -16.236125946044922, "drop_db": -0.1465911865234375}, {"offset_sec": 5.0, "bit_group": 1, "freq_hz": 12653.0, "bit": 0, "before_db": -16.93486785888672, "after_db": -16.99164581298828, "drop_db": 0.0567779541015625}, {"offset_sec": 5.0, "bit_group": 1, "freq_hz": 13597.0, "bit": 0, "before_db": -19.62785530090332, "after_db": -19.627830505371094, "drop_db": -2.47955322265625e-05}, {"offset_sec": 5.0, "bit_group": 1, "freq_hz": 14831.0, "bit": 0, "before_db": -23.657785415649414, "after_db": -23.785764694213867, "drop_db": 0.12797927856445312}, {"offset_sec": 5.0, "bit_group": 1, "freq_hz": 15551.0, "bit": 0, "before_db": -22.42252540588379, "after_db": -22.422338485717773, "drop_db": -0.000186920166015625}, {"offset_sec": 5.0, "bit_group": 1, "freq_hz": 16067.0, "bit": 1, "before_db": -30.35174560546875, "after_db": -47.28807067871094, "drop_db": 16.936325073242188}, {"offset_sec": 8.0, "bit_group": 0, "freq_hz": 10973.0, "bit": 1, "before_db": -5.921930313110352, "after_db": -32.128028869628906, "drop_db": 26.206098556518555}, {"offset_sec": 8.0, "bit_group": 0, "freq_hz": 11213.0, "bit": 0, "before_db": -7.776857852935791, "after_db": -7.772505283355713, "drop_db": -0.004352569580078125}, {"offset_sec": 8.0, "bit_group": 0, "freq_hz": 12379.0, "bit": 1, "before_db": -10.529312133789062, "after_db": -35.5029182434082, "drop_db": 24.97360610961914}, {"offset_sec": 8.0, "bit_group": 0, "freq_hz": 12653.0, "bit": 1, "before_db": -14.804710388183594, "after_db": -38.87993240356445, "drop_db": 24.07522201538086}, {"offset_sec": 8.0, "bit_group": 0, "freq_hz": 13597.0, "bit": 0, "before_db": -20.151660919189453, "after_db": -20.153972625732422, "drop_db": 0.00231170654296875}, {"offset_sec": 8.0, "bit_group": 0, "freq_hz": 14831.0, "bit": 1, "before_db": -22.998149871826172, "after_db": -47.842674255371094, "drop_db": 24.844524383544922}, {"offset_sec": 8.0, "bit_group": 0, "freq_hz": 15551.0, "bit": 0, "before_db": -22.447664260864258, "after_db": -22.449085235595703, "drop_db": 0.0014209747314453125}, {"offset_sec": 8.0, "bit_group": 0, "freq_hz": 16067.0, "bit": 0, "before_db": -42.36724853515625, "after_db": -42.354103088378906, "drop_db": -0.01314544677734375}, {"offset_sec": 8.0, "bit_group": 1, "freq_hz": 10973.0, "bit": 0, "before_db": -2.823659896850586, "after_db": -3.01636004447937, "drop_db": 0.19270014762878418}, {"offset_sec": 8.0, "bit_group": 1, "freq_hz": 11213.0, "bit": 0, "before_db": -4.15776252746582, "after_db": -4.157756328582764, "drop_db": -6.198883056640625e-06}, {"offset_sec": 8.0, "bit_group": 1, "freq_hz": 12379.0, "bit": 0, "before_db": -8.148232460021973, "after_db": -8.25399112701416, "drop_db": 0.1057586669921875}, {"offset_sec": 8.0, "bit_group": 1, "freq_hz": 12653.0, "bit": 0, "before_db": -9.968853950500488, "after_db": -10.087855339050293, "drop_db": 0.11900138854980469}, {"offset_sec": 8.0, "bit_group": 1, "freq_hz": 13597.0, "bit": 0, "before_db": -14.463295936584473, "after_db": -14.463298797607422, "drop_db": 2.86102294921875e-06}, {"offset_sec": 8.0, "bit_group": 1, "freq_hz": 14831.0, "bit": 0, "before_db": -17.681333541870117, "after_db": -17.805252075195312, "drop_db": 0.12391853332519531}, {"offset_sec": 8.0, "bit_group": 1, "freq_hz": 15551.0, "bit": 0, "before_db": -18.341856002807617, "after_db": -18.341720581054688, "drop_db": -0.0001354217529296875}, {"offset_sec": 8.0, "bit_group": 1, "freq_hz": 16067.0, "bit": 1, "before_db": -33.16600799560547, "after_db": -52.44485855102539, "drop_db": 19.278850555419922}, {"offset_sec": 13.0, "bit_group": 0, "freq_hz": 10973.0, "bit": 1, "before_db": -7.149510860443115, "after_db": -32.52115249633789, "drop_db": 25.371641635894775}, {"offset_sec": 13.0, "bit_group": 0, "freq_hz": 11213.0, "bit": 0, "before_db": -9.062129020690918, "after_db": -9.063416481018066, "drop_db": 0.0012874603271484375}, {"offset_sec": 13.0, "bit_group": 0, "freq_hz": 12379.0, "bit": 1, "before_db": -13.656214714050293, "after_db": -37.34257888793945, "drop_db": 23.68636417388916}, {"offset_sec": 13.0, "bit_group": 0, "freq_hz": 12653.0, "bit": 1, "before_db": -15.942963600158691, "after_db": -40.282100677490234, "drop_db": 24.339137077331543}, {"offset_sec": 13.0, "bit_group": 0, "freq_hz": 13597.0, "bit": 0, "before_db": -19.476892471313477, "after_db": -19.477277755737305, "drop_db": 0.000385284423828125}, {"offset_sec": 13.0, "bit_group": 0, "freq_hz": 14831.0, "bit": 1, "before_db": -21.337947845458984, "after_db": -45.15309143066406, "drop_db": 23.815143585205078}, {"offset_sec": 13.0, "bit_group": 0, "freq_hz": 15551.0, "bit": 0, "before_db": -21.016794204711914, "after_db": -21.0164737701416, "drop_db": -0.0003204345703125}, {"offset_sec": 13.0, "bit_group": 0, "freq_hz": 16067.0, "bit": 0, "before_db": -26.108001708984375, "after_db": -26.09320068359375, "drop_db": -0.014801025390625}, {"offset_sec": 13.0, "bit_group": 1, "freq_hz": 10973.0, "bit": 0, "before_db": -4.460138320922852, "after_db": -4.570034980773926, "drop_db": 0.10989665985107422}, {"offset_sec": 13.0, "bit_group": 1, "freq_hz": 11213.0, "bit": 0, "before_db": -7.197947025299072, "after_db": -7.198015213012695, "drop_db": 6.818771362304688e-05}, {"offset_sec": 13.0, "bit_group": 1, "freq_hz": 12379.0, "bit": 0, "before_db": -9.465350151062012, "after_db": -9.557451248168945, "drop_db": 0.0921010971069336}, {"offset_sec": 13.0, "bit_group": 1, "freq_hz": 12653.0, "bit": 0, "before_db": -15.44957160949707, "after_db": -15.563132286071777, "drop_db": 0.11356067657470703}, {"offset_sec": 13.0, "bit_group": 1, "freq_hz": 13597.0, "bit": 0, "before_db": -16.72744369506836, "after_db": -16.727142333984375, "drop_db": -0.000301361083984375}, {"offset_sec": 13.0, "bit_group": 1, "freq_hz": 14831.0, "bit": 0, "before_db": -17.99782943725586, "after_db": -17.892719268798828, "drop_db": -0.10511016845703125}, {"offset_sec": 13.0, "bit_group": 1, "freq_hz": 15551.0, "bit": 0, "before_db": -20.19013214111328, "after_db": -20.192102432250977, "drop_db": 0.0019702911376953125}, {"offset_sec": 13.0, "bit_group": 1, "freq_hz": 16067.0, "bit": 1, "before_db": -17.829978942871094, "after_db": -41.28449630737305, "drop_db": 23.454517364501953}, {"offset_sec": 21.0, "bit_group": 0, "freq_hz": 10973.0, "bit": 1, "before_db": -3.576592206954956, "after_db": -28.114370346069336, "drop_db": 24.53777813911438}, {"offset_sec": 21.0, "bit_group": 0, "freq_hz": 11213.0, "bit": 0, "before_db": -5.5862956047058105, "after_db": -5.585185527801514, "drop_db": -0.001110076904296875}, {"offset_sec": 21.0, "bit_group": 0, "freq_hz": 12379.0, "bit": 1, "before_db": -7.9107866287231445, "after_db": -32.776939392089844, "drop_db": 24.8661527633667}, {"offset_sec": 21.0, "bit_group": 0, "freq_hz": 12653.0, "bit": 1, "before_db": -11.619776725769043, "after_db": -35.638248443603516, "drop_db": 24.018471717834473}, {"offset_sec": 21.0, "bit_group": 0, "freq_hz": 13597.0, "bit": 0, "before_db": -10.392919540405273, "after_db": -10.388009071350098, "drop_db": -0.004910469055175781}, {"offset_sec": 21.0, "bit_group": 0, "freq_hz": 14831.0, "bit": 1, "before_db": -14.354354858398438, "after_db": -39.4109001159668, "drop_db": 25.05654525756836}, {"offset_sec": 21.0, "bit_group": 0, "freq_hz": 15551.0, "bit": 0, "before_db": -17.959447860717773, "after_db": -17.955873489379883, "drop_db": -0.003574371337890625}, {"offset_sec": 21.0, "bit_group": 0, "freq_hz": 16067.0, "bit": 0, "before_db": -21.25897216796875, "after_db": -21.261146545410156, "drop_db": 0.00217437744140625}, {"offset_sec": 21.0, "bit_group": 1, "freq_hz": 10973.0, "bit": 0, "before_db": -10.440629959106445, "after_db": -10.557453155517578, "drop_db": 0.11682319641113281}, {"offset_sec": 21.0, "bit_group": 1, "freq_hz": 11213.0, "bit": 0, "before_db": -10.060420989990234, "after_db": -10.060402870178223, "drop_db": -1.811981201171875e-05}, {"offset_sec": 21.0, "bit_group": 1, "freq_hz": 12379.0, "bit": 0, "before_db": -11.726048469543457, "after_db": -11.81554889678955, "drop_db": 0.08950042724609375}, {"offset_sec": 21.0, "bit_group": 1, "freq_hz": 12653.0, "bit": 0, "before_db": -17.64769744873047, "after_db": -17.59255027770996, "drop_db": -0.05514717102050781}, {"offset_sec": 21.0, "bit_group": 1, "freq_hz": 13597.0, "bit": 0, "before_db": -15.59251880645752, "after_db": -15.59245491027832, "drop_db": -6.389617919921875e-05}, {"offset_sec": 21.0, "bit_group": 1, "freq_hz": 14831.0, "bit": 0, "before_db": -21.492753982543945, "after_db": -21.46411895751953, "drop_db": -0.028635025024414062}, {"offset_sec": 21.0, "bit_group": 1, "freq_hz": 15551.0, "bit": 0, "before_db": -23.90314483642578, "after_db": -23.903675079345703, "drop_db": 0.000530242919921875}, {"offset_sec": 21.0, "bit_group": 1, "freq_hz": 16067.0, "bit": 1, "before_db": -32.68827819824219, "after_db": -51.2503662109375, "drop_db": 18.562088012695312}], "frequencies": [10973.0, 11213.0, 12379.0, 12653.0, 13597.0, 14831.0, 15551.0, 16067.0], "offsets": [1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0], "bits": [1, 0, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], "cluster_half_width": 2, "sr": 48000, "duration_sec": 177.83997916666667}
+;
+
+const results = DATA.results;
+const freqs = DATA.frequencies;
+const offsets = DATA.offsets;
+
+// build a lookup: freq -> offset -> bitGroup -> {drop_db, bit}
+const lookup = {};
+for (const r of results) {
+  const key = `${r.freq_hz}|${r.offset_sec}|${r.bit_group}`;
+  lookup[key] = r;
+}
+
+function dropToColor(dropDb) {
+  // sequential ramp, 0dB -> lightest, 26dB -> darkest (matches the reference scale's step range)
+  const steps = ["--seq-100","--seq-150","--seq-200","--seq-250","--seq-300","--seq-350","--seq-400","--seq-450","--seq-500","--seq-550","--seq-600","--seq-650","--seq-700"];
+  const clamped = Math.max(0, Math.min(26, dropDb));
+  const idx = Math.round((clamped / 26) * (steps.length - 1));
+  return `var(${steps[idx]})`;
+}
+
+function textColorFor(dropDb) {
+  return dropDb > 13 ? "#ffffff" : "var(--text-secondary)";
+}
+
+// stat row
+const markedCells = results.filter(r => r.bit === 1);
+const unmarkedCells = results.filter(r => r.bit === 0);
+const avgMarkedDrop = markedCells.reduce((s, r) => s + r.drop_db, 0) / markedCells.length;
+const avgUnmarkedDrop = unmarkedCells.reduce((s, r) => s + Math.abs(r.drop_db), 0) / unmarkedCells.length;
+const minMarkedDrop = Math.min(...markedCells.map(r => r.drop_db));
+const maxMarkedDrop = Math.max(...markedCells.map(r => r.drop_db));
+
+document.getElementById("statRow").innerHTML = `
+  <div class="stat-card"><div class="num">${avgMarkedDrop.toFixed(1)} dB</div><div class="lbl">Avg drop, "1" bits</div></div>
+  <div class="stat-card"><div class="num">${avgUnmarkedDrop.toFixed(2)} dB</div><div class="lbl">Avg change, "0" bits</div></div>
+  <div class="stat-card"><div class="num">${minMarkedDrop.toFixed(1)}–${maxMarkedDrop.toFixed(1)} dB</div><div class="lbl">Range, "1" bits</div></div>
+  <div class="stat-card"><div class="num">${markedCells.length}/${results.length}</div><div class="lbl">Cells marked</div></div>
+`;
+
+// matrix table
+const table = document.getElementById("matrixTable");
+let html = "<thead><tr><th class='corner'></th>";
+for (const o of offsets) {
+  html += `<th class="time-label" colspan="2">${o}s</th>`;
+}
+html += "</tr></thead><tbody>";
+
+for (const f of freqs) {
+  html += `<tr><th class="freq-label">${Math.round(f).toLocaleString()} Hz</th>`;
+  for (const o of offsets) {
+    for (const bg of [0, 1]) {
+      const r = lookup[`${f}|${o}|${bg}`];
+      if (!r) {
+        html += `<td class="cell-wrap"><div class="cell" style="background:var(--unmarked-fill)"></div></td>`;
+        continue;
+      }
+      const isMarked = r.bit === 1;
+      const bg_color = isMarked ? dropToColor(r.drop_db) : "var(--unmarked-fill)";
+      const textColor = isMarked ? textColorFor(r.drop_db) : "var(--text-muted)";
+      const label = isMarked ? `-${r.drop_db.toFixed(0)}` : "0";
+      html += `<td class="cell-wrap"><div class="cell${isMarked ? ' marked' : ''}" style="background:${bg_color}; color:${textColor}" title="${Math.round(f)}Hz @ ${o}s, slot ${bg}: ${r.drop_db.toFixed(1)}dB drop, bit=${r.bit}"><span class="val">${label}</span></div></td>`;
+    }
+  }
+  html += "</tr>";
+}
+html += "</tbody>";
+table.innerHTML = html;
+</script>

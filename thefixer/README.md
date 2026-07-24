@@ -65,31 +65,33 @@ The processing order is deliberate — see [Why this order](#why-this-order).
    compression, conservative settings (ratio 1.3:1, threshold -12dB). See
    [Multiband compressor: how it compares to a real one](#multiband-compressor-how-it-compares-to-a-real-one)
    for what's simplified here.
-10. **Linear-model AI-detector fix** — gradient-based adversarial
+10. **CNN-model AI-detector fix** — shift-robust gradient optimization
+    targeting the CQT-cepstrum CNN detector. The recommended mode trains
+    across small timing shifts around the detector's five real evaluation
+    positions; a slower dense whole-track mode is also available.
+11. **Linear-model AI-detector fix** — gradient-based adversarial
     correction targeting the fakeprint/logistic-regression detector.
     Reports live progress during optimization: current step, which retry
     attempt, and the live surrogate score as it converges.
-11. **CNN-model AI-detector fix** — whole-track joint gradient optimization
-    targeting the CQT-cepstrum CNN detector, across all overlapping
-    10-second analysis windows simultaneously.
-12. **Post-chain linear re-verification** (automatic, not a separate
+12. **Temporal pattern normalization** (optional, experimental) — applies a
+    tiny smooth non-uniform timing warp before the final watermark. The 8ms
+    default passed one listening check and moves landmarks in a simplified
+    local proxy; it has not been verified against a commercial fingerprint
+    system. Production runs deliberately use a fresh random curve.
+13. **True-peak limiter** — brick-wall ceiling at -1dBTP (industry-standard
+    safe margin for lossy-codec transcoding headroom), oversampled 4x to
+    catch inter-sample peaks, not just sample peaks.
+14. **Post-chain linear/CNN re-verification** (automatic, not a separate
     selectable tool) — if both AI fixes were selected, re-scores the linear
-    model on the final post-chain audio and, if the CNN fix disturbed it
-    back above target, re-runs the linear fix once more, verified. See
-    [Why this order](#why-this-order).
-13. **Post-chain LUFS drift correction** (automatic, not a separate
+    and CNN models on the post-chain audio and can re-run either fix once
+    if later processing erased its safety margin. See [Why this order](#why-this-order).
+15. **Post-chain LUFS drift correction** (automatic, not a separate
     selectable tool) — if `normalize_lufs` was selected, the truly final
     LUFS is measured after every later stage (multiband compression, both
     AI-detector fixes, the limiter) and corrected with one direct gain
     pass if it has drifted more than 0.5dB from target. Re-runs the
-    limiter afterward if it was selected, since a late gain change can
-    push a peak back over ceiling.
-14. **True-peak limiter** — brick-wall ceiling at -1dBTP (industry-standard
-    safe margin for lossy-codec transcoding headroom), oversampled 4x to
-    catch inter-sample peaks, not just sample peaks. Re-runs automatically
-    after either of the two re-verification passes above if it was
-    originally selected, so it remains the genuine last stage regardless
-    of what triggers a late correction.
+    limiter afterward if it was selected, since a late gain change can push
+    a peak back over ceiling.
 
 ## Output format
 
@@ -101,6 +103,13 @@ CBR 320kbps (a flat bitrate on every frame, what most people mean literally
 by "highest bitrate"). The delivered filename's extension always matches
 what was actually encoded, regardless of what was typed into the filename
 field.
+
+Every delivered file is also stamped with a disclosed, fixed product
+watermark for aggregate footprint measurement. It is not per-user tracking,
+DRM, or a delivery gate. The current v2 mark uses seed-derived frequencies
+bounded to 10-16kHz; detection remains backward-compatible with v1 files.
+It is known not to survive 128kbps MP3 or downsampling to 22050Hz and below,
+and a watermark failure is logged but never blocks delivery.
 
 ## Why this order
 
@@ -115,14 +124,12 @@ a musical/spectral-shaping step, and it needs to see the truly final signal
 (including whatever small amount of energy the AI fixes add) to actually
 guarantee the delivered file stays under its ceiling.
 
-**The two AI-detector fixes can still interact with each other even in the
-correct order.** Running the linear fix followed by the CNN fix can let the
-CNN fix's broadband correction disturb the linear fix's precise correction
-— on a full-length test track, a linear score verified at 1.56% rose to
-9.65% once the CNN fix had also run. This is why step 12 above exists — a
-mandatory re-verification pass that catches and corrects this specific
-interaction automatically, rather than shipping a degraded result. It is
-not a complete fix for the underlying issue (see [Roadmap](#roadmap)).
+**The two AI-detector fixes can still interact with each other.** The CNN
+fix runs first and the cheaper linear fix runs second, but either correction
+or the later limiter can erase the other model's safety margin. Historical
+testing also observed a linear score rise from 1.56% to 9.65% when CNN was
+applied afterward. The bounded post-chain re-verification sequence therefore
+checks both models and may retry each once; it does not ping-pong indefinitely.
 
 **LUFS normalization is checked again at the very end, for the same
 reason.** It runs mid-chain (step 8), but every stage after it — multiband
@@ -152,16 +159,16 @@ near-perfectly on unperturbed audio. Verification happens:
   (44.1kHz stereo). Both fixes re-check the real score on the actual
   transferred audio, and the linear fix retries with a stricter internal
   target (up to a set number of times) if the transfer degraded the result.
-- **After the full chain** — if both fixes were selected, a final check
-  verifies the linear model on the truly final (post-mastering, post-CNN
-  fix) audio and triggers one more corrective pass if needed (see above).
+- **After the full chain** — if both fixes were selected, final linear and
+  CNN checks can trigger one bounded corrective pass each (see above).
 - **In the final job result** — reported scores always reflect the real
   model scored on the actual saved output file, never a self-reported claim
   from mid-pipeline. If either model is still failing after everything,
   this is shown as a warning rather than hidden.
 
-A fix is only ever reported as applied once the real model has confirmed it
-on the actual audio that gets delivered.
+The step result distinguishes a correction being applied from it being
+verified after transfer. Failed verification is surfaced rather than
+silently relabeled as success.
 
 ## Architecture
 
