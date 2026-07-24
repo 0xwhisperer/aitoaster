@@ -407,6 +407,96 @@ TOOL_LABELS = {
 }
 
 
+def _tool_status_line(tool, info):
+    """Builds ONE confirmation line for the given tool's outcome, called
+    uniformly right after every "done (Xs)" line in the main tool loop -
+    guarantees every selected tool gets a status line, in the same place,
+    every time, rather than relying on each branch to remember to add its
+    own (which is exactly how several tools ended up silently missing one).
+    Returns None for tools with nothing meaningful to report beyond "done."
+
+    Thresholds quoted here match the results table's own pass/fail bars
+    (statusPill in app.js) exactly, so the live line and the final table
+    never disagree about what counts as a pass."""
+    applied = info.get("applied")
+
+    if tool == "strip_metadata":
+        n_tags = len(info.get("tags_found") or {})
+        has_images = info.get("has_embedded_images")
+        if not applied:
+            return "pass (nothing found to strip)"
+        parts = []
+        if n_tags:
+            parts.append(f"{n_tags} tag{'s' if n_tags != 1 else ''}")
+        if has_images:
+            parts.append("embedded image(s)")
+        return f"pass (removed {' and '.join(parts)})"
+
+    if tool == "trim_silence":
+        if not applied:
+            return "pass (no leading/trailing silence found)"
+        lead_ms = info.get("lead_ms", 0)
+        trail_ms = info.get("trail_ms", 0)
+        return f"pass (trimmed {lead_ms:.0f}ms lead / {trail_ms:.0f}ms trail)"
+
+    if tool == "dc_offset":
+        dc_after_max = max(abs(info.get("dc_l_after", 0.0)), abs(info.get("dc_r_after", 0.0))) if applied else 0.0
+        return f"{'pass' if dc_after_max < 0.001 else 'check'} (max L/R after: {dc_after_max:.5f})"
+
+    if tool == "fix_transients":
+        count = info.get("count", 0)
+        return f"pass (processed {count} anomal{'y' if count == 1 else 'ies'}; final check runs after the full chain)"
+
+    if tool == "spectral_revive":
+        if not applied:
+            reason = info.get("reason", "no artificial rolloff detected")
+            return f"pass ({reason})"
+        cutoff = info.get("cutoff_hz")
+        slope = info.get("fitted_rolloff_db_per_octave")
+        return f"pass (filled above {cutoff / 1000:.0f}kHz, fitted rolloff {slope:.1f}dB/octave)" if cutoff and slope is not None else "pass (applied)"
+
+    if tool == "high_pass":
+        cutoff = info.get("cutoff_hz")
+        return f"pass (cutoff {cutoff:.0f}Hz)" if cutoff else "pass (applied)"
+
+    if tool == "fix_phase":
+        corr_after = info.get("correlation_after", info.get("correlation"))
+        if corr_after is None:
+            return "pass (applied)"
+        ok = corr_after >= 0.1
+        return f"{'pass' if ok else 'check'} (correlation: {corr_after:.2f})"
+
+    if tool == "normalize_lufs":
+        lufs_after = info.get("lufs_after")
+        if lufs_after is None:
+            return "pass (no change needed)"
+        ok = -16 <= lufs_after <= -12
+        return f"{'pass' if ok else 'check'} ({lufs_after:.1f} LUFS)"
+
+    if tool == "multiband_compress":
+        bands = info.get("bands") or []
+        max_reduction = min((b.get("max_reduction_db", 0.0) for b in bands), default=0.0)
+        return f"pass (up to {abs(max_reduction):.1f}dB gentle reduction across {len(bands)} bands)"
+
+    if tool == "temporal_normalize":
+        # "pass" here means the operation completed and produced valid
+        # audio - NOT a claim of verified effectiveness against any real
+        # detector/fingerprinting service (there is no such verification
+        # available - see app/timewarp.py's module docstring). Matches
+        # what's actually knowable at this point in the pipeline, same
+        # honesty standard as everything else in this app.
+        return f"pass (applied, max drift: {info.get('max_drift_ms', 0):.0f}ms)"
+
+    if tool == "true_peak_limit":
+        if not applied:
+            return "pass (already under ceiling)"
+        reduction = info.get("gain_reduction_db")
+        ceiling = info.get("ceiling_db")
+        return f"pass (reduced up to {abs(reduction):.1f}dB to hold {ceiling:.1f}dBTP ceiling)" if reduction is not None else "pass (applied)"
+
+    return None
+
+
 def run_pipeline(job_id, file_id, tools, options, output_name=None, output_format="same", mp3_mode="vbr0"):
     try:
         path = _find_upload_path(file_id)
@@ -486,12 +576,6 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 lead_samples_trimmed = info.get("lead_samples", 0)
             elif tool == "dc_offset":
                 audio, info = chain.fix_dc_offset(audio, sr)
-                # thresholds match the results table's own pass/fail logic
-                # (statusPill in app.js) exactly - this is the same "under
-                # 0.001 = pass" bar shown after the fact, just surfaced
-                # live too now instead of only in the final table.
-                dc_after_max = max(abs(info.get("dc_l_after", 0.0)), abs(info.get("dc_r_after", 0.0))) if info.get("applied") else 0.0
-                job_log(job_id, f"dc_offset: {'pass' if dc_after_max < 0.001 else 'check'} (max L/R after: {dc_after_max:.5f})")
             elif tool == "fix_transients":
                 transients = chain.detect_transients(audio, sr)
                 info = {"applied": len(transients) > 0, "count": len(transients), "details": []}
@@ -499,7 +583,6 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                     audio, tinfo = chain.fix_transient(audio, sr, t["time_sec"],
                                                          target_peak=options.get("transient_target_peak"))
                     info["details"].append(tinfo)
-                job_log(job_id, f"fix_transients: processed ({len(transients)} anomal{'y' if len(transients) == 1 else 'ies'} found)")
             elif tool == "spectral_revive":
                 audio, info = chain.spectral_revive(audio, sr, cutoff_hz=options.get("spectral_revive_cutoff_hz"))
             elif tool == "high_pass":
@@ -545,22 +628,8 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 # weakly-positive 0.05 correlation is not called "no change
                 # needed" here and then shown as failing in the final table.
                 audio, info = chain.fix_phase_issues(audio, sr, min_correlation=0.1)
-                if not info.get("applied"):
-                    corr_after = info.get("correlation")
-                    job_log(job_id, f"fix_phase: pass (no change needed; correlation: {corr_after:.2f})")
-                else:
-                    corr_after = info.get("correlation_after")
-                    # >= 0.1 matches the results table's own stereo-correlation
-                    # pass bar (statusPill in app.js)
-                    job_log(job_id, f"fix_phase: {'pass' if corr_after >= 0.1 else 'check'} (correlation: {corr_after:.2f})")
             elif tool == "normalize_lufs":
                 audio, info = chain.normalize_lufs(audio, sr, target_lufs=options.get("lufs_target", -14.0))
-                lufs_after = info.get("lufs_after")
-                # -16 to -12 matches the results table's own LUFS pass bar
-                # (statusPill in app.js)
-                if lufs_after is not None:
-                    lufs_ok = -16 <= lufs_after <= -12
-                    job_log(job_id, f"normalize_lufs: {'pass' if lufs_ok else 'check'} ({lufs_after:.1f} LUFS)")
             elif tool == "multiband_compress":
                 audio, info = chain.multiband_compress(audio, sr)
             elif tool == "temporal_normalize":
@@ -605,14 +674,6 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                     "seed_mode": "random" if temporal_seed is None else "explicit",
                     "note": "not verified against any real fingerprinting/pattern-matching service",
                 }
-                # "pass" here means the operation completed and produced
-                # valid audio - NOT a claim of verified effectiveness
-                # against any real detector/fingerprinting service (there
-                # is no such verification available - see the module
-                # docstring). Matches what's actually knowable at this
-                # point in the pipeline, same honesty standard as
-                # everything else in this app.
-                job_log(job_id, f"temporal_normalize: applied (max drift: {max_drift_ms:.0f}ms)")
             elif tool == "true_peak_limit":
                 audio, info = chain.true_peak_limit(audio, sr, ceiling_db=options.get("ceiling_db", -1.0))
             else:
@@ -623,6 +684,13 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
             info["elapsed_sec"] = round(time.time() - t0, 2)
             steps.append(info)
             job_log(job_id, f"  done ({info['elapsed_sec']}s)")
+            # ALWAYS logged right after "done", never before it, and never
+            # skipped - every tool gets exactly one status line here (see
+            # _tool_status_line's own docstring for why this is centralized
+            # instead of scattered across each branch above).
+            status_line = _tool_status_line(tool, info)
+            if status_line is not None:
+                job_log(job_id, f"  {tool}: {status_line}")
 
         # The blocks below sit outside TOOL_ORDER, so the loop's top-of-stage
         # checkpoint cannot cover them. Check here and again before every

@@ -891,7 +891,6 @@
     [/^wm: pass \(version (\d+), (\d+)% confidence, method=(\w+)\)$/, (m) =>
       ({ text: `Watermark (wm): embedded and verified — ${m[2]}% confidence`, badge: "pass" })],
     [/^wm: fail.*$/, () => ({ text: "Watermark (wm): embedded but could not be re-verified", badge: "fail" })],
-    [/^temporal_normalize: applied \(max drift: (\d+)ms\)$/, (m) => ({ text: `Temporal pattern denormalization: applied (max drift: ${m[1]}ms)`, badge: "pass" })],
     [/^wm: error.*$/, () => ({ text: "Watermark (wm): step failed, file shipped without it", badge: "fail" })],
     [/^linear: attempt (\d+) of (\d+) - optimizing.*$/, (m) => `AI-detector fix (linear model): trying attempt ${m[1]} of ${m[2]}…`],
     [/^linear: attempt \d+ result checked against the REAL detector.*: ([\d.]+)%$/, (m) => {
@@ -918,16 +917,28 @@
       return { text: `CNN model result: ${m[1]}% AI-likely`, badge: pct < 8 ? "pass" : "retry" };
     }],
     [/^\s*cnn lost its safety margin.*$/, () => ({ text: "The CNN fix slipped after a later step - running it again", badge: "retry" })],
-    [/^dc_offset: (pass|check) \(max L\/R after: ([\d.]+)\)$/, (m) => ({ text: `DC offset correction: max L/R ${m[2]}`, badge: m[1] === "pass" ? "pass" : "retry" })],
-    [/^fix_transients: processed \((\d+) anomal(?:y|ies) found\)$/, (m) => `Transient/pop fix: processed ${m[1]} anomal${m[1] === "1" ? "y" : "ies"}; final check runs after the full chain`],
+    [/^temporal_normalize: note .*$/, () => "Temporal denormalization stayed in place; a later safety correction ran before the final watermark (this exact combination is unbenchmarked)"],
     [/^fix_transients: final (pass|check) \((\d+) anomal(?:y|ies) after full chain\)$/, (m) => ({
       text: `Transient/pop fix: ${m[2]} anomal${m[2] === "1" ? "y" : "ies"} remain after the full chain`,
       badge: m[1] === "pass" ? "pass" : "retry",
     })],
-    [/^temporal_normalize: note .*$/, () => "Temporal denormalization stayed in place; a later safety correction ran before the final watermark (this exact combination is unbenchmarked)"],
-    [/^fix_phase: (pass|check) \(correlation: ([\-\d.]+)\)$/, (m) => ({ text: `Stereo phase correction: correlation ${m[2]}`, badge: m[1] === "pass" ? "pass" : "retry" })],
-    [/^fix_phase: pass \(no change needed; correlation: ([\-\d.]+)\)$/, (m) => ({ text: `Stereo phase correction: already fine at ${m[1]}, no change needed`, badge: "pass" })],
-    [/^normalize_lufs: (pass|check) \(([\-\d.]+) LUFS\)$/, (m) => ({ text: `Loudness normalization: ${m[2]} LUFS`, badge: m[1] === "pass" ? "pass" : "retry" })],
+    // Generic handler for the centralized per-tool status line (see
+    // _tool_status_line in server.py) - every selected tool logs exactly
+    // one "  {tool}: pass|check (...)" line right after "done (Xs)", so one
+    // regex + a friendly-name lookup covers all of them instead of a
+    // separate hand-written pattern per tool (which is exactly how several
+    // tools ended up with no status line at all before this).
+    [/^\s*(strip_metadata|trim_silence|dc_offset|fix_transients|spectral_revive|high_pass|fix_phase|normalize_lufs|multiband_compress|temporal_normalize|true_peak_limit): (pass|check) \((.+)\)$/, (m) => {
+      const FRIENDLY_TOOL_NAME = {
+        strip_metadata: "Metadata strip", trim_silence: "Silence trim", dc_offset: "DC offset correction",
+        fix_transients: "Transient/pop fix", spectral_revive: "High-frequency fill-in", high_pass: "High-pass filter",
+        fix_phase: "Stereo phase correction", normalize_lufs: "Loudness normalization",
+        multiband_compress: "Multiband compression", temporal_normalize: "Temporal pattern denormalization",
+        true_peak_limit: "True-peak limiter",
+      };
+      const name = FRIENDLY_TOOL_NAME[m[1]] || m[1];
+      return { text: `${name}: ${m[3]}`, badge: m[2] === "pass" ? "pass" : "retry" };
+    }],
     [/^re-running true-peak limiter.*$/, () => "Re-checking the loudness ceiling after that last change"],
     [/^post-chain LUFS check: ([\-\d.]+) vs target ([\-\d.]+).*$/, (m) => `Loudness drifted to ${m[1]} (target ${m[2]}) - correcting`],
     [/^\s*corrected to ([\-\d.]+) LUFS.*$/, (m) => `Loudness corrected to ${m[1]}`],
