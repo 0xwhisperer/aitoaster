@@ -27,12 +27,16 @@ class CnnPostGuardVerificationTests(unittest.TestCase):
             # mutates it afterward.
             return 0.9
 
+        def scan_real_scores(audio_np, positions, seg_len):
+            return [real_score(audio_np[pos:pos + seg_len]) for pos in positions]
+
         with (
             patch.object(optimizer, "forward_logit_differentiable", differentiable_logit),
             patch.object(optimizer, "perceptual_penalty", penalty),
             patch.object(optimizer, "band_limit_penalty", penalty),
             patch.object(optimizer, "tonality_penalty", penalty),
             patch.object(optimizer, "get_real_score_segment", real_score),
+            patch.object(optimizer, "scan_real_scores", scan_real_scores),
             patch.object(
                 optimizer,
                 "apply_silence_guard_to_delta",

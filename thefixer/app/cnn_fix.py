@@ -9,7 +9,12 @@ import os
 import soundfile as sf
 
 from .cnn_differentiable_v2 import SR as CNN_SR, get_real_score_segment
-from .cnn_wholetrack_optimizer_v2 import optimize_whole_track_verified, optimize_eot_verified, _worst_shift_score
+from .cnn_wholetrack_optimizer_v2 import (
+    optimize_whole_track_verified,
+    optimize_eot_verified,
+    _worst_shift_score,
+    scan_real_scores,
+)
 
 
 def _resample_mono(audio, sr_in, sr_out):
@@ -170,12 +175,13 @@ def fix_cnn(stereo_audio, sr, max_steps=300, min_steps=100, hop_sec=0.5,
             if s is not None
         ]
     else:
-        post_transfer_scores = []
-        for pos in positions:
-            seg = out_mono_16k[pos:pos + seg_len]
-            if len(seg) < seg_len:
-                continue
-            post_transfer_scores.append(get_real_score_segment(seg))
+        valid_positions = [
+            pos for pos in positions
+            if len(out_mono_16k[pos:pos + seg_len]) >= seg_len
+        ]
+        post_transfer_scores = scan_real_scores(
+            out_mono_16k, valid_positions, seg_len
+        )
     worst_after_transfer = max(post_transfer_scores) if post_transfer_scores else None
 
     # this was being computed and silently dropped into the returned info

@@ -4,11 +4,10 @@ import torch.nn as nn
 import subprocess
 import yaml
 import onnxruntime as ort
-import librosa
-from scipy.fft import dct
 from onnx2torch import convert
 from nnAudio.features import CQT
 from pathlib import Path
+from .cnn_real_scanner import extract_real_cepstrum
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 
@@ -135,8 +134,13 @@ def forward_score_differentiable(audio_1d):
     return torch.sigmoid(forward_logit_differentiable(audio_1d))
 
 
+_session_options = ort.SessionOptions()
+_session_options.intra_op_num_threads = 1
+_session_options.inter_op_num_threads = 1
+_session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 _session = ort.InferenceSession(
     str(MODELS_DIR / "cnn_detector.onnx"),
+    sess_options=_session_options,
     providers=["CPUExecutionProvider"])
 _input_name = _session.get_inputs()[0].name
 
@@ -149,11 +153,15 @@ def get_real_score_segment(audio_np):
 
 def get_real_logit_segment(audio_np):
     """Return the raw logit from the unchanged librosa/ONNX path."""
-    cqt = librosa.cqt(audio_np, sr=SR, fmin=CQT_CFG["fmin"], n_bins=CQT_CFG["n_bins"],
-                       bins_per_octave=CQT_CFG["bins_per_octave"], hop_length=CQT_CFG["hop_length"])
-    cqt_mag = np.abs(cqt)
-    log_cqt = np.log(cqt_mag + 1e-6)
-    cepstrum = dct(log_cqt, type=2, axis=0, norm='ortho')[:N_COEFFS, :]
+    cepstrum = extract_real_cepstrum(
+        audio_np,
+        sr=SR,
+        fmin=CQT_CFG["fmin"],
+        n_bins=CQT_CFG["n_bins"],
+        bins_per_octave=CQT_CFG["bins_per_octave"],
+        hop_length=CQT_CFG["hop_length"],
+        n_coeffs=N_COEFFS,
+    )
     batch = cepstrum[np.newaxis, np.newaxis, :, :].astype(np.float32)
     output = _session.run(None, {_input_name: batch})[0]
     return float(output[0, 0])

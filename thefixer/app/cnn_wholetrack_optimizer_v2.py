@@ -5,6 +5,7 @@ from .cnn_differentiable_v2 import (
     forward_logit_differentiable, forward_score_differentiable,
     get_real_score_segment, get_real_evaluator_segments, SR, SEGMENT_SAMPLES,
 )
+from .cnn_real_scanner import get_default_real_score_scanner
 from .cnn_gradient_optimizer_v2 import perceptual_penalty, band_limit_penalty, tonality_penalty, apply_silence_guard_to_delta
 
 
@@ -52,6 +53,11 @@ def scaled_step_budget(n_windows):
     min_steps = max(60, int(raw * 1.5))
     max_steps = max(300, min_steps * 4)
     return min_steps, max_steps
+
+
+def scan_real_scores(audio_np, positions, seg_len):
+    """Scan exact real-model scores in position order using the reusable pool."""
+    return get_default_real_score_scanner().scan(audio_np, positions, seg_len)
 
 
 def build_sliding_windows(n_samples, hop_sec=0.5, segment_sec=10.0, sr=SR, edge_guard_sec=0.5):
@@ -228,9 +234,8 @@ def optimize_whole_track_verified(
     window_weight = {}
     real0_by_pos = {}
     audio_np_orig = audio_np
-    for pos in positions:
-        seg_np = audio_np_orig[pos:pos + seg_len]
-        real0 = get_real_score_segment(seg_np)
+    initial_real_scores = scan_real_scores(audio_np_orig, positions, seg_len)
+    for pos, real0 in zip(positions, initial_real_scores):
         real0_by_pos[pos] = real0
         # same 1.0-20.0 scale and threshold the periodic re-check already uses,
         # just applied before step 0 instead of first appearing at step 25
@@ -353,10 +358,9 @@ def optimize_whole_track_verified(
         if step > 0 and step % real_check_interval == 0:
             with torch.no_grad():
                 perturbed_np = (audio + delta).numpy()
-            real_scores = {}
-            for pos in positions:
-                seg_np = perturbed_np[pos:pos + seg_len]
-                real_scores[pos] = get_real_score_segment(seg_np)
+            real_scores = dict(zip(
+                positions, scan_real_scores(perturbed_np, positions, seg_len)
+            ))
             real_max = max(real_scores.values())
             n_bad = sum(1 for v in real_scores.values() if v > real_target)
             if verbose:
@@ -414,10 +418,7 @@ def optimize_whole_track_verified(
     guarded_delta = apply_silence_guard_to_delta(best_delta, audio)
     with torch.no_grad():
         guarded_perturbed_np = (audio + guarded_delta).numpy()
-    post_guard_scores = [
-        get_real_score_segment(guarded_perturbed_np[pos:pos + seg_len])
-        for pos in positions
-    ]
+    post_guard_scores = scan_real_scores(guarded_perturbed_np, positions, seg_len)
     post_guard_worst = max(post_guard_scores) if post_guard_scores else 1.0
     print(f"  post-silence-guard worst real score: {post_guard_worst:.4f} "
           f"(pre-guard best_real_max was {best_real_max:.4f})")
@@ -454,16 +455,15 @@ def _worst_shift_score(perturbed_np, center_pos, seg_len, n, shift_range_sec=1.0
     # an absence of data as a passing score.
     shift_samples = int(shift_range_sec * sr)
     step_samples = max(1, int(shift_step_sec * sr))
-    worst = None
+    offsets = []
     for offset in range(-shift_samples, shift_samples + 1, step_samples):
         pos = center_pos + offset
         if pos < 0 or pos + seg_len > n:
             continue
-        seg = perturbed_np[pos:pos + seg_len]
-        s = get_real_score_segment(seg)
-        if worst is None or s > worst:
-            worst = s
-    return worst
+        offsets.append(pos)
+    if not offsets:
+        return None
+    return max(scan_real_scores(perturbed_np, offsets, seg_len))
 
 
 def optimize_eot_verified(
