@@ -18,7 +18,14 @@ class CnnPostGuardVerificationTests(unittest.TestCase):
             return (delta ** 2).mean()
 
         def real_score(segment):
-            return 0.9 if abs(float(np.mean(segment))) > 0.0005 else 0.01
+            # untouched (zero-mean) audio must itself score ABOVE real_target
+            # so the optimizer's own pre-optimization seeding scan finds real
+            # work to do and does not take the (correct, separately tested)
+            # early-exit path for already-passing audio - this test's whole
+            # point is exercising what happens to a delta that DID get
+            # optimized and certified, once the post-processing guard below
+            # mutates it afterward.
+            return 0.9
 
         with (
             patch.object(optimizer, "forward_logit_differentiable", differentiable_logit),

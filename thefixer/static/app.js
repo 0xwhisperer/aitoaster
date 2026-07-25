@@ -181,6 +181,18 @@
     { id: "true_peak_limit", group: "chainGroupMaster", name: "True-peak limiter", desc: "Brick-wall safety ceiling at -1dBTP, accounting for inter-sample peaks.", info: "tool_true_peak_limit" },
   ];
 
+  // BUG FIX (second adversarial audit round): the analysis-response race
+  // guard (runAnalysis's requestedFileId check) can only ever be as
+  // correct as state.fileId itself - but the UPLOAD race was never
+  // guarded at all. If upload A starts, then upload B starts, and B's
+  // /api/upload response returns before A's, state.fileId briefly becomes
+  // B's id (correct) - but if A's response then lands AFTER B's, A
+  // unconditionally overwrites state.fileId back to A's older id with no
+  // check at all, "winning" despite being the stale request. This counter
+  // makes upload ordering explicit: each handleFile call captures the
+  // sequence number in effect when IT started, and only applies its
+  // result if no newer upload has started since.
+  let uploadSequence = 0;
   let state = {
     fileId: null,
     filename: null,
@@ -242,10 +254,36 @@
 
   function resetWorkspace() {
     if (typeof stopElapsedTimer === "function") stopElapsedTimer();
+    // BUG FIX (third adversarial audit round): resetWorkspace cleared
+    // state.fileId but never incremented uploadSequence - so an upload
+    // already in flight when the user clicked "Analyze a different file"
+    // would still pass handleFile's own sequence guard (mySequence still
+    // equals uploadSequence, since nothing bumped it here) and reopen the
+    // just-discarded workspace with that stale upload's data the moment
+    // its response landed. Bumping the sequence here invalidates any
+    // upload started before this reset, the same way starting a genuinely
+    // NEWER upload already does.
+    uploadSequence++;
+    // BUG FIX (direct user report): clicking "Analyze a different file" left
+    // whatever was currently playing (the original-file preview player OR
+    // the A/B before/after player) running in the background with no
+    // indication anything was still audible - the workspace visually reset
+    // to a blank upload state while audio kept going. The A/B play button's
+    // own handler already stops the OTHER player when one starts (see
+    // originalPlayer.onplay above) - this applies that same "only one
+    // thing plays at a time" rule to the reset action itself.
+    const origPlayer = $("originalPlayer");
+    if (origPlayer && !origPlayer.paused) origPlayer.pause();
+    const ao = $("audioOrig"), af = $("audioFixed");
+    if (ao && !ao.paused) ao.pause();
+    if (af && !af.paused) af.pause();
+    const playBtn = $("playBtn");
+    if (playBtn) playBtn.textContent = "▶";
     state = { ...state, fileId: null, analysis: null, selected: new Set(), jobId: null, result: null,
               lastResult: null, spectrumViewMode: "both", waveformViewMode: "both" };
     $("workspace").classList.remove("active");
     $("results").classList.remove("active");
+    $("preprocessGrid").classList.remove("hidden");
     $("progressPanel").classList.remove("active");
     $("spectrumLegend").classList.remove("active");
     $("waveformLegend").classList.remove("active");
@@ -256,6 +294,7 @@
   }
 
   async function handleFile(file) {
+    const mySequence = ++uploadSequence;
     uploadZone.classList.add("dragover");
     uploadZone.querySelector(".primary").textContent = "Uploading & decoding…";
     const form = new FormData();
@@ -264,6 +303,13 @@
       const res = await fetch("/api/upload", { method: "POST", body: form });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
+      if (mySequence !== uploadSequence) {
+        // a newer upload started (and possibly already finished) while
+        // this one's request was in flight - this response is stale no
+        // matter when it happens to arrive; discard it rather than let it
+        // clobber whatever the truly latest upload already set.
+        return;
+      }
       state.fileId = data.file_id;
       state.filename = data.filename;
       uploadZone.querySelector(".primary").textContent = "Drop an audio file, or click to browse";
@@ -300,10 +346,13 @@
 
       $("workspace").classList.add("active");
       $("results").classList.remove("active");
+      $("preprocessGrid").classList.remove("hidden");
       renderToolChain();
       await runAnalysis();
     } catch (err) {
-      uploadZone.querySelector(".primary").textContent = "Upload failed — try again";
+      if (mySequence === uploadSequence) {
+        uploadZone.querySelector(".primary").textContent = "Upload failed — try again";
+      }
       console.error(err);
     }
   }
@@ -315,7 +364,49 @@
   }
 
   // ---------- analysis ----------
+  // BUG FIX (direct user report): the Detector Analysis panel (score
+  // cards, stat list, spectrum/waveform charts) kept showing the PREVIOUS
+  // file's numbers while a new file's analysis was still in flight - the
+  // "Analyzing audio..." banner rendered ABOVE that stale content in
+  // normal document flow, not as an overlay covering it, so both were
+  // simultaneously visible and looked like the new file was already
+  // scored. Clear every field this function populates back to a neutral
+  // "—" placeholder state immediately when analysis starts, before the
+  // fetch even goes out, so nothing carries over between files.
+  function clearAnalysisDisplay() {
+    $("linearScore").textContent = "—";
+    $("linearScore").className = "value mono";
+    $("linearMeter").style.width = "0%";
+    $("linearMeter").className = "meter-fill";
+    $("linearPill").innerHTML = "";
+    $("cnnScore").textContent = "—";
+    $("cnnScore").className = "value mono";
+    $("cnnMeter").style.width = "0%";
+    $("cnnMeter").className = "meter-fill";
+    $("cnnPill").innerHTML = "";
+    $("statList").innerHTML = "";
+    const specCtx = $("spectrumCanvas").getContext("2d");
+    specCtx.clearRect(0, 0, $("spectrumCanvas").width, $("spectrumCanvas").height);
+    const waveCtx = $("waveformOverviewCanvas").getContext("2d");
+    waveCtx.clearRect(0, 0, $("waveformOverviewCanvas").width, $("waveformOverviewCanvas").height);
+    $("waveformDuration").textContent = "";
+    $("spectrumLegend").classList.remove("active");
+    $("waveformLegend").classList.remove("active");
+  }
+
+  // BUG FIX (adversarial audit): runAnalysis had no way to tell, once its
+  // fetch resolved, whether the user had since uploaded a NEWER file while
+  // this (older, possibly slower) analysis was still in flight - if
+  // analysis A returns after a newer analysis B already updated the
+  // display, A's stale results silently overwrite B's current ones even
+  // though state.fileId correctly shows B's id the whole time. Capture the
+  // fileId THIS call is analyzing and only apply its response if that's
+  // still the current file when the response lands; otherwise discard it
+  // quietly - a real, if rare, race (rapid re-upload, or a slow analysis
+  // on a large file followed immediately by a smaller/faster one).
   async function runAnalysis() {
+    const requestedFileId = state.fileId;
+    clearAnalysisDisplay();
     $("analyzingState").classList.add("active");
     const startedAt = performance.now();
     const tick = setInterval(() => {
@@ -325,15 +416,31 @@
         : `Analyzing audio (running AI detectors, spectral checks)… ${secs}s`;
     }, 1000);
     try {
-      const res = await fetch(`/api/analyze/${state.fileId}`);
+      const res = await fetch(`/api/analyze/${requestedFileId}`);
       const data = await res.json();
+      if (state.fileId !== requestedFileId) {
+        // a newer upload superseded this one while the fetch was in
+        // flight - discard these now-stale results instead of clobbering
+        // whatever the current file's own analysis already rendered (or
+        // will render, if its own runAnalysis call is still in flight too).
+        return;
+      }
       state.analysis = data;
       renderAnalysis(data);
       state.selected = new Set(data.recommended_tools);
       renderToolChain();
     } finally {
+      // the interval timer belongs ONLY to this call and must always be
+      // cleared regardless of staleness (leaving it running would leak a
+      // timer forever) - but the shared "analyzing..." banner should only
+      // be hidden by whichever call is actually still current, so a
+      // slower stale request finishing after a newer one doesn't
+      // incorrectly clear the spinner out from under a still-in-flight
+      // current analysis.
       clearInterval(tick);
-      $("analyzingState").classList.remove("active");
+      if (state.fileId === requestedFileId) {
+        $("analyzingState").classList.remove("active");
+      }
     }
   }
 
@@ -376,20 +483,42 @@
     const dcMax = Math.max(Math.abs(data.dc_offset.l), Math.abs(data.dc_offset.r));
     const stats = [
       {
+        // BUG FIX (adversarial audit): this used a wider "good" band
+        // (-16 to -12) than the backend's own /api/analyze recommendation
+        // logic (only -17..-13 OR -15..-15 count as fine, everything else
+        // recommends normalize_lufs) - confirmed directly a value like
+        // -12.5 was recommended for correction by the backend but marked
+        // "good" here. Match the backend's exact acceptance range.
         k: "LUFS (integrated)", v: `${data.lufs.toFixed(1)} LU`, info: "lufs",
-        status: (data.lufs >= -16 && data.lufs <= -12) ? "good" : (data.lufs < -20 || data.lufs > -8) ? "warn" : null,
+        status: ((data.lufs >= -17 && data.lufs <= -13)) ? "good" : (data.lufs < -20 || data.lufs > -8) ? "warn" : null,
       },
       {
         k: "Stereo correlation", v: data.stereo_correlation.toFixed(2), info: "stereo_correlation",
         status: data.stereo_correlation >= 0.3 ? "good" : data.stereo_correlation < 0.1 ? "bad" : "warn",
       },
       {
+        // BUG FIX (adversarial audit): this used a completely different
+        // bar (0.001) than the backend's own /api/analyze recommendation
+        // threshold (6e-5, DC_OFFSET_RECHECK_FLOOR in server.py) -
+        // confirmed directly a value like 0.0005 was recommended for
+        // correction by the backend but shown as "Safe" here. Match the
+        // backend's exact threshold so the two never contradict each
+        // other on the same page again.
         k: "DC offset (L/R)", v: `${data.dc_offset.l.toFixed(5)} / ${data.dc_offset.r.toFixed(5)}`, info: "dc_offset",
-        status: dcMax < 0.001 ? "good" : dcMax > 0.01 ? "warn" : null,
+        status: dcMax > 6e-5 ? "warn" : "good",
       },
       {
+        // BUG FIX (direct user report): this fired on ANY nonzero value,
+        // while the backend's own /api/analyze recommendation logic uses a
+        // 100ms bar (deliberately set there to tolerate genuinely
+        // inaudible processing residue from resample/interpolation
+        // round-trips elsewhere in the pipeline) - so this panel could
+        // show a "Check" pill for a value (e.g. 30.5ms/69ms) the backend
+        // itself had ALREADY decided needs no action and wouldn't even
+        // recommend trim_silence for. Same 100ms bar here so the two
+        // don't contradict each other on the same page.
         k: "Leading/trailing silence", v: `${data.silence.lead_ms || 0}ms / ${data.silence.trail_ms || 0}ms`, info: "silence_trim",
-        status: ((data.silence.lead_ms || 0) > 0 || (data.silence.trail_ms || 0) > 0) ? "warn" : "good",
+        status: ((data.silence.lead_ms || 0) > 100 || (data.silence.trail_ms || 0) > 100) ? "warn" : "good",
       },
       {
         k: "Transients detected", v: data.transients.length, info: "transients",
@@ -655,12 +784,31 @@
             <div class="cnn-mode-hint">Higher values are untested for audibility - lower this if you notice anything.</div>
           </div>`;
         }
+        // BUG FIX (Codex MAJOR / Fable B3, verified directly): multiband_compress
+        // is deliberately gentle (least-change-necessary by design) and can take
+        // several passes to fully clear its own recommendation on a strongly
+        // peaky file - a flat repeated "Recommended" badge with no further
+        // context looked like the tool wasn't doing anything, when in fact real,
+        // measurable progress (peak_over_db decaying) was happening every pass.
+        // Surface the actual per-band numbers (from /api/analyze's band_peakiness)
+        // so a re-upload after one pass shows real headroom remaining, not just
+        // an unqualified repeat of the same badge.
+        let peakinessHint = "";
+        if (t.id === "multiband_compress" && recommended && state.analysis && state.analysis.band_peakiness) {
+          const worstBand = state.analysis.band_peakiness.reduce(
+            (a, b) => (b.peak_over_db > a.peak_over_db ? b : a)
+          );
+          if (worstBand.peak_over_db > 0) {
+            peakinessHint = `<div class="cnn-mode-hint">Still ${worstBand.peak_over_db.toFixed(1)}dB over target in the ${worstBand.range_hz[0]}-${worstBand.range_hz[1]}Hz band - gentle by design, may take another pass or two to fully clear.</div>`;
+          }
+        }
         return `
         <div class="tool-row ${checked ? "checked" : ""}" data-tool="${t.id}">
           <div class="box"></div>
           <div class="info">
             <div class="name">${t.name}${t.info ? infoBtn(t.info) : ""}${recommended ? `<span class="rec-badge">Recommended</span>` : ""}</div>
             <div class="desc">${t.desc}</div>
+            ${peakinessHint}
             ${settingsRow}
           </div>
         </div>`;
@@ -773,6 +921,16 @@
 
   $("runBtn").addEventListener("click", async () => {
     if (!state.fileId || state.selected.size === 0) return;
+    // BUG FIX (third adversarial audit round): $("logBox").innerHTML = ""
+    // clears the VISIBLE log, but seenLogCount (the cursor pollJob uses to
+    // only append NEW lines each poll) is a separate, persistent variable
+    // that was never reset alongside it. Running a second job in the same
+    // page session without a full reload left seenLogCount holding
+    // whatever count the FIRST job reached - pollJob would then slice the
+    // new job's much-shorter log array against that stale, larger cursor,
+    // silently dropping every one of its early lines until the new job's
+    // own log caught up past the old count.
+    seenLogCount = 0;
     $("progressPanel").classList.add("active");
     $("results").classList.remove("active");
     $("logBox").innerHTML = "";
@@ -857,7 +1015,15 @@
     // reading it back it's easy to see why: "Step 12 of 12 (optimization
     // step 90 of 300...)" looks like one counter contradicting itself, not
     // two different things. Render them as two separate lines instead.
+    // BUG FIX (direct user report): "Tool 10 of 13" alone doesn't say
+    // WHICH tool is running - during a long CNN/linear optimization the
+    // user is watching "Optimization step 2 of 488" with no indication in
+    // that same line whether this is the linear or CNN model being fixed.
+    // current_step_name already holds the real tool label (rendered
+    // separately in progressStepLabel above) - fold it in here too so the
+    // step-count line is self-sufficient on its own.
     let stepText = `Tool ${idx + 1} of ${total}`;
+    if (data.current_step_name) stepText += ` (${data.current_step_name})`;
     let subText = "";
     if (data.sub_progress && data.sub_progress.total) {
       const sp = data.sub_progress;
@@ -903,7 +1069,7 @@
     [/^cnn: verifying final transferred stereo output against the real model$/, () => "Double-checking the CNN fix on the actual file you'll receive"],
     [/^cnn: worst window after transfer scored ([\d.]+)% AI$/, (m) => {
       const pct = Number(m[1]);
-      return { text: `Checked against the real detector: worst window ${m[1]}% AI-likely`, badge: pct < 8 ? "pass" : "retry" };
+      return { text: `Checked against the real detector: worst window ${m[1]}% AI-likely`, badge: pct < 8 ? "margin" : "retry" };
     }],
     [/^cnn: no windows survived the post-transfer check.*$/, () => ({ text: "Could not verify any window after transfer - track may be too short", badge: "fail" })],
     [/^re-verifying linear model after full chain.*$/, () => "Double-checking the linear fix still holds after mastering"],
@@ -914,10 +1080,14 @@
     [/^\s*above target - re-running linear_fix.*$/, () => ({ text: "Still above target - running the linear fix once more", badge: "retry" })],
     [/^\s*post-chain cnn score: ([\d.]+)%$/, (m) => {
       const pct = Number(m[1]);
-      return { text: `CNN model result: ${m[1]}% AI-likely`, badge: pct < 8 ? "pass" : "retry" };
+      return { text: `CNN model result: ${m[1]}% AI-likely`, badge: pct < 8 ? "margin" : "retry" };
     }],
     [/^\s*cnn lost its safety margin.*$/, () => ({ text: "The CNN fix slipped after a later step - running it again", badge: "retry" })],
     [/^temporal_normalize: note .*$/, () => "Temporal denormalization stayed in place; a later safety correction ran before the final watermark (this exact combination is unbenchmarked)"],
+    [/^\s*found (\d+) new anomal(?:y|ies) introduced by later chain stages.*$/, (m) => ({
+      text: `Transient/pop fix: found ${m[1]} new anomal${m[1] === "1" ? "y" : "ies"} from later steps - fixing`,
+      badge: "retry",
+    })],
     [/^fix_transients: final (pass|check) \((\d+) anomal(?:y|ies) after full chain\)$/, (m) => ({
       text: `Transient/pop fix: ${m[2]} anomal${m[2] === "1" ? "y" : "ies"} remain after the full chain`,
       badge: m[1] === "pass" ? "pass" : "retry",
@@ -946,6 +1116,7 @@
     [/^re-scoring with AI detectors$/, () => "Running the final check with both AI detectors"],
     [/^WARNING: final file still flagged by at least one model \((.+)\)$/, (m) => ({ text: `Heads up: still flagged by at least one detector (${m[1]})`, badge: "fail" })],
     [/^\s*WARNING: linear regressed.*$/, () => ({ text: "Heads up: the linear score slipped a bit after a later step", badge: "fail" })],
+    [/^\s*WARNING: cnn regressed.*$/, () => ({ text: "Heads up: the CNN score slipped again after the loudness limiter re-ran - the delivered file may still be flagged", badge: "fail" })],
     [/^\s*WARNING: delivered file is ([\-\d.]+) LUFS.*$/, (m) => `Heads up: couldn't fully reach the loudness target (landed at ${m[1]} LUFS) without exceeding the peak safety ceiling`],
     [/^complete$/, () => "All done"],
     [/^cancelled by user$/, () => ({ text: "Job cancelled", badge: "fail" })],
@@ -960,7 +1131,7 @@
     return null;
   }
 
-  const LOG_BADGE_LABEL = { pass: "PASS", retry: "RETRY", fail: "FLAGGED" };
+  const LOG_BADGE_LABEL = { pass: "PASS", retry: "RETRY", fail: "FLAGGED", margin: "WITHIN TARGET" };
 
   function appendLog(msg, isErr) {
     const box = $("logBox");
@@ -995,11 +1166,26 @@
   }
 
   let seenLogCount = 0;
+  // BUG FIX (third adversarial audit round): pollJob captured state.jobId
+  // only implicitly (reading it fresh each recursive setTimeout call), but
+  // a single in-flight fetch has no record of WHICH job it was requested
+  // for - if the user cancels and starts a new job while an old poll's
+  // request is still in flight, that stale response lands with no way to
+  // tell it apart from the current job's own response, and would
+  // overwrite seenLogCount/progress/results with data for a job that's no
+  // longer the one being watched.
   async function pollJob() {
     if (!state.jobId) return;
+    const polledJobId = state.jobId;
     try {
-      const res = await fetch(`/api/job/${state.jobId}`);
+      const res = await fetch(`/api/job/${polledJobId}`);
       const data = await res.json();
+      if (state.jobId !== polledJobId) {
+        // a newer job started while this request was in flight - this
+        // response describes a job that's no longer current; discard it
+        // rather than let it clobber the actually-current job's state.
+        return;
+      }
 
       const newLines = data.log.slice(seenLogCount);
       seenLogCount = data.log.length;
@@ -1035,6 +1221,17 @@
   // ---------- results ----------
   function renderResults(result) {
     $("results").classList.add("active");
+    // BUG FIX (direct user report): the pre-processing "Detector Analysis"
+    // panel (left column of the upload/tool-picker grid) had no visibility
+    // gating at all - it stayed on screen showing the ORIGINAL file's
+    // scores/transient count forever, even once real post-processing
+    // results were shown right below/beside it. Confirmed directly this
+    // read as instrument disagreement ("why does it say CNN 0.0% here but
+    // 2.5% down there") when it was actually just a stale pre-job snapshot
+    // with nothing distinguishing it from current state. Hide it the
+    // moment real results are available - runAnalysis()/resetWorkspace()
+    // already show it again for the next file.
+    $("preprocessGrid").classList.add("hidden");
 
     const passBanner = $("verdictBanner");
     $("verdictFilename").textContent = state.filename || "";
@@ -1055,13 +1252,29 @@
     const rows = [
       ["Linear model score", `${result.scores_before.linear_pct.toFixed(3)}%`, `${result.scores_after.linear_pct.toFixed(3)}%`, result.scores_after.passes_linear, "linear_passes"],
       ["CNN model score", `${result.scores_before.cnn_pct.toFixed(1)}%`, `${result.scores_after.cnn_pct.toFixed(1)}%`, result.scores_after.passes_cnn, "cnn_passes"],
+      // BUG FIX (second adversarial audit round): this used a WIDER
+      // "good" band (-16..-12) than /api/analyze's own recommendation
+      // logic (-17..-13) - confirmed directly a delivered file at -12.5
+      // LUFS showed "good" here but got recommended for normalize_lufs
+      // again the moment that same file was re-uploaded. The earlier fix
+      // this session only synchronized the PRE-processing analysis
+      // panel's threshold, reasoning the results table served a
+      // different purpose (did the tool hit its own delivery bar) - that
+      // reasoning doesn't survive contact with a user re-uploading their
+      // own output and seeing a direct contradiction. Match exactly.
       ["Integrated LUFS", `${result.lufs_before.toFixed(1)}`, `${result.lufs_after.toFixed(1)}`,
-       (result.lufs_after >= -16 && result.lufs_after <= -12) ? "good" : (result.lufs_after < -20 || result.lufs_after > -8) ? "bad" : "warn", "lufs"],
+       (result.lufs_after >= -17 && result.lufs_after <= -13) ? "good" : (result.lufs_after < -20 || result.lufs_after > -8) ? "bad" : "warn", "lufs"],
       ["Stereo correlation", result.stereo_correlation_before != null ? result.stereo_correlation_before.toFixed(2) : "—",
        result.stereo_correlation_after != null ? result.stereo_correlation_after.toFixed(2) : "—",
        result.stereo_correlation_after != null ? result.stereo_correlation_after >= 0.1 : null, "stereo_correlation"],
+      // BUG FIX (second adversarial audit round): same class of gap as
+      // LUFS above - this used 0.001 while /api/analyze's own
+      // recommendation floor is 6e-5 (DC_OFFSET_RECHECK_FLOOR in
+      // server.py, itself calibrated against real measured MP3 encoder
+      // noise). Confirmed directly a delivered value of 0.0005 passed
+      // here but triggered a dc_offset recommendation on re-upload.
       ["DC offset (max L/R)", dcMaxBefore != null ? dcMaxBefore.toFixed(5) : "—", dcMaxAfter != null ? dcMaxAfter.toFixed(5) : "—",
-       dcMaxAfter != null ? dcMaxAfter < 0.001 : null, "dc_offset"],
+       dcMaxAfter != null ? dcMaxAfter < 6e-5 : null, "dc_offset"],
       ["Transients detected", result.transients_found ? (result.transients_found.length + (result.transients_found.length ? " (fixed)" : "")) : "—",
        result.transients_after_count != null ? result.transients_after_count : "—",
        result.transients_after_count != null ? result.transients_after_count === 0 : null, "transients"],

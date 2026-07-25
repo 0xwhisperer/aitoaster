@@ -308,6 +308,28 @@ def analyze(file_id):
     has_embedded_images = any(s["is_attached_image"] for s in metadata["streams"])
     has_rolloff, rolloff_cutoff_hz, rolloff_deficit_db = chain.detect_spectral_rolloff(audio, 44100)
 
+    # BUG FIX: high_pass/multiband_compress/true_peak_limit used to be
+    # unconditionally recommended on EVERY file, with no check for whether
+    # they'd actually do anything - meaning a file this app already
+    # processed (or one that never needed them) would always show these
+    # as "recommended" again, which is never an honest signal. Run each
+    # tool's own real check (same function the pipeline itself uses) and
+    # only recommend it if it reports it would actually change something.
+    _, high_pass_check_info = chain.high_pass_filter(audio, 44100, cutoff_hz=30)
+    _, true_peak_check_info = chain.true_peak_limit(audio, 44100, ceiling_db=-1.0)
+    # BUG FIX (direct user report): multiband_compress used to be checked
+    # the same way as high_pass/true_peak - run the tool itself and see if
+    # its own gain math found anything - but that's the wrong question for
+    # a genuinely gentle, diminishing-returns tool (ratio=1.3 by design).
+    # Verified directly: repeatedly running multiband_compress on its own
+    # output barely reduced its own reported max_reduction_db pass over
+    # pass, so it kept recommending itself almost indefinitely on a real
+    # peaky file. detect_band_peakiness measures the FILE's own actual
+    # condition (how much of its duration is spent meaningfully over
+    # threshold in each band) instead of the compressor's own trace - see
+    # that function's docstring for the full comparison data.
+    band_peakiness = chain.detect_band_peakiness(audio, 44100)
+
     recommendations = []
     if metadata["format"] or any(s["tags"] for s in metadata["streams"]) or has_embedded_images:
         recommendations.append("strip_metadata")
@@ -317,19 +339,65 @@ def analyze(file_id):
         recommendations.append("linear_fix")
     if scores["cnn"]["probability"] >= 0.5:
         recommendations.append("cnn_fix")
-    if abs(dc[0]) > 1e-5 or abs(dc[1]) > 1e-5:
+    # DC_OFFSET_RECHECK_FLOOR (module-level constant, see its own
+    # definition above TOOL_ORDER for the full measured justification -
+    # MP3 lossy quantization noise floor) is shared with _tool_status_line
+    # so the live per-tool log line and this recommendation logic can
+    # never independently drift again.
+    #
+    # BUG FIX (Grok #10, verified against the measurement this floor was
+    # originally derived from): DC_OFFSET_RECHECK_FLOOR was measured
+    # specifically from MP3 ENCODER-introduced DC bias (~2e-6 to ~3.5e-5
+    # across synthetic tones) - it exists to stop a lossy round-trip from
+    # re-flagging bias the encoder itself introduced, not the app. That
+    # justification only applies to a LOSSY upload; a lossless upload
+    # (WAV/FLAC/AIFF - no lossy encoder in its own history) has no such
+    # noise floor to tolerate, so applying the same 6x-looser bar to it
+    # uniformly meant a genuine ~3e-5 DC offset on a lossless file (well
+    # above this app's original, tighter 1e-5 bar) could go unflagged for
+    # no reason tied to how that specific file was actually produced.
+    # LOSSLESS_UPLOAD_EXTENSIONS intentionally lists containers with no
+    # lossy-encode step in their own provenance; anything else (mp3, aac,
+    # ogg, opus, m4a, etc.) keeps the original MP3-derived floor, since an
+    # uploaded lossy file already carries whatever bias ITS OWN encoder
+    # introduced, matching the exact case this floor was measured for.
+    dc_floor = (
+        DC_OFFSET_LOSSLESS_RECHECK_FLOOR
+        if path.suffix.lower() in LOSSLESS_UPLOAD_EXTENSIONS
+        else DC_OFFSET_RECHECK_FLOOR
+    )
+    if abs(dc[0]) > dc_floor or abs(dc[1]) > dc_floor:
         recommendations.append("dc_offset")
-    if silence_info.get("lead_ms", 0) > 20 or silence_info.get("trail_ms", 0) > 20:
+    # BUG FIX: 20ms was tight enough to flag genuinely inaudible residue
+    # (a few tens of milliseconds left over from resample/interpolation
+    # round-trips elsewhere in this pipeline - CQT transfer, temporal
+    # denormalization, etc.) as "still needs trimming," which meant a file
+    # this app already trimmed could still show this as recommended again.
+    # 100ms is comfortably above that kind of processing residue while
+    # still well below anything a listener would perceive as a real gap.
+    if silence_info.get("lead_ms", 0) > 100 or silence_info.get("trail_ms", 0) > 100:
         recommendations.append("trim_silence")
     if transients:
         recommendations.append("fix_transients")
     if correlation < 0.1:
         recommendations.append("fix_phase")
-    if not (-15 <= lufs <= -13) and not (-17 <= lufs <= -15):
+    if not (LUFS_GOOD_LOW <= lufs <= LUFS_GOOD_HIGH):
         recommendations.append("normalize_lufs")
-    recommendations.append("high_pass")
-    recommendations.append("multiband_compress")
-    recommendations.append("true_peak_limit")
+    if high_pass_check_info.get("applied"):
+        recommendations.append("high_pass")
+    # FRAC_TIME_OVER_RECOMMEND_FLOOR: measured directly, a genuinely-fine
+    # real file (already processed by this app) spent at most ~1.3% of its
+    # duration meaningfully over threshold in any band (a brief transient,
+    # not real imbalance), while a deliberately-built peaky test signal
+    # spent 16-25%. 2% sits comfortably above the well-mastered file's
+    # real noise floor while well below the genuinely-peaky signal's
+    # range, so a brief transient doesn't trigger a recommendation but
+    # real, sustained tonal imbalance does.
+    FRAC_TIME_OVER_RECOMMEND_FLOOR = 0.02
+    if any(b["frac_time_over"] > FRAC_TIME_OVER_RECOMMEND_FLOOR for b in band_peakiness):
+        recommendations.append("multiband_compress")
+    if true_peak_check_info.get("applied"):
+        recommendations.append("true_peak_limit")
 
     return safe_jsonify({
         "file_id": file_id,
@@ -347,6 +415,21 @@ def analyze(file_id):
         "has_embedded_images": has_embedded_images,
         "spectral_rolloff": {"detected": has_rolloff, "cutoff_hz": rolloff_cutoff_hz, "deficit_db": round(rolloff_deficit_db, 1)},
         "recommended_tools": recommendations,
+        "band_peakiness": band_peakiness,
+        # BUG FIX (Codex MAJOR / Fable B3, verified directly): multiband_compress
+        # is deliberately gentle (ratio=1.3, "least change necessary" by design -
+        # see its own docstring) and can take 4-5 passes to fully clear a
+        # strongly peaky signal's frac_time_over recommendation bar, even though
+        # peak_over_db decays geometrically and genuinely every single pass.
+        # Making the tool more aggressive to converge in one pass would trade
+        # away that documented design goal; the actual bug the audits caught is
+        # that the UI had no way to SHOW that real progress even though the
+        # flat "still recommended" signal stays true across several passes.
+        # Expose the underlying per-band peak_over_db numbers (not just the
+        # boolean recommendation) so a re-upload after one pass can say
+        # "still peaky, but improved from 5.9dB to 5.0dB over" instead of
+        # repeating an unqualified "run multiband_compress again" with no
+        # indication whether the last pass did anything at all.
         "passes_both": scores["passes_both"],
     })
 
@@ -381,6 +464,83 @@ def analyze(file_id):
 # (linear) LAST means ITS re-verify pass is the final safety net, rather
 # than leaving the slow/expensive fix (cnn) unprotected at the very end of
 # the chain, which is what the previous order did.
+# Post-chain re-verification margins. linear_fix and cnn_fix already certify
+# their output below a real_target threshold (0.008-0.01 for linear, 0.08 for
+# cnn) before they hand off - that certification is the whole point of their
+# worst-shift-scan verification loops. But the post-chain rechecks further
+# down this file used the SAME numbers as the re-trigger point, with zero
+# margin between "just certified" and "treat as regressed." Neither
+# temporal_normalize nor true_peak_limit touch the frequency bands either
+# detector model attends to (temporal warp is sub-audio-sample interpolation
+# noise; the limiter only touches isolated peak samples), so any score
+# movement they cause post-certification is floating-point/dither-level, not
+# a real regression - but with zero margin, that noise alone was enough to
+# re-trigger a full expensive re-run (Thorough-mode cnn_fix included) every
+# single time, even when the file was already genuinely fine. Confirmed
+# directly: this is why real production jobs were burning a full second
+# cnn_fix pass (and sometimes a third) on files that never actually needed
+# one - "3 of 4 passes do nothing but take time" per direct user report.
+# These margins give real headroom above the optimizers' own certified
+# targets before paying for a full re-run, while still catching genuine
+# regressions (which move scores by whole percentage points, not noise).
+# BUG FIX (adversarial audit, verified directly): these margins were
+# originally sized to make a specific noise-triggered false-positive
+# symptom go away, without measuring what real benign downstream drift
+# actually looks like - the audit caught that a genuine 1.9% linear score
+# (0.01+0.01=0.02 threshold, so 0.019 stays silently under it) or a
+# genuine 10% CNN score (0.08+0.05=0.13, so 0.10 stays under it) would
+# NOT re-trigger, even though both are real, meaningful regressions by
+# this app's own stated safety-margin philosophy. Measured directly what
+# benign downstream noise ACTUALLY looks like: a tiny gain-only mutation
+# (simulating true_peak_limit) moved linear by ~0.0006 percentage points
+# and CNN by ~0.033 percentage points; a full real MP3 round-trip moved
+# linear by ~0.00005 and CNN by ~0.037 percentage points. Both are two
+# orders of magnitude smaller than the old margins. These new margins
+# keep real headroom (roughly 10-20x the measured noise floor) above that
+# actual measured drift while catching real regressions like the audit's
+# 0.019/0.10 examples, which the old margins let through entirely.
+LINEAR_RECHECK_MARGIN = 0.001   # linear target 0.01 -> re-trigger at 0.011
+CNN_RECHECK_MARGIN = 0.005      # cnn target 0.08 -> re-trigger at 0.085
+
+# BUG FIX (third adversarial audit round, verified directly): this used to
+# be a LOCAL variable defined only inside the /api/analyze endpoint - which
+# meant _tool_status_line (the live per-tool log line shown DURING a job)
+# had its own separate, stale 0.001 threshold with no way to reference the
+# real one. Confirmed directly: a file could log "dc_offset: pass" during
+# the run using the old 0.001 bar, then get re-recommended for dc_offset
+# the moment that same delivered file was re-uploaded and checked against
+# the real 6e-5 floor - the exact "results claim success but re-analysis
+# disagrees" contradiction this session has repeatedly had to fix in other
+# tools. Promoted to a real module-level constant so every consumer
+# (analyze recommendations, the live status line, and any future caller)
+# references the same single source of truth.
+DC_OFFSET_RECHECK_FLOOR = 6e-5
+
+# BUG FIX (Grok #10, verified against server.py's own DC_OFFSET_RECHECK_FLOOR
+# measurement): that floor was derived specifically from MP3 encoder noise
+# and is too loose for a genuinely lossless upload, which has no such noise
+# to tolerate. Restores this app's original, tighter pre-MP3-measurement bar
+# (1e-5) for lossless source containers only - see the DC_OFFSET_RECHECK_FLOOR
+# recommendation site in /api/analyze for the full reasoning and the
+# per-format selection.
+DC_OFFSET_LOSSLESS_RECHECK_FLOOR = 1e-5
+LOSSLESS_UPLOAD_EXTENSIONS = {".wav", ".flac", ".aiff", ".aif", ".alac"}
+
+# BUG FIX (fourth adversarial audit round, Grok/Fable, verified directly by
+# grep before fixing): same bug class as DC_OFFSET_RECHECK_FLOOR above, one
+# instance missed - _tool_status_line's normalize_lufs branch had its own
+# separate, stale -16..-12 bar, hardcoded independently of the real
+# -17..-13 bar already used by /api/analyze's recommendation logic and (per
+# an earlier fix this session) both frontend result tables. Confirmed
+# directly: a delivered file at -12.5 LUFS would log "pass" during the run
+# (inside the old -16..-12 bar) and then get immediately re-recommended for
+# normalize_lufs on re-upload/re-analysis (outside the real -17..-13 bar) -
+# the exact "log says pass, re-analysis disagrees" contradiction this
+# session has repeatedly had to fix elsewhere. Promoted to real
+# module-level constants, referenced by both consumers.
+LUFS_GOOD_LOW = -17.0
+LUFS_GOOD_HIGH = -13.0
+
 TOOL_ORDER = [
     "strip_metadata", "trim_silence", "dc_offset", "fix_transients",
     "spectral_revive", "high_pass",
@@ -441,7 +601,7 @@ def _tool_status_line(tool, info):
 
     if tool == "dc_offset":
         dc_after_max = max(abs(info.get("dc_l_after", 0.0)), abs(info.get("dc_r_after", 0.0))) if applied else 0.0
-        return f"{'pass' if dc_after_max < 0.001 else 'check'} (max L/R after: {dc_after_max:.5f})"
+        return f"{'pass' if dc_after_max < DC_OFFSET_RECHECK_FLOOR else 'check'} (max L/R after: {dc_after_max:.5f})"
 
     if tool == "fix_transients":
         count = info.get("count", 0)
@@ -470,7 +630,7 @@ def _tool_status_line(tool, info):
         lufs_after = info.get("lufs_after")
         if lufs_after is None:
             return "pass (no change needed)"
-        ok = -16 <= lufs_after <= -12
+        ok = LUFS_GOOD_LOW <= lufs_after <= LUFS_GOOD_HIGH
         return f"{'pass' if ok else 'check'} ({lufs_after:.1f} LUFS)"
 
     if tool == "multiband_compress":
@@ -705,14 +865,30 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         # the linear model is still above target, re-run linear_fix ONE more
         # time (cheap relative to cnn_fix) rather than silently shipping a
         # result that's worse than what linear_fix itself already achieved.
-        if "linear_fix" in tools and "cnn_fix" in tools:
-            job_log(job_id, "re-verifying linear model after full chain (cnn_fix can disturb it)")
+        # BUG FIX (direct user report, real production job): this used to
+        # require BOTH linear_fix AND cnn_fix to be selected before EITHER
+        # re-verification pass below would run at all - so a job that only
+        # selected linear_fix got NO post-chain safety net whatsoever.
+        # Confirmed directly: linear_fix verified 0.006% mid-chain, but
+        # temporal_normalize/true_peak_limit/watermark all ran after it with
+        # nothing checking the actual delivered file, which shipped at
+        # 9.02% - a large, completely unverified regression, on a job that
+        # never even selected cnn_fix. Each recheck below now gates ONLY on
+        # its OWN tool being selected, independently - linear_fix alone
+        # still gets checked and can still trigger a redo even when cnn_fix
+        # was never part of the run.
+        if "linear_fix" in tools:
+            job_log(job_id, "re-verifying linear model after full chain (later stages can disturb it)")
             recheck_path = OUTPUT_DIR / f"_recheck_{uuid.uuid4().hex[:8]}.wav"
             try:
                 save_stereo(recheck_path, audio, sr)
                 recheck_score = scorer.linear.predict(str(recheck_path))["probability"]
                 job_log(job_id, f"  post-chain linear score: {recheck_score * 100:.3f}%")
-                if recheck_score >= 0.01:
+                # LINEAR_RECHECK_MARGIN (see its definition above TOOL_ORDER):
+                # linear_fix's own target is 0.01, so re-triggering at that
+                # exact number meant benign downstream dither alone was
+                # enough to force a full needless re-run every time.
+                if recheck_score >= 0.01 + LINEAR_RECHECK_MARGIN:
                     check_cancelled(job_id)
                     job_log(job_id, "  above target - re-running linear_fix once more on the final signal")
                     from .linear_fix import fix_linear
@@ -740,12 +916,28 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                     # actually stays under its ceiling, rather than only having
                     # been checked against audio that predates this correction.
                     if "true_peak_limit" in tools:
-                        job_log(job_id, "re-running true-peak limiter after re-verification pass")
+                        # BUG FIX (direct user report, real production job):
+                        # this used to call the FULL true_peak_limit, whose
+                        # oversample/downsample round-trip (only triggered
+                        # when actual limiting is needed) introduces real
+                        # broadband reconstruction noise across the whole
+                        # signal - measured directly at up to -46dB, exactly
+                        # the magnitude this session has repeatedly found
+                        # disturbs a fragile CNN/linear-optimized correction.
+                        # A re-verification safety pass only needs to
+                        # guarantee no raw digital clipping ships, not full
+                        # inter-sample-peak-aware, dynamics-preserving
+                        # limiting - sample_peak_safety_clamp achieves that
+                        # with a flat scale (no resampling at all), and is a
+                        # true no-op (byte-identical output) when nothing
+                        # actually needs clamping, unlike true_peak_limit's
+                        # resample-based approach.
+                        job_log(job_id, "re-running peak safety clamp after re-verification pass")
                         t0 = time.time()
-                        audio, limiter_info = chain.true_peak_limit(
-                            audio, sr, ceiling_db=options.get("ceiling_db", -1.0))
+                        audio, limiter_info = chain.sample_peak_safety_clamp(
+                            audio, ceiling_db=options.get("ceiling_db", -1.0))
                         limiter_info["tool"] = "true_peak_limit_reverify"
-                        limiter_info["label"] = "True-peak limiter (post-reverification safety pass)"
+                        limiter_info["label"] = "Peak safety clamp (post-reverification safety pass)"
                         limiter_info["elapsed_sec"] = round(time.time() - t0, 2)
                         steps.append(limiter_info)
                         job_log(job_id, f"  done ({limiter_info['elapsed_sec']}s)")
@@ -753,30 +945,40 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 if recheck_path.exists():
                     recheck_path.unlink()
 
-            # CNN re-check must run UNCONDITIONALLY here, not only inside the
-            # "linear needed a redo" branch above - confirmed directly on a
-            # real production run where linear was ALREADY fine post-chain
-            # (0.155%, no redo triggered) and this whole check was skipped
-            # entirely, so nothing ever re-verified cnn after true_peak_limit
-            # ran. cnn_fix's own internal check had reached a genuine pass
-            # (1.09%), but the delivered file scored 99.7% - the limiter
-            # alone was enough to disturb it, independent of whether linear
-            # needed anything. This is the SAME class of bug fixed once
-            # before (a 48%-internal result shipping as 99.9% when linear DID
-            # need a redo) - that fix was scoped too narrowly and only closed
-            # half the gap. Always check the truly final audio, full stop.
+        # CNN re-check must run whenever cnn_fix was selected, not only
+        # inside the "linear needed a redo" branch above - confirmed
+        # directly on a real production run where linear was ALREADY
+        # fine post-chain (0.155%, no redo triggered) and this whole
+        # check was skipped entirely, so nothing ever re-verified cnn
+        # after true_peak_limit ran. cnn_fix's own internal check had
+        # reached a genuine pass (1.09%), but the delivered file scored
+        # 99.7% - the limiter alone was enough to disturb it,
+        # independent of whether linear needed anything. This is the
+        # SAME class of bug fixed once before (a 48%-internal result
+        # shipping as 99.9% when linear DID need a redo) - that fix was
+        # scoped too narrowly and only closed half the gap. Always check
+        # the truly final audio, full stop - but only when cnn_fix was
+        # actually part of this run (the outer if above now also covers
+        # linear_fix-only jobs, which have nothing CNN-related to
+        # recheck here).
+        if "cnn_fix" in tools:
             check_cancelled(job_id)
             cnn_recheck_path = OUTPUT_DIR / f"_cnn_recheck_{uuid.uuid4().hex[:8]}.wav"
             try:
                 save_stereo(cnn_recheck_path, audio, sr)
                 cnn_recheck_score = scorer.cnn.predict(str(cnn_recheck_path))["probability"]
                 job_log(job_id, f"  post-chain cnn score: {cnn_recheck_score * 100:.3f}%")
-                # re-trigger at 0.08 (the optimizer's own real_target), not
-                # 0.5 (the model's raw pass/fail boundary) - waiting until a
-                # full regression back to "flagged" is exactly the gap that
-                # let a 48% result silently ship as 99.9%; catching any loss
-                # of safety margin, not just a full regression, is the point.
-                if cnn_recheck_score >= 0.08:
+                # re-trigger at 0.08 + CNN_RECHECK_MARGIN, not the raw 0.08
+                # real_target itself (see the margin's definition above
+                # TOOL_ORDER) - 0.08 alone left zero headroom above what
+                # cnn_fix already certifies, so downstream dither from
+                # temporal_normalize/true_peak_limit was enough to force a
+                # full expensive Thorough-mode re-run on files that never
+                # actually regressed. Still well below 0.5 (the model's raw
+                # pass/fail boundary), so a genuine loss of safety margin -
+                # not just a full regression back to "flagged" - still
+                # catches and re-runs; only noise-level movement is ignored.
+                if cnn_recheck_score >= 0.08 + CNN_RECHECK_MARGIN:
                     check_cancelled(job_id)
                     job_log(job_id, "  cnn lost its safety margin (or regressed) after later chain stages - re-running cnn_fix once more on the final signal")
                     from .cnn_fix import fix_cnn
@@ -815,15 +1017,50 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                     job_log(job_id, f"  done ({cnn_reverify_info['elapsed_sec']}s)")
 
                     if "true_peak_limit" in tools:
-                        job_log(job_id, "re-running true-peak limiter after cnn re-verification pass")
+                        # same fix as the linear-reverify limiter re-run
+                        # above - see that comment for the full mechanism
+                        # this was found and fixed against (real production
+                        # job: a verified 14.17% CNN result regressed to
+                        # 77.147% with the OLD full true_peak_limit re-run as
+                        # the only step in between).
+                        job_log(job_id, "re-running peak safety clamp after cnn re-verification pass")
                         t0 = time.time()
-                        audio, limiter_info2 = chain.true_peak_limit(
-                            audio, sr, ceiling_db=options.get("ceiling_db", -1.0))
+                        audio, limiter_info2 = chain.sample_peak_safety_clamp(
+                            audio, ceiling_db=options.get("ceiling_db", -1.0))
                         limiter_info2["tool"] = "true_peak_limit_reverify_cnn"
-                        limiter_info2["label"] = "True-peak limiter (post-cnn-reverification safety pass)"
+                        limiter_info2["label"] = "Peak safety clamp (post-cnn-reverification safety pass)"
                         limiter_info2["elapsed_sec"] = round(time.time() - t0, 2)
                         steps.append(limiter_info2)
                         job_log(job_id, f"  done ({limiter_info2['elapsed_sec']}s)")
+
+                        # BUG FIX (found via direct testing, real file):
+                        # this second limiter re-run is exactly one more
+                        # place that can disturb the just-reverified CNN
+                        # result, and nothing checked for it - confirmed
+                        # directly: a genuinely verified 2.02% CNN result
+                        # regressed to 66.5% by final delivery, with this
+                        # limiter re-run as the only step in between.
+                        # Same "certify then mutate with no re-check" bug
+                        # class already fixed once inside the CNN optimizer
+                        # itself (silence guard) and once at the pipeline
+                        # level (this very re-verification block) - it just
+                        # kept recurring one layer further out each time.
+                        # Check honestly here too, and ship what's actually
+                        # true rather than a stale "verified" claim.
+                        check_cancelled(job_id)
+                        final_cnn_check_path = OUTPUT_DIR / f"_final_cnncheck_{uuid.uuid4().hex[:8]}.wav"
+                        try:
+                            save_stereo(final_cnn_check_path, audio, sr)
+                            final_cnn_score = scorer.cnn.predict(str(final_cnn_check_path))["probability"]
+                            if final_cnn_score >= 0.08:
+                                job_log(job_id, f"  WARNING: cnn regressed to {final_cnn_score * 100:.3f}% "
+                                                 f"after the post-cnn-reverification limiter pass - not "
+                                                 f"re-running cnn again to avoid an unbounded cnn/limiter "
+                                                 f"ping-pong; the delivered file may still be flagged by "
+                                                 f"the cnn model")
+                        finally:
+                            if final_cnn_check_path.exists():
+                                final_cnn_check_path.unlink()
 
                     # this cnn re-run could, in turn, disturb linear again the
                     # same way the ORIGINAL cnn_fix pass did (documented
@@ -894,15 +1131,117 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 # for the same reason the linear-fix re-verification pass
                 # re-runs the limiter above.
                 if "true_peak_limit" in tools:
-                    job_log(job_id, "re-running true-peak limiter after LUFS drift correction")
+                    # same fix as the other post-reverification limiter
+                    # re-runs - see the linear-reverify comment above for
+                    # the full mechanism (real broadband resample noise
+                    # disturbing a fragile AI-detector-fix correction).
+                    # LUFS correction runs before the AI-detector-fix
+                    # reverify passes in TOOL_ORDER, so this specific call
+                    # site is lower-risk than the others, but there's no
+                    # reason to accept ANY unnecessary resample-noise
+                    # injection this late in the chain when a flat clamp
+                    # achieves the same real safety guarantee.
+                    job_log(job_id, "re-running peak safety clamp after LUFS drift correction")
                     t0 = time.time()
-                    audio, limiter_info2 = chain.true_peak_limit(
-                        audio, sr, ceiling_db=options.get("ceiling_db", -1.0))
+                    audio, limiter_info2 = chain.sample_peak_safety_clamp(
+                        audio, ceiling_db=options.get("ceiling_db", -1.0))
                     limiter_info2["tool"] = "true_peak_limit_reverify_lufs"
-                    limiter_info2["label"] = "True-peak limiter (post-LUFS-correction safety pass)"
+                    limiter_info2["label"] = "Peak safety clamp (post-LUFS-correction safety pass)"
                     limiter_info2["elapsed_sec"] = round(time.time() - t0, 2)
                     steps.append(limiter_info2)
                     job_log(job_id, f"  done ({limiter_info2['elapsed_sec']}s)")
+
+                # BUG FIX (third adversarial audit round, verified
+                # directly): this LUFS drift correction applies a REAL
+                # whole-signal gain scale (gain_linear above) - not
+                # dither-level noise - after both the linear_fix and
+                # cnn_fix post-chain rechecks already ran and certified
+                # the signal. Nothing verified whether that gain change
+                # itself disturbed either AI-detector score before this
+                # fix - the exact "certify then mutate with no re-check"
+                # bug class already fixed at several other layers this
+                # session (CNN silence guard, the pipeline-level linear/
+                # cnn rechecks, the post-CNN-reverification limiter),
+                # recurring here at one more layer. A confirmed real
+                # gain-only mutation (unlike the earlier resample-noise
+                # cases) genuinely warrants a full check using the same
+                # margins already established for the other rechecks.
+                if "linear_fix" in tools or "cnn_fix" in tools:
+                    check_cancelled(job_id)
+                    post_lufs_check_path = OUTPUT_DIR / f"_post_lufs_check_{uuid.uuid4().hex[:8]}.wav"
+                    try:
+                        save_stereo(post_lufs_check_path, audio, sr)
+                        if "linear_fix" in tools:
+                            post_lufs_linear = scorer.linear.predict(str(post_lufs_check_path))["probability"]
+                            job_log(job_id, f"  post-LUFS-correction linear score: {post_lufs_linear * 100:.3f}%")
+                            if post_lufs_linear >= 0.01 + LINEAR_RECHECK_MARGIN:
+                                check_cancelled(job_id)
+                                job_log(job_id, "  LUFS gain change disturbed the linear model - re-running linear_fix once more")
+                                from .linear_fix import fix_linear
+                                t0 = time.time()
+
+                                def _post_lufs_linear_step_cb(step, mx, score, attempt, max_attempts):
+                                    check_cancelled(job_id)
+                                    job_set_sub_progress(
+                                        job_id, step, mx,
+                                        extra={
+                                            "score_pct": round(float(score) * 100, 4),
+                                            "attempt": attempt,
+                                            "max_attempts": max_attempts,
+                                        },
+                                    )
+
+                                audio, post_lufs_linear_info = fix_linear(
+                                    audio, sr, target=options.get("linear_target", 0.01),
+                                    progress_cb=_cancel_aware_log,
+                                    step_progress_cb=_post_lufs_linear_step_cb,
+                                )
+                                post_lufs_linear_info["tool"] = "linear_fix_reverify_lufs"
+                                post_lufs_linear_info["label"] = "AI-detector fix: linear model (post-LUFS-correction pass)"
+                                post_lufs_linear_info["elapsed_sec"] = round(time.time() - t0, 2)
+                                post_lufs_linear_info["triggered_by"] = f"post-LUFS-correction recheck showed {post_lufs_linear * 100:.3f}%"
+                                steps.append(post_lufs_linear_info)
+                                job_log(job_id, f"  done ({post_lufs_linear_info['elapsed_sec']}s)")
+                                save_stereo(post_lufs_check_path, audio, sr)
+                        if "cnn_fix" in tools:
+                            post_lufs_cnn = scorer.cnn.predict(str(post_lufs_check_path))["probability"]
+                            job_log(job_id, f"  post-LUFS-correction cnn score: {post_lufs_cnn * 100:.3f}%")
+                            if post_lufs_cnn >= 0.08 + CNN_RECHECK_MARGIN:
+                                check_cancelled(job_id)
+                                job_log(job_id, "  LUFS gain change disturbed the cnn model - re-running cnn_fix once more")
+                                from .cnn_fix import fix_cnn
+                                t0 = time.time()
+
+                                def _post_lufs_cnn_step_cb(s, mx, surrogate_score, real_check_extra):
+                                    check_cancelled(job_id)
+                                    extra = {"score_pct": round(float(surrogate_score) * 100, 4)}
+                                    if real_check_extra is not None:
+                                        extra["real_max_score_pct"] = round(float(real_check_extra["real_max_score"]) * 100, 4)
+                                        extra["windows_failing"] = int(real_check_extra["n_windows_bad"])
+                                        extra["windows_total"] = int(real_check_extra["n_windows"])
+                                    job_set_sub_progress(job_id, s, mx, extra=extra)
+
+                                _post_lufs_cnn_mode = options.get("cnn_mode", "eot")
+                                if _post_lufs_cnn_mode not in ("simple", "eot", "thorough"):
+                                    _post_lufs_cnn_mode = "eot"
+                                audio, post_lufs_cnn_info = fix_cnn(
+                                    audio, sr,
+                                    max_steps=options.get("cnn_max_steps", 300),
+                                    min_steps=options.get("cnn_min_steps", 100),
+                                    hop_sec=options.get("cnn_hop_sec", 0.5),
+                                    progress_cb=_cancel_aware_log,
+                                    step_progress_cb=_post_lufs_cnn_step_cb,
+                                    mode=_post_lufs_cnn_mode,
+                                )
+                                post_lufs_cnn_info["tool"] = "cnn_fix_reverify_lufs"
+                                post_lufs_cnn_info["label"] = "AI-detector fix: CNN model (post-LUFS-correction pass)"
+                                post_lufs_cnn_info["elapsed_sec"] = round(time.time() - t0, 2)
+                                post_lufs_cnn_info["triggered_by"] = f"post-LUFS-correction recheck showed {post_lufs_cnn * 100:.3f}%"
+                                steps.append(post_lufs_cnn_info)
+                                job_log(job_id, f"  done ({post_lufs_cnn_info['elapsed_sec']}s)")
+                    finally:
+                        if post_lufs_check_path.exists():
+                            post_lufs_check_path.unlink()
 
                 # the limiter now does real dynamics limiting (only reduces
                 # gain where peaks actually exceed ceiling), which preserves
@@ -931,27 +1270,78 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 "the watermark is still applied last, but this exact combination is unbenchmarked)",
             )
 
+        # BUG FIX (direct user report, real production job): these
+        # corrective re-checks used to run AFTER scoring_wav_path was
+        # written, the watermark embedded, and out_path encoded - meaning
+        # any correction they made here was applied to "audio" in memory
+        # but NEVER reflected in either the scores or the actual delivered
+        # file, both of which were already written from an earlier, stale
+        # version of "audio". Confirmed directly: a job's own results table
+        # showed "1 anomaly" while re-analyzing the DOWNLOADED file (built
+        # from the stale pre-correction encode) showed 4, and separately
+        # showed real leading/trailing silence the job's own trim_silence
+        # step had supposedly already removed. Every mutating correction
+        # below must run BEFORE scoring_wav_path/watermark/encode - this is
+        # the same "certify then mutate with no re-check" bug class fixed
+        # several times already this session (CNN silence guard, the
+        # linear/cnn post-chain rechecks), just one layer further out:
+        # right at the final write, not inside an earlier stage.
+        SILENCE_RECHECK_FLOOR_MS = 100
+        if "trim_silence" in tools:
+            _, late_silence_info = chain.trim_silence(audio, sr)
+            late_lead_ms = late_silence_info.get("lead_ms", 0)
+            late_trail_ms = late_silence_info.get("trail_ms", 0)
+            if late_lead_ms > SILENCE_RECHECK_FLOOR_MS or late_trail_ms > SILENCE_RECHECK_FLOOR_MS:
+                check_cancelled(job_id)
+                job_log(job_id, f"  found {late_lead_ms:.1f}ms lead / {late_trail_ms:.1f}ms trail "
+                                 f"silence introduced by later chain stages - running one corrective trim")
+                audio, late_trim_info = chain.trim_silence(audio, sr)
+                job_log(job_id, f"  done (trimmed {late_trim_info.get('lead_ms', 0):.1f}ms lead / "
+                                 f"{late_trim_info.get('trail_ms', 0):.1f}ms trail)")
+                # this late trim can remove MORE leading samples than the
+                # main loop's original trim_silence pass already accounted
+                # for in lead_samples_trimmed - without adding the extra
+                # here too, aligned_original's offset below would drift
+                # out of sync with the actual delivered audio by however
+                # many additional lead samples this late pass removed.
+                lead_samples_trimmed += late_trim_info.get("lead_samples", 0)
+                _, final_silence_check = chain.trim_silence(audio, sr)
+                trim_status = ("pass" if final_silence_check.get("lead_ms", 0) <= SILENCE_RECHECK_FLOOR_MS
+                                and final_silence_check.get("trail_ms", 0) <= SILENCE_RECHECK_FLOOR_MS else "check")
+                job_log(job_id, f"trim_silence: final {trim_status} "
+                                 f"({final_silence_check.get('lead_ms', 0):.1f}ms lead / "
+                                 f"{final_silence_check.get('trail_ms', 0):.1f}ms trail after full chain)")
+            else:
+                job_log(job_id, f"trim_silence: final pass ({late_lead_ms:.1f}ms lead / {late_trail_ms:.1f}ms trail after full chain)")
+
+        transients_after = chain.detect_transients(audio, sr)
+        late_transients_fixed = []
+        if "fix_transients" in tools:
+            if transients_after:
+                check_cancelled(job_id)
+                job_log(job_id, f"  found {len(transients_after)} new anomal{'y' if len(transients_after) == 1 else 'ies'} "
+                                 f"introduced by later chain stages - running one corrective pass")
+                for t in transients_after:
+                    audio, _ = chain.fix_transient(audio, sr, t["time_sec"],
+                                                     target_peak=options.get("transient_target_peak"))
+                    late_transients_fixed.append({"time_sec": t["time_sec"]})
+                transients_after = chain.detect_transients(audio, sr)
+
+            transient_status = "pass" if len(transients_after) == 0 else "check"
+            job_log(
+                job_id,
+                f"fix_transients: final {transient_status} "
+                f"({len(transients_after)} anomal{'y' if len(transients_after) == 1 else 'ies'} after full chain)",
+            )
+
         out_id = uuid.uuid4().hex[:12]
-        # always keep a WAV copy for detector re-scoring regardless of the
-        # chosen delivery format, since the scorer needs a file ffmpeg/
-        # librosa can decode and re-scoring must reflect the exact audio
-        # that was actually processed. Saved BEFORE the watermark stage
-        # below, on purpose: the watermark's notches sit at 10-16kHz,
-        # outside the linear detector's 1-8kHz analysis band and outside
-        # the CNN detector's own CQT range, so it shouldn't affect AI-
-        # detector scoring either way - but re-scoring against the
-        # pre-watermark signal removes any doubt rather than relying on
-        # that reasoning alone.
-        scoring_wav_path = OUTPUT_DIR / f"{out_id}_score.wav"
-        save_stereo(scoring_wav_path, audio, sr)
 
         # product watermark: applied unconditionally to every delivered
         # file, not a user-selectable tool in TOOL_ORDER - this is
         # intentional (see app/watermark.py's module docstring for the
         # full design rationale). Runs after all real processing/AI-
-        # detector work and after the scoring copy above, right before
-        # final encode, so it's the last thing to touch the signal and
-        # nothing downstream can disturb it.
+        # detector work, right before final encode, so it's the last thing
+        # to touch the signal and nothing downstream can disturb it.
         job_log(job_id, "running: wm")
         try:
             from .watermark import embed_watermark, detect_watermark
@@ -982,11 +1372,73 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
             # if it fails for any reason, log it and ship the file anyway.
             job_log(job_id, f"wm: error, shipping without it ({e})")
 
+        # BUG FIX (third adversarial audit round, verified directly): the
+        # watermark's additive delta can push the TRUE peak (inter-sample
+        # reconstruction peak, what -1dBTP actually measures) above the
+        # limiter's own advertised ceiling even while staying under 1.0
+        # sample-peak - np.clip above only guards raw digital overflow, not
+        # true-peak. Confirmed directly: a real limited signal at exactly
+        # -1.0dBTP, watermarked, measured 0.10dB OVER that ceiling on the
+        # actual delivered signal. If true_peak_limit was selected, its
+        # whole advertised guarantee ("the delivered file stays under
+        # ceiling_db") is false the moment the watermark (which always
+        # runs, unconditionally) adds anything back on top. Unlike the
+        # earlier post-CNN-reverification safety passes (where using the
+        # FULL true_peak_limit risked destabilizing a still-fragile
+        # adversarial correction with resample noise), the watermark is
+        # the LAST stage before encode - all AI-detector-fix verification
+        # is already complete and nothing downstream will re-check CNN/
+        # linear again, so there's no fragile correction left to disturb.
+        # The full, real true_peak_limit is the correct, safe tool here.
+        if "true_peak_limit" in tools:
+            check_cancelled(job_id)
+            t0 = time.time()
+            post_wm_audio, post_wm_limiter_info = chain.true_peak_limit(
+                audio, sr, ceiling_db=options.get("ceiling_db", -1.0))
+            if post_wm_limiter_info.get("applied"):
+                job_log(job_id, "  watermark pushed the true peak back over ceiling - re-limiting")
+                audio = post_wm_audio
+                post_wm_limiter_info["tool"] = "true_peak_limit_reverify_watermark"
+                post_wm_limiter_info["label"] = "True-peak limiter (post-watermark safety pass)"
+                post_wm_limiter_info["elapsed_sec"] = round(time.time() - t0, 2)
+                steps.append(post_wm_limiter_info)
+                job_log(job_id, f"  done ({post_wm_limiter_info['elapsed_sec']}s)")
+
+        # BUG FIX (adversarial audit, verified directly): the scoring WAV
+        # used to be written BEFORE the watermark stage, on the reasoning
+        # that the watermark's 10-16kHz notches sit outside both detector
+        # models' analysis bands and therefore "shouldn't" move the score -
+        # but the very next line of that old comment admitted the whole
+        # point of re-scoring the delivered file was to remove doubt rather
+        # than rely on that same assumption, while doing exactly the
+        # opposite in practice. Confirmed directly with a test that mutates
+        # audio inside embed_watermark (a null test purely to prove the
+        # PRINCIPLE, not a claim about the real watermark's actual
+        # magnitude): the old code reported a score from PCM that provably
+        # differed from what was handed to the encoder, 100% of samples
+        # mismatched. Encode the real delivered file FIRST, then score
+        # THAT file directly - not a WAV proxy of any kind.
+        #
+        # BUG FIX (second adversarial audit round, verified directly): the
+        # previous fix moved the WAV snapshot to after the watermark stage,
+        # which fixed the watermark-mutation gap, but a WAV snapshot is
+        # STILL not what the user actually receives for lossy formats -
+        # for mp3/flac output, real encoder quantization happens AFTER any
+        # WAV snapshot, so scores_after never reflected the genuine
+        # lossy-encoded bytes. Confirmed directly: a real MP3 round-trip on
+        # a 176,400-sample test signal changed 176,344 of those samples
+        # (essentially all of them), with a max per-sample error of 0.018 -
+        # far larger than DC-offset-level noise, easily enough to move a
+        # borderline detector score. scorer.score() decodes via ffmpeg
+        # (load_audio_mono), which handles wav/mp3/flac identically - there
+        # is no reason to score a WAV proxy AT ALL when the real delivered
+        # file can be scored directly, regardless of format.
         resolved_format, format_fallback_warning = resolve_output_format(output_format, path)
         if format_fallback_warning:
             job_log(job_id, f"NOTE: {format_fallback_warning}")
         job_log(job_id, f"saving output file (format: {resolved_format})")
         out_path = encode_final_output(audio, sr, resolved_format, OUTPUT_DIR / out_id, mp3_mode=mp3_mode)
+        scoring_wav_path = out_path
 
         # align on the same underlying audio content before doing ANY
         # before/after comparison - if silence was trimmed from the front,
@@ -1014,16 +1466,44 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 failing.append(f"cnn={scores_after['cnn_pct']:.1f}%")
             job_log(job_id, f"WARNING: final file still flagged by at least one model ({', '.join(failing)})")
 
-        n = min(len(aligned_original), len(audio))
-        delta = audio[:n, 0] - aligned_original[:n, 0]
+        # BUG FIX (fourth adversarial audit round, verified directly):
+        # scores_after was already correctly fixed (earlier this session)
+        # to score the REAL delivered file at out_path rather than an
+        # in-memory/pre-encode proxy - but every OTHER results-table metric
+        # below (LUFS, stereo correlation, DC offset, spectral tilt,
+        # waveform, transient count) still measured the in-memory `audio`
+        # array directly, never re-decoding the actual encoded output.
+        # For lossless (WAV) delivery these are identical, but for lossy
+        # (MP3) delivery the real encoded bytes can differ measurably from
+        # the pre-encode array (this session already measured real MP3
+        # encoder artifacts elsewhere - DC bias, sample-level changes) -
+        # meaning a user could see one set of numbers in the results table
+        # and a different set on re-analyzing their own downloaded file,
+        # the exact "results claim X, re-analysis says Y" contradiction
+        # this session has repeatedly had to fix in other tools. Re-decode
+        # the actual out_path file (via the same load_stereo used for the
+        # original upload) and measure everything below from THAT, not
+        # from `audio`.
+        try:
+            delivered_audio = load_stereo(str(out_path), sr)
+        except Exception:
+            # if re-decoding the just-written file somehow fails, fall back
+            # to the in-memory array rather than crash the whole job at
+            # its very last step - the AI scores (the actual safety-
+            # critical numbers) are already correctly sourced from
+            # out_path independently of this fallback.
+            delivered_audio = audio
+
+        n = min(len(aligned_original), len(delivered_audio))
+        delta = delivered_audio[:n, 0] - aligned_original[:n, 0]
         orig_rms = np.sqrt(np.mean(aligned_original[:n, 0] ** 2))
         delta_rms = np.sqrt(np.mean(delta ** 2))
         overall_snr = float(20 * np.log10(orig_rms / (delta_rms + 1e-12))) if delta_rms > 0 else None
 
         tilt_before, freqs_b, psd_b = chain.spectral_tilt_report(aligned_original, sr)
-        tilt_after, freqs_a, psd_a = chain.spectral_tilt_report(audio, sr)
+        tilt_after, freqs_a, psd_a = chain.spectral_tilt_report(delivered_audio, sr)
         waveform_before = chain.waveform_peaks(aligned_original, sr)
-        waveform_after = chain.waveform_peaks(audio, sr)
+        waveform_after = chain.waveform_peaks(delivered_audio, sr)
 
         # the results panel only ever showed a 5-row before/after table even
         # though the pre-processing analysis panel shows a much richer set
@@ -1033,17 +1513,18 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         # so the results panel can show the same depth, not a stripped-down
         # subset of it.
         correlation_before = chain.stereo_correlation(aligned_original)
-        correlation_after = chain.stereo_correlation(audio)
+        correlation_after = chain.stereo_correlation(delivered_audio)
         dc_before = aligned_original.mean(axis=0)
-        dc_after = audio.mean(axis=0)
-        transients_after = chain.detect_transients(audio, sr)
-        if "fix_transients" in tools:
-            transient_status = "pass" if len(transients_after) == 0 else "check"
-            job_log(
-                job_id,
-                f"fix_transients: final {transient_status} "
-                f"({len(transients_after)} anomal{'y' if len(transients_after) == 1 else 'ies'} after full chain)",
-            )
+        dc_after = delivered_audio.mean(axis=0)
+        # trim_silence/fix_transients post-chain corrections already ran
+        # BEFORE scoring_wav_path/watermark/encode above (see the comment
+        # there for why) - this final detect_transients call is read-only,
+        # purely to report the actual final count for the results table
+        # against audio that has already been corrected, not to correct
+        # anything itself. Uses delivered_audio (the re-decoded actual
+        # output file) for the same reason correlation_after/dc_after do -
+        # see the delivered_audio comment above.
+        transients_after = chain.detect_transients(delivered_audio, sr)
 
         # surface WHERE each fixed transient/pop was found, for the results
         # panel's waveform chart to mark - fix_transients' own step already
@@ -1054,13 +1535,7 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
             {"time_sec": d["time_sec"]}
             for s in steps if s.get("tool") == "fix_transients"
             for d in s.get("details", []) if "time_sec" in d
-        ]
-
-        # the scoring WAV is redundant once re-scoring is done UNLESS the
-        # delivered format IS wav (in which case out_path == scoring_wav_path
-        # already covers it) - only remove the extra copy when they differ
-        if scoring_wav_path != out_path and scoring_wav_path.exists():
-            scoring_wav_path.unlink()
+        ] + late_transients_fixed
 
         default_output_name = f"{Path(path.name).stem}_fixed{out_path.suffix}"
         # the extension in output_name must always match what was ACTUALLY
@@ -1083,7 +1558,7 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
             "scores_after": scores_after,
             "overall_snr_db": overall_snr,
             "lufs_before": chain.measure_lufs(original_audio, sr),
-            "lufs_after": chain.measure_lufs(audio, sr),
+            "lufs_after": chain.measure_lufs(delivered_audio, sr),
             "spectrum_before": {"freqs": freqs_b, "psd_db": psd_b, "tilt": tilt_before},
             "spectrum_after": {"freqs": freqs_a, "psd_db": psd_a, "tilt": tilt_after},
             "waveform_before": waveform_before,

@@ -155,10 +155,19 @@ def fix_cnn(stereo_audio, sr, max_steps=300, min_steps=100, hop_sec=0.5,
     n_16k = len(out_mono_16k)
 
     if mode == "eot":
+        # BUG FIX (adversarial audit, verified directly): _worst_shift_score
+        # now returns None (not 0.0) when a position has no valid in-bounds
+        # window at all - filter those out explicitly here, the same way
+        # the "else" (thorough/simple) branch below already filters
+        # too-short segments, rather than letting a None silently coerce
+        # into "0.0 = perfectly clean" via max().
         post_transfer_scores = [
-            _worst_shift_score(out_mono_16k, pos, seg_len, n_16k,
-                                shift_range_sec=0.5, shift_step_sec=0.1, sr=CNN_SR)
-            for pos in positions
+            s for s in (
+                _worst_shift_score(out_mono_16k, pos, seg_len, n_16k,
+                                    shift_range_sec=0.5, shift_step_sec=0.1, sr=CNN_SR)
+                for pos in positions
+            )
+            if s is not None
         ]
     else:
         post_transfer_scores = []
@@ -178,7 +187,15 @@ def fix_cnn(stereo_audio, sr, max_steps=300, min_steps=100, hop_sec=0.5,
     # result checked against the REAL detector" line).
     if progress_cb:
         if worst_after_transfer is not None:
-            progress_cb(f"cnn: worst window after transfer scored {worst_after_transfer * 100:.2f}% AI")
+            # BUG FIX: .2f formatting on a genuinely very small score (e.g.
+            # 0.00003) rounds down to a confusing "0.00%" that reads as
+            # broken/impossible next to a non-pass badge, rather than
+            # showing the real, meaningful precision that explains it.
+            # Use more decimal places specifically when the value is small
+            # enough that 2 decimals would hide it.
+            _pct = worst_after_transfer * 100
+            _precision = 2 if _pct >= 0.01 else 5
+            progress_cb(f"cnn: worst window after transfer scored {_pct:.{_precision}f}% AI")
         else:
             progress_cb("cnn: no windows survived the post-transfer check (all fell outside the delivered audio's length)")
 

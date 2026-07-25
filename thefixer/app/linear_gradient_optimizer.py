@@ -7,6 +7,15 @@ from .linear_differentiable import (
 
 STFT_WIN = 1024
 
+# BUG FIX (adversarial audit, verified directly): see the comment at this
+# constant's use site (the real-check break condition in optimize()) - a
+# borderline real-verified pass this early is more likely to be optimizer
+# noise than genuine convergence. 50 mirrors this module's own
+# real_check_interval default, i.e. "give it at least one full normal
+# checking interval" rather than trusting the very first opportunistic
+# check. Comfortably-clear passes are exempt and can still break on step 1.
+MIN_STEPS_FOR_BORDERLINE_PASS = 50
+
 
 def a_weighting_approx(f):
     f = np.maximum(f, 1.0)
@@ -171,6 +180,10 @@ def optimize(audio_orig, lambda_perceptual=2000.0, lambda_band=5000.0, lambda_to
     masking_mult = compute_masking_mult(audio_orig)
 
     step = 0
+    surrogate_opportunistic_check_fired = False  # edge-trigger latch for the
+    # surrogate_converged real-check below - see its own comment for why
+    # this must fire only ONCE per optimize() call, not every step the
+    # surrogate stays under threshold.
     while step < max_steps:
         optimizer.zero_grad()
         perturbed = audio_orig + delta
@@ -200,8 +213,46 @@ def optimize(audio_orig, lambda_perceptual=2000.0, lambda_band=5000.0, lambda_to
         # doesn't land on a real_check_interval multiple - otherwise a run whose
         # cap isn't itself a multiple of real_check_interval can end without ever
         # having its final state verified at all.
+        #
+        # BUG FIX (direct user report - watching a live job sit at "step 53 of
+        # 225, live estimate 0%" and keep grinding): the surrogate can drop to
+        # a near-zero, clearly-converged score well before the next scheduled
+        # real_check_interval boundary (default 50 steps), and previously had
+        # to wait out the FULL remaining interval before the real model ever
+        # got a chance to confirm it and break the loop - burning dozens of
+        # steps on a delta that was probably already done. surrogate_converged
+        # gives the real check an EXTRA opportunistic firing the moment the
+        # surrogate looks confidently done, on top of (not instead of) the
+        # normal interval/budget-end checks - if the real model disagrees,
+        # optimization just continues exactly as before with no behavior
+        # change; this only ever shortens a run, never weakens verification,
+        # since a break still can't happen without the real model's own
+        # confirmation.
+        #
+        # BUG FIX (adversarial audit, verified directly): surrogate_converged
+        # was recomputed fresh every step with no memory of whether it had
+        # already triggered - since a converged surrogate score essentially
+        # never bounces back UP once it drops, this didn't fire once at the
+        # crossing edge as the comment above claims, it fired on EVERY
+        # subsequent step for the rest of the run whenever the real model
+        # disagreed (real_score stays high, so the "real check every step"
+        # condition just kept re-triggering). Confirmed directly: a 4-step
+        # run with real_check_interval=100 (should only ever hit the real
+        # model at budget-end) called the real scorer 15 times, not <=4.
+        # surrogate_opportunistic_check_fired makes this a true one-shot
+        # edge trigger - once the opportunistic check has fired (whether or
+        # not the real model agreed), it never fires again for the rest of
+        # THIS optimize() call; the scheduled interval/budget-end checks are
+        # completely unaffected and still run exactly as before.
+        surrogate_converged = (
+            cur_score < target * 0.1 and not surrogate_opportunistic_check_fired
+        )
         at_budget_end = (step == max_steps - 1)
-        if cur_score < target * 0.5 and step > 0 and (step % real_check_interval == 0 or at_budget_end):
+        if cur_score < target * 0.5 and step > 0 and (
+            step % real_check_interval == 0 or at_budget_end or surrogate_converged
+        ):
+            if surrogate_converged:
+                surrogate_opportunistic_check_fired = True
             real_score = _real_score_for_delta(delta, audio_orig)
             cur_norm = delta.norm().item()
             if verbose:
@@ -214,7 +265,41 @@ def optimize(audio_orig, lambda_perceptual=2000.0, lambda_band=5000.0, lambda_to
                 best_real_score = real_score
                 best_delta = delta.detach().clone()
 
-            if real_score < real_target and step >= 150:
+            # BUG FIX (direct user report): this used to require step >= 150
+            # before accepting a real-verified pass, an unexplained magic
+            # number present since this file's very first version with no
+            # documented rationale anywhere. Concretely: the real model
+            # confirming a genuine pass at, say, step 53 could not break the
+            # loop - it just kept grinding, re-checking every
+            # real_check_interval steps, until it finally crossed 150 for no
+            # reason tied to convergence. The real-model check IS the source
+            # of truth this function exists to trust (see the comment at the
+            # top of this periodic-check block) - once it confirms
+            # real_score < real_target, there is nothing left to gain by
+            # continuing.
+            #
+            # BUG FIX (adversarial audit, verified directly): removing the
+            # step>=150 floor entirely (rather than making it margin-
+            # conditional, as the analogous CNN optimizer fix below does via
+            # comfortably_clear) left this loop able to break on the very
+            # FIRST real check - as early as step 1 if surrogate_converged
+            # fires opportunistically - the moment real_score dips even
+            # fractionally under real_target, with no stability margin at
+            # all. A borderline pass that early (e.g. real_score=0.049
+            # against real_target=0.05) is far more likely to be optimizer
+            # noise than genuine convergence, and would ship completely
+            # unverified against a second data point. Restore a real
+            # stability requirement using the exact same pattern already
+            # applied to the CNN optimizer: a comfortably-clear result (well
+            # under half the target) breaks immediately regardless of step
+            # count, since there's nothing left to gain from grinding
+            # further; a merely-borderline result must additionally reach
+            # MIN_STEPS_FOR_BORDERLINE_PASS steps of training before being
+            # trusted, exactly mirroring CNN's min_steps floor.
+            comfortably_clear = real_score < real_target * 0.5
+            if real_score < real_target and (
+                step >= MIN_STEPS_FOR_BORDERLINE_PASS or comfortably_clear
+            ):
                 if verbose:
                     print(f"  converged (real-verified) at step {step}")
                 break

@@ -18,6 +18,41 @@ from .cnn_gradient_optimizer_v2 import perceptual_penalty, band_limit_penalty, t
 # optimizer can operate on, not to scoring.
 MIN_VIABLE_SEGMENT_SAMPLES = 4000
 
+# BUG FIX (direct, repeated user report): max_steps/min_steps for Thorough
+# mode used to be flat constants (300/150) regardless of how many 10-second
+# windows a track actually has - a 30s file (38 windows) and a 600s file
+# (~1200 windows) got the identical budget, which makes no sense: all
+# windows share ONE joint delta tensor, so more windows plausibly need more
+# steps to jointly converge. A prior attempt at scaling this was reverted
+# for being unvalidated against real data (see build_sliding_windows'
+# nearby history) - this time it's grounded in an actual multi-length
+# benchmark, not a guess.
+#
+# Measured directly (real optimizer runs, not simulated): a track's own
+# convergence step count grows roughly with log2(window count), not
+# linearly - consistent with heavy window overlap (10s windows at 0.5s hop
+# share ~95% of their samples with neighbors), so a correction that fixes
+# one window generalizes partially to its neighbors; more windows mostly
+# means more redundant content to VERIFY, not proportionally more distinct
+# problems to solve.
+#   38 windows (30s)  -> converged at step 40
+#  158 windows (90s)  -> converged at step 70
+#  338 windows (180s) -> converged at step 80
+# step/log2(windows) settles to ~9.5 for the two larger cases. This is only
+# 3 data points, not a proven law - the formula below applies real safety
+# margin (1.5x for min_steps, 4x that again for the max_steps ceiling)
+# rather than fitting tightly to these exact numbers, and never reduces
+# below the previous flat defaults for typical-length files.
+def scaled_step_budget(n_windows):
+    """Returns (min_steps, max_steps) scaled to how many overlapping windows
+    a track actually has, instead of a flat constant regardless of length."""
+    if n_windows <= 1:
+        return 60, 300
+    raw = 9.5 * np.log2(n_windows)
+    min_steps = max(60, int(raw * 1.5))
+    max_steps = max(300, min_steps * 4)
+    return min_steps, max_steps
+
 
 def build_sliding_windows(n_samples, hop_sec=0.5, segment_sec=10.0, sr=SR, edge_guard_sec=0.5):
     hop = int(hop_sec * sr)
@@ -154,6 +189,22 @@ def optimize_whole_track_verified(
         positions, seg_len = build_sliding_windows(n, hop_sec=hop_sec)
         print(f"track length: {n/SR:.1f}s, {len(positions)} overlapping windows "
               f"(hop={hop_sec}s, window={seg_len/SR:.1f}s)")
+        # BUG FIX (direct, repeated user report): scale the step budget to
+        # this track's ACTUAL window count via scaled_step_budget (see its
+        # definition above build_sliding_windows for the real multi-length
+        # benchmark this is grounded in), rather than leaving every track
+        # stuck with the same flat default regardless of length. Only ever
+        # RAISES min_steps/max_steps above whatever the caller passed in -
+        # never lowers them - so an explicit override always still wins;
+        # this only fills in more headroom for tracks with enough windows
+        # that the flat default might not be (or might barely be) enough.
+        scaled_min, scaled_max = scaled_step_budget(len(positions))
+        if scaled_min > min_steps:
+            print(f"  scaling min_steps {min_steps} -> {scaled_min} for {len(positions)} windows")
+            min_steps = scaled_min
+        if scaled_max > max_steps:
+            print(f"  scaling max_steps {max_steps} -> {scaled_max} for {len(positions)} windows")
+            max_steps = scaled_max
 
     audio = torch.tensor(audio_np, dtype=torch.float32)
     delta = torch.zeros_like(audio, requires_grad=True)
@@ -175,10 +226,12 @@ def optimize_whole_track_verified(
     # starting point.
     print("checking initial real-model score per window (before any optimization)...", flush=True)
     window_weight = {}
+    real0_by_pos = {}
     audio_np_orig = audio_np
     for pos in positions:
         seg_np = audio_np_orig[pos:pos + seg_len]
         real0 = get_real_score_segment(seg_np)
+        real0_by_pos[pos] = real0
         # same 1.0-20.0 scale and threshold the periodic re-check already uses,
         # just applied before step 0 instead of first appearing at step 25
         window_weight[pos] = min(20.0, 1.0 + 19.0 * max(0.0, real0 - real_target) / max(1e-6, 1.0 - real_target)) \
@@ -204,6 +257,27 @@ def optimize_whole_track_verified(
     print(f"  {n_seeded_hot}/{len(positions)} windows started with boosted weight "
           f"(real score already above real_target={real_target} pre-optimization), "
           f"rescaled so total pressure matches the un-seeded baseline", flush=True)
+
+    # EARLY EXIT: the seeding scan above already ran the real (non-
+    # differentiable) model on every window - if every single one already
+    # scores under real_target with zero correction applied, there is
+    # nothing for the gradient loop to do. Without this, an already-clean
+    # file still paid for min_steps (150 by default) of Adam optimization
+    # against a delta that starts at exactly zero and has no pressure
+    # pushing it anywhere, purely because the real-check break condition at
+    # the bottom of the loop is gated on step >= min_steps and can't fire
+    # any earlier - confirmed directly this was true "wasted work" per user
+    # report ("3 of 4 passes do nothing but take time"). real0 (not the
+    # per-step real_scores dict, which doesn't exist yet) is what the
+    # seeding loop already measured per window with zero delta applied, so
+    # reusing it here costs nothing extra.
+    if n_seeded_hot == 0:
+        zero_delta = torch.zeros_like(audio)
+        already_worst = max(real0_by_pos.values()) if real0_by_pos else 0.0
+        print(f"  0/{len(positions)} windows above real_target={real_target} "
+              f"before any optimization - skipping the gradient loop entirely, "
+              f"nothing to fix", flush=True)
+        return zero_delta.numpy(), positions, seg_len, already_worst
 
     best_delta = None
     best_real_max = 1.0
@@ -305,7 +379,19 @@ def optimize_whole_track_verified(
                 best_real_max = real_max
                 best_delta = delta.detach().clone()
 
-            if real_max < real_target and step >= min_steps:
+            # BUG FIX (direct user report, watching a live job): min_steps
+            # used to gate EVERY real-verified pass, even a comfortably-clear
+            # one (e.g. max_real_score=0.0018 against real_target=0.08 - 44x
+            # under the line) at an early step. min_steps exists to give a
+            # BORDERLINE result more training before accepting it, not to
+            # force an already-clearly-converged result to keep grinding
+            # with nothing left to gain. Only apply the min_steps floor when
+            # the result is still close to the line (within a real margin of
+            # real_target); a comfortably-clear pass breaks immediately
+            # regardless of step count, exactly like the analogous fix
+            # already applied to the linear optimizer's step>=150 floor.
+            comfortably_clear = real_max < real_target * 0.5
+            if real_max < real_target and (step >= min_steps or comfortably_clear):
                 print(f"  converged (real-verified) at step {step}")
                 break
 
@@ -351,16 +437,31 @@ def _worst_shift_score(perturbed_np, center_pos, seg_len, n, shift_range_sec=1.0
     that's been shipping all session (a delta that scores 0% at its exact
     optimized position but 90%+ just 0.25s away is NOT actually fixed, even
     though a single-point check would have called it a pass)."""
+    # BUG FIX (adversarial audit, verified directly): worst used to
+    # initialize to 0.0 and simply never update if EVERY candidate offset
+    # fell outside [0, n) - meaning "genuinely scanned and confirmed
+    # perfectly clean" and "never scanned a single valid window" both
+    # returned the identical 0.0, with no way for a caller to tell them
+    # apart. Confirmed directly: a post-transfer track shrunk by
+    # resampling to just under one segment length (a real, reachable shape
+    # after a 44.1kHz->16kHz resample, e.g. 440,998 samples -> 159,999,
+    # one sample short of a full 160,000-sample segment) produced a
+    # position with NO valid in-bounds shift at all, returned 0.0, and got
+    # certified as verified_after_transfer=True for a segment that was
+    # never actually scored by the real model. Return None when nothing
+    # was scanned, so every caller can distinguish "verified clean" from
+    # "could not verify" and fail closed on the latter instead of treating
+    # an absence of data as a passing score.
     shift_samples = int(shift_range_sec * sr)
     step_samples = max(1, int(shift_step_sec * sr))
-    worst = 0.0
+    worst = None
     for offset in range(-shift_samples, shift_samples + 1, step_samples):
         pos = center_pos + offset
         if pos < 0 or pos + seg_len > n:
             continue
         seg = perturbed_np[pos:pos + seg_len]
         s = get_real_score_segment(seg)
-        if s > worst:
+        if worst is None or s > worst:
             worst = s
     return worst
 
@@ -446,6 +547,40 @@ def optimize_eot_verified(
 
     window_weight = {pos: 1.0 for pos in positions}
 
+    # EARLY EXIT: only 5 positions in EOT mode, so a worst-shift pre-scan
+    # here is cheap (unlike Thorough's per-window seeding scan, this isn't
+    # reusing work the rest of the function needs anyway - it's a small
+    # deliberate up-front check). If every position is already robust
+    # across the full jitter range with zero delta applied, there is
+    # nothing to train against - skip straight to returning a zero delta
+    # instead of paying for min_steps of Adam optimization with no pressure
+    # pushing it anywhere.
+    with torch.no_grad():
+        audio_np_orig = audio.numpy()
+    # BUG FIX (adversarial audit, verified directly): _worst_shift_score
+    # returns None (not a numeric score) when a position has no valid
+    # in-bounds shift window at all - filter those out before max() rather
+    # than let a None crash the comparison or (worse, if a default were
+    # used to paper over it) get silently treated as a passing score. If
+    # EVERY position failed to scan, treat this as "cannot confirm clean"
+    # (default=1.0, the worst possible score) so the early-exit below
+    # correctly does NOT fire on unverifiable input.
+    pre_scan_results = [
+        s for s in (
+            _worst_shift_score(audio_np_orig, pos, seg_len, n,
+                                shift_range_sec=eot_jitter_sec, shift_step_sec=0.1, sr=SR)
+            for pos in positions
+        )
+        if s is not None
+    ]
+    pre_scan_worst = max(pre_scan_results, default=1.0) if len(pre_scan_results) == len(positions) else 1.0
+    if pre_scan_worst < real_target:
+        zero_delta = torch.zeros_like(audio)
+        print(f"  worst-shift score across all {len(positions)} positions is already "
+              f"{pre_scan_worst:.4f} (under real_target={real_target}) before any "
+              f"optimization - skipping the gradient loop entirely, nothing to fix", flush=True)
+        return zero_delta.numpy(), positions, seg_len, pre_scan_worst
+
     best_delta = None
     best_worst_shift_max = 1.0
     rng = np.random.default_rng(1234)
@@ -502,11 +637,19 @@ def optimize_eot_verified(
             # worst-shift score per position (Fable-recommended metric) - not
             # just the exact-position score, which is precisely the check
             # that let non-robust deltas look converged all session.
+            # BUG FIX (adversarial audit, verified directly): a None from
+            # _worst_shift_score (no valid in-bounds window at all for this
+            # position) must never be compared against real_target or fed
+            # into max() as if it were a real score - treat it as "cannot
+            # confirm clean," i.e. as bad as scoring 1.0 (the worst
+            # possible), so it counts toward n_bad and can never make
+            # worst_shift_max look artificially low.
             worst_shift_scores = {}
             for pos in positions:
-                worst_shift_scores[pos] = _worst_shift_score(
+                raw = _worst_shift_score(
                     perturbed_np, pos, seg_len, n,
                     shift_range_sec=eot_jitter_sec, shift_step_sec=0.1, sr=SR)
+                worst_shift_scores[pos] = raw if raw is not None else 1.0
             worst_shift_max = max(worst_shift_scores.values())
             n_bad = sum(1 for v in worst_shift_scores.values() if v > real_target)
             if verbose:
@@ -528,7 +671,12 @@ def optimize_eot_verified(
                 best_worst_shift_max = worst_shift_max
                 best_delta = delta.detach().clone()
 
-            if worst_shift_max < real_target and step >= min_steps:
+            # same fix as optimize_whole_track_verified above: only hold a
+            # comfortably-clear result to the min_steps floor when it's
+            # actually still close to the line, not just because a step
+            # counter hasn't hit an arbitrary number yet.
+            comfortably_clear = worst_shift_max < real_target * 0.5
+            if worst_shift_max < real_target and (step >= min_steps or comfortably_clear):
                 print(f"  converged (shift-robust, real-verified) at step {step}")
                 break
 
@@ -552,12 +700,22 @@ def optimize_eot_verified(
     guarded_delta = apply_silence_guard_to_delta(best_delta, audio)
     with torch.no_grad():
         guarded_perturbed_np = (audio + guarded_delta).numpy()
-    post_guard_worst = max(
-        (_worst_shift_score(guarded_perturbed_np, pos, seg_len, n,
-                             shift_range_sec=eot_jitter_sec, shift_step_sec=0.1, sr=SR)
-         for pos in positions),
-        default=1.0,
-    )
+    # BUG FIX (adversarial audit, verified directly): this is the FINAL
+    # certification value returned to cnn_fix.py as pre_transfer_worst -
+    # the last line of defense before a delta gets shipped. A None from
+    # _worst_shift_score (no valid in-bounds window) must fail closed here
+    # above anywhere else in this file: treat it as the worst possible
+    # score (1.0), never silently drop it from the max() via a filter that
+    # could let an all-None scan report a false "clean" default.
+    post_guard_results = [
+        s if s is not None else 1.0
+        for s in (
+            _worst_shift_score(guarded_perturbed_np, pos, seg_len, n,
+                                shift_range_sec=eot_jitter_sec, shift_step_sec=0.1, sr=SR)
+            for pos in positions
+        )
+    ]
+    post_guard_worst = max(post_guard_results, default=1.0)
     print(f"  post-silence-guard worst-shift real score: {post_guard_worst:.4f} "
           f"(pre-guard was {best_worst_shift_max:.4f})")
     if post_guard_worst > best_worst_shift_max + 1e-6:

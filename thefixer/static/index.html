@@ -231,7 +231,14 @@ header {
   gap: 20px;
   align-items: start;
 }
-@media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+@media (max-width: 980px) {
+  .grid { grid-template-columns: 1fr; }
+  /* on a single column, every panel just stacks in natural source order -
+     the explicit two-column placement below only applies at desktop
+     widths where the grid actually has two columns to place into. */
+  #preprocessGrid > .panel:first-child { grid-column: 1; grid-row: auto; }
+  #preprocessGrid > .panel:last-child { grid-column: 1; grid-row: auto; }
+}
 
 .panel {
   background: var(--panel);
@@ -472,8 +479,19 @@ canvas#waveformOverviewCanvas {
 .run-count { font-size: 12px; color: var(--text-faint); margin-left: auto; }
 
 /* ---------- Progress ---------- */
-.progress-panel { display: none; }
+.progress-panel { display: none; grid-column: 1; grid-row: 2; }
 .progress-panel.active { display: block; }
+/* explicit grid placement (see the layout comment above #preprocessGrid's
+   markup): source order is [Detector Analysis, Processing, Signal Chain],
+   but Processing should stack under Detector Analysis in the LEFT column,
+   not sit beside it as a 3rd auto-placed grid item - and Signal Chain
+   should span both rows on the right so it stays one tall column next to
+   the shorter left-side stack, instead of the whole grid collapsing
+   Processing down below both columns and leaving a large empty gap under
+   Detector Analysis while Signal Chain is still taller. */
+#preprocessGrid { grid-template-rows: auto auto; }
+#preprocessGrid > .panel:first-child { grid-column: 1; grid-row: 1; }
+#preprocessGrid > .panel:last-child { grid-column: 2; grid-row: 1 / span 2; }
 .progress-step-row {
   display: flex; justify-content: space-between; align-items: baseline;
   font-size: 12.5px; margin-bottom: 8px;
@@ -528,6 +546,7 @@ canvas#waveformOverviewCanvas {
 .log-badge.pass { background: var(--accent-glow); color: var(--good); }
 .log-badge.retry { background: rgba(232,163,61,0.15); color: var(--warn); }
 .log-badge.fail { background: rgba(224,84,79,0.15); color: var(--crit); }
+.log-badge.margin { background: rgba(94, 201, 168, 0.12); color: var(--accent-dim, var(--good)); }
 
 /* ---------- Results ---------- */
 .results { display: none; flex-direction: column; gap: 20px; }
@@ -663,7 +682,7 @@ footer {
       <audio id="originalPlayer" controls preload="none"></audio>
     </div>
 
-    <div class="grid">
+    <div class="grid" id="preprocessGrid">
       <!-- LEFT: analysis -->
       <div class="panel">
         <div class="panel-head"><span class="title">Detector Analysis</span></div>
@@ -716,6 +735,23 @@ footer {
           </div>
         </div>
       </div>
+
+    <div class="panel progress-panel" id="progressPanel">
+      <div class="panel-head">
+        <span class="title">Processing</span>
+        <span class="mono elapsed-time" id="elapsedTime"></span>
+        <button class="check-all-btn cancel-job-btn hidden" id="cancelJobBtn" type="button">Cancel job</button>
+        <button class="check-all-btn copy-log-btn" id="copyLogBtn" type="button">Copy log</button>
+      </div>
+      <div class="panel-body">
+        <div class="progress-step-row">
+          <span class="mono" id="progressStepLabel">—</span>
+          <span class="mono" id="progressStepCount"></span>
+        </div>
+        <div class="progress-bar-track"><div class="progress-bar-fill" id="progressFill"></div></div>
+        <div class="log-box mono" id="logBox"></div>
+      </div>
+    </div>
 
       <!-- RIGHT: tool chain -->
       <div class="panel">
@@ -778,22 +814,6 @@ footer {
       </div>
     </div>
 
-    <div class="panel progress-panel" id="progressPanel">
-      <div class="panel-head">
-        <span class="title">Processing</span>
-        <span class="mono elapsed-time" id="elapsedTime"></span>
-        <button class="check-all-btn cancel-job-btn hidden" id="cancelJobBtn" type="button">Cancel job</button>
-        <button class="check-all-btn copy-log-btn" id="copyLogBtn" type="button">Copy log</button>
-      </div>
-      <div class="panel-body">
-        <div class="progress-step-row">
-          <span class="mono" id="progressStepLabel">—</span>
-          <span class="mono" id="progressStepCount"></span>
-        </div>
-        <div class="progress-bar-track"><div class="progress-bar-fill" id="progressFill"></div></div>
-        <div class="log-box mono" id="logBox"></div>
-      </div>
-    </div>
 
     <div class="results" id="results">
 
