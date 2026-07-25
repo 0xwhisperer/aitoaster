@@ -36,9 +36,78 @@ def _transfer_delta_to_stereo(stereo_audio, sr, delta_16k):
     native_delta = native_normalized / scale
     output = stereo_audio.copy()
     n_delta = min(len(output), len(native_delta))
-    output[:n_delta, 0] += native_delta[:n_delta]
-    output[:n_delta, 1] += native_delta[:n_delta]
+
+    # BUG FIX (audible flutter at track start, measured directly): the
+    # optimizers gate the delta against near-silence at the model's 16kHz
+    # rate, but that guarantee does not survive the resample above.
+    # Polyphase resampling rings across the gate boundary, so a delta that
+    # is a HARD ZERO across a silent intro at 16kHz comes back with real
+    # energy there at 44.1kHz - measured at ~1.45x the active-region RMS
+    # from a literally all-zero input region.
+    #
+    # On the real "North Star" track (a -68dBFS fade-in opening) this put
+    # correction energy at ~1.0x the source level across the first 40ms,
+    # against ~-24dB everywhere else: a ~20dB outlier sitting on top of a
+    # near-silent intro, which is what made the flutter audible at the
+    # beginning specifically. The silence guard's whole purpose is to
+    # prevent exactly this, so re-apply it at the NATIVE rate against the
+    # NATIVE source, after the resample that breaks it.
+    native_delta = _apply_native_silence_guard(
+        native_delta[:n_delta],
+        stereo_audio[:n_delta].mean(axis=1),
+        sr,
+    )
+    output[:n_delta, 0] += native_delta
+    output[:n_delta, 1] += native_delta
     return output
+
+
+def _apply_native_silence_guard(delta, mono_source, sr, win_sec=0.02):
+    """Gate a native-rate delta wherever the native-rate source is silent.
+
+    Mirrors _silence_guard in cnn_gradient_optimizer_v2 (same 20ms blocks,
+    same -70dBFS floor / -35dBFS ceiling, same squared falloff) so the
+    delivered file honors the identical rule the optimizer certified
+    against, rather than a weaker one.  Implemented on numpy here because
+    this runs on the native-rate stereo transfer path, outside the torch
+    optimization graph.
+
+    The block gain is linearly interpolated across each block instead of
+    applied as a hard per-block step: a 20ms staircase on the correction is
+    itself a 50Hz amplitude modulation, which is the same class of artifact
+    this is meant to remove.
+    """
+    n = len(delta)
+    if n == 0:
+        return delta
+    win = max(1, int(win_sec * sr))
+    n_blocks = (n + win - 1) // win
+    pad = n_blocks * win - n
+
+    padded_source = np.pad(mono_source, (0, pad)) if pad else mono_source
+    blocks = padded_source.reshape(n_blocks, win)
+    block_rms = np.sqrt((blocks ** 2).mean(axis=1) + 1e-12)
+    block_db = 20 * np.log10(block_rms + 1e-8)
+
+    floor_db, ceiling_db = -70.0, -35.0
+    gate = np.clip((block_db - floor_db) / (ceiling_db - floor_db), 0.0, 1.0)
+    gate = gate ** 2
+
+    # Interpolate the per-block gain onto a per-sample envelope, anchored at
+    # each block's center, so the gate ramps smoothly instead of stepping.
+    #
+    # Interpolating alone is not safe at a silence->music boundary: the ramp
+    # between a silent block and the loud one after it would re-open the gate
+    # over the tail of the silent block, which is exactly where the resampler
+    # deposits its ringing. Take the per-sample minimum of the interpolated
+    # envelope and each sample's OWN block gain, so smoothing can only ever
+    # lower the gain, never raise it above what that block's own loudness
+    # permits.
+    centers = np.arange(n_blocks) * win + win / 2.0
+    envelope = np.interp(np.arange(n), centers, gate)
+    own_block_gate = np.repeat(gate, win)[:n]
+    envelope = np.minimum(envelope, own_block_gate)
+    return (delta * envelope.astype(delta.dtype)).astype(delta.dtype)
 
 
 def _resample_mono(audio, sr_in, sr_out):
