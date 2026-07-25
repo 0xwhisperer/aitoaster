@@ -59,7 +59,9 @@ def _tighten_retry_targets(real_target, surrogate_target):
 
 
 def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=225,
-                max_retries=3, progress_cb=None, step_progress_cb=None):
+                max_retries=3, progress_cb=None, step_progress_cb=None,
+                prefer_feature_solver=True, feature_min_snr_db=35.0,
+                feature_max_gain_db=0.75):
     """Apply the gradient-based linear-model fix. stereo_audio: [N,2] float32
     at native sr (typically 44100). Returns (fixed_stereo, info).
 
@@ -101,6 +103,100 @@ def fix_linear(stereo_audio, sr, target=0.005, real_target=0.008, max_steps=225,
     if progress_cb and truncated:
         progress_cb(f"linear: model only ever scores the first {MAX_DURATION}s of a track "
                     f"(matches the detector's own limit) - only that portion will be corrected")
+
+    # Fast first-stage solve. The detector reduces the complete analysis prefix
+    # to one mean log spectrum before applying its 3,585-feature classifier, so
+    # optimize that sufficient statistic directly and reconstruct only once.
+    # The existing waveform optimizer below remains the correctness fallback:
+    # the feature candidate must survive the exact same native-rate stereo
+    # transfer check, plus conservative SNR and spectral-gain guards, before it
+    # can return.
+    if prefer_feature_solver:
+        try:
+            from .linear_feature_optimizer import optimize_feature_eq
+
+            if progress_cb:
+                progress_cb(
+                    "linear: trying fast feature-domain solve before the "
+                    "waveform optimizer"
+                )
+            feature_result = optimize_feature_eq(analysis, target_score=0.00005)
+            feature_delta = feature_result.audio - analysis
+            feature_delta_peak = float(np.abs(feature_delta).max())
+
+            if feature_delta_peak >= 1e-9:
+                scale = 0.9 / feature_delta_peak
+                normalized = feature_delta * scale
+                native_normalized = (
+                    _resample_mono(normalized, LIN_SR, sr)
+                    if sr != LIN_SR else normalized
+                )
+                native_delta = native_normalized / scale
+                n_delta = min(len(stereo_audio), len(native_delta))
+                feature_out = stereo_audio.copy()
+                feature_out[:n_delta, 0] += native_delta[:n_delta]
+                feature_out[:n_delta, 1] += native_delta[:n_delta]
+
+                peak = np.abs(feature_out).max()
+                if peak > 0.97:
+                    feature_out *= 0.97 / peak
+
+                transferred_score = _score_stereo_array(feature_out, sr)
+                # Measure the actual delivered stereo result. A channel-only
+                # check can misreport quality on asymmetric material (for
+                # example a silent or deliberately sparse left channel).
+                orig_rms = np.sqrt(np.mean(stereo_audio ** 2))
+                delta_rms = np.sqrt(np.mean((feature_out - stereo_audio) ** 2))
+                transferred_snr = float(
+                    20 * np.log10(orig_rms / (delta_rms + 1e-12))
+                )
+                quality_ok = (
+                    transferred_snr >= feature_min_snr_db
+                    and feature_result.gain_peak_db <= feature_max_gain_db
+                )
+
+                if progress_cb:
+                    progress_cb(
+                        "linear: feature-domain result checked on transferred "
+                        f"stereo output: {transferred_score * 100:.5f}% AI, "
+                        f"SNR {transferred_snr:.1f}dB, peak spectral adjustment "
+                        f"{feature_result.gain_peak_db:.2f}dB"
+                    )
+
+                if transferred_score < ACCEPT_THRESHOLD and quality_ok:
+                    return feature_out, {
+                        "applied": True,
+                        "method": "feature_domain",
+                        "snr_db": transferred_snr,
+                        "target": target,
+                        "final_real_score": transferred_score,
+                        "attempts": 1,
+                        "feature_solver_sec": feature_result.elapsed_sec,
+                        "feature_gain_rms_db": feature_result.gain_rms_db,
+                        "feature_gain_peak_db": feature_result.gain_peak_db,
+                    }
+
+                if progress_cb:
+                    reason = (
+                        f"score remained {transferred_score * 100:.3f}%"
+                        if transferred_score >= ACCEPT_THRESHOLD
+                        else "perceptual quality guard was not met"
+                    )
+                    progress_cb(
+                        f"linear: fast feature-domain candidate rejected ({reason}); "
+                        "falling back to the full waveform optimizer"
+                    )
+            elif progress_cb:
+                progress_cb(
+                    "linear: feature-domain solve found no correction; falling "
+                    "back to the full waveform optimizer"
+                )
+        except Exception as exc:
+            if progress_cb:
+                progress_cb(
+                    "linear: feature-domain solve could not complete "
+                    f"({exc}); falling back to the full waveform optimizer"
+                )
 
     # track the best-scoring attempt across all retries, not just the last one -
     # a later retry can converge WORSE than an earlier one (each retry tightens
