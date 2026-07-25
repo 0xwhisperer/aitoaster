@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import torch.nn as nn
 import subprocess
 import yaml
 import onnxruntime as ort
@@ -26,6 +27,59 @@ _model.eval()
 for p in _model.parameters():
     p.requires_grad = False
 
+
+class CNNConvolutionalTrunk(nn.Module):
+    """The ONNX CNN up through the last max-pool, with time preserved.
+
+    The modules are references to the converted ONNX graph's modules rather
+    than a second copy of the weights.  Keeping this split here makes the
+    existing single-segment path numerically equivalent while allowing the
+    prototype whole-track path to run the trunk once and pool sliding spans
+    of its output.
+    """
+
+    def __init__(self, converted_model):
+        super().__init__()
+        self.conv1 = getattr(converted_model, "conv1/conv/Conv")
+        self.relu1 = getattr(converted_model, "conv1/Relu")
+        self.conv2 = getattr(converted_model, "conv2/conv/Conv")
+        self.relu2 = getattr(converted_model, "conv2/Relu")
+        self.pool2 = getattr(converted_model, "conv2/pool/MaxPool")
+        self.conv3 = getattr(converted_model, "conv3/conv/Conv")
+        self.relu3 = getattr(converted_model, "conv3/Relu")
+        self.pool3 = getattr(converted_model, "conv3/pool/MaxPool")
+        self.conv4 = getattr(converted_model, "conv4/conv/Conv")
+        self.relu4 = getattr(converted_model, "conv4/Relu")
+        self.pool4 = getattr(converted_model, "conv4/pool/MaxPool")
+
+    def forward(self, x):
+        x = self.relu1(self.conv1(x))
+        x = self.pool2(self.relu2(self.conv2(x)))
+        x = self.pool3(self.relu3(self.conv3(x)))
+        return self.pool4(self.relu4(self.conv4(x)))
+
+
+class CNNMLPHead(nn.Module):
+    """The ONNX classifier after global average pooling.
+
+    ``nn.Linear`` naturally applies across the final dimension, so the head
+    accepts either one pooled vector per batch item ([B, 128]) or a sequence
+    of pooled vectors ([B, cells, 128]).
+    """
+
+    def __init__(self, converted_model):
+        super().__init__()
+        self.fc1 = getattr(converted_model, "classifier/classifier/1/Gemm")
+        self.relu = getattr(converted_model, "classifier/classifier/2/Relu")
+        self.fc2 = getattr(converted_model, "classifier/classifier/4/Gemm")
+
+    def forward(self, pooled):
+        return self.fc2(self.relu(self.fc1(pooled))).squeeze(-1)
+
+
+_cnn_trunk = CNNConvolutionalTrunk(_model)
+_cnn_head = CNNMLPHead(_model)
+
 _cqt_transform = CQT(sr=SR, fmin=CQT_CFG["fmin"], n_bins=CQT_CFG["n_bins"],
                       bins_per_octave=CQT_CFG["bins_per_octave"], hop_length=CQT_CFG["hop_length"],
                       output_format="Magnitude", verbose=False)
@@ -45,16 +99,36 @@ def _dct_matrix(N):
 _dctmat = _dct_matrix(CQT_CFG["n_bins"])
 
 
-def forward_logit_differentiable(audio_1d):
-    """audio_1d: [1, T] -> raw logit (pre-sigmoid), differentiable end-to-end
-    via nnAudio's CQT (a verified-close surrogate for librosa's CQT)."""
+def differentiable_cepstrum(audio_1d):
+    """Compute the differentiable nnAudio CQT/cepstrum exactly once.
+
+    ``audio_1d`` is [B, T].  This is intentionally the existing surrogate
+    preprocessing; the exact librosa/ONNX certificate remains in
+    ``get_real_score_segment`` and ``detector.CNNDetector``.
+    """
     cqt_mag = _cqt_transform(audio_1d)
     log_cqt = torch.log(cqt_mag + 1e-6)
     cepstrum = torch.einsum('kb,cbt->ckt', _dctmat, log_cqt)
-    cepstrum = cepstrum[:, :N_COEFFS, :]
-    model_input = cepstrum.unsqueeze(1)
-    logit = _model(model_input)
-    return logit[0, 0]
+    return cepstrum[:, :N_COEFFS, :]
+
+
+def convolutional_trunk_from_cepstrum(cepstrum):
+    """Run the split convolutional trunk on [B, 24, time] cepstra."""
+    return _cnn_trunk(cepstrum.unsqueeze(1))
+
+
+def mlp_head_from_pooled(pooled):
+    """Run the split MLP head on [B, 128] or [B, cells, 128] vectors."""
+    return _cnn_head(pooled)
+
+
+def forward_logit_differentiable(audio_1d):
+    """audio_1d: [1, T] -> raw logit (pre-sigmoid), differentiable end-to-end
+    via nnAudio's CQT (a verified-close surrogate for librosa's CQT)."""
+    cepstrum = differentiable_cepstrum(audio_1d)
+    trunk = convolutional_trunk_from_cepstrum(cepstrum)
+    pooled = trunk.mean(dim=(2, 3))
+    return mlp_head_from_pooled(pooled)[0]
 
 
 def forward_score_differentiable(audio_1d):
@@ -69,6 +143,12 @@ _input_name = _session.get_inputs()[0].name
 
 def get_real_score_segment(audio_np):
     """Ground truth: exact librosa-based pipeline the real model uses."""
+    output = get_real_logit_segment(audio_np)
+    return float(1 / (1 + np.exp(-output)))
+
+
+def get_real_logit_segment(audio_np):
+    """Return the raw logit from the unchanged librosa/ONNX path."""
     cqt = librosa.cqt(audio_np, sr=SR, fmin=CQT_CFG["fmin"], n_bins=CQT_CFG["n_bins"],
                        bins_per_octave=CQT_CFG["bins_per_octave"], hop_length=CQT_CFG["hop_length"])
     cqt_mag = np.abs(cqt)
@@ -76,7 +156,7 @@ def get_real_score_segment(audio_np):
     cepstrum = dct(log_cqt, type=2, axis=0, norm='ortho')[:N_COEFFS, :]
     batch = cepstrum[np.newaxis, np.newaxis, :, :].astype(np.float32)
     output = _session.run(None, {_input_name: batch})[0]
-    return 1 / (1 + np.exp(-output[0, 0]))
+    return float(output[0, 0])
 
 
 def load_audio_mono(path, sr=SR):
