@@ -413,6 +413,37 @@
     clearProcessingLog();
   }
 
+  function clearResultCharts() {
+    // Wipe everything the PREVIOUS run's results rendered, so clicking
+    // "Process file" again does not leave the old run's spectrum, waveform
+    // and correction overlays on screen - stale charts that describe an
+    // output which no longer exists while the new job is still running.
+    //
+    // Deliberately NOT clearAnalysisDisplay(): the Detector Analysis panel
+    // describes the uploaded FILE, which has not changed on a re-run, so
+    // blanking its scores would throw away still-valid information. Only the
+    // result-side charts are reset here.
+    const specCtx = $("spectrumCanvas").getContext("2d");
+    specCtx.clearRect(0, 0, $("spectrumCanvas").width, $("spectrumCanvas").height);
+    const waveCtx = $("waveformOverviewCanvas").getContext("2d");
+    waveCtx.clearRect(0, 0, $("waveformOverviewCanvas").width, $("waveformOverviewCanvas").height);
+    $("waveformDuration").textContent = "";
+    $("spectrumLegend").classList.remove("active");
+    $("spectrumLegend").innerHTML = "";
+    $("waveformLegend").classList.remove("active");
+    $("waveformLegend").innerHTML = "";
+    document.querySelectorAll(".chart-view-row").forEach(el => el.classList.remove("active"));
+    // stop and detach the previous run's overlay players; leaving them live
+    // means audio from the OLD output can keep playing over the new job.
+    document.querySelectorAll("#correctionOverlayList audio").forEach(a => {
+      a.pause();
+      a.removeAttribute("src");
+      a.load();
+    });
+    $("correctionOverlayPanel")?.classList.add("hidden");
+    state.lastResult = null;
+  }
+
   function clearProcessingLog() {
     $("logBox").innerHTML = "";
     $("progressPanel").classList.remove("active");
@@ -958,6 +989,11 @@
     // adversarial audit round found here. It also removes .active, so it
     // must run BEFORE the panel is shown below.
     clearProcessingLog();
+    // Reset the previous run's result charts too - hiding #results leaves the
+    // old spectrum/waveform pixels and legends intact underneath, so they
+    // reappear unchanged the moment the new run finishes rendering, and are
+    // visibly stale if the user re-opens the panel mid-job.
+    clearResultCharts();
     $("progressPanel").classList.add("active");
     $("results").classList.remove("active");
     $("progressFill").style.width = "6%";
