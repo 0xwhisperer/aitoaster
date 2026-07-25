@@ -28,11 +28,23 @@ def apply_fade(audio, sr, fade_in_ms=10, fade_out_ms=3000):
     UI sliders expose. Passing 0 (or a negative) for either disables that
     side, so a fade-out-only or fade-in-only run is possible.
 
-    Uses an EQUAL-POWER (sine/cosine quarter-cycle) curve rather than a
-    linear ramp. A linear amplitude ramp sounds like it dips in the middle,
-    because perceived loudness follows power rather than amplitude; the sine
-    curve holds constant power through the fade, which is what a mastering
-    engineer's fade actually does.
+    Uses a raised-cosine (sine-squared) S-curve.
+
+    NAMING NOTE: this was originally labelled "equal-power", which is wrong.
+    Equal-power is a CROSSFADE term - it describes a sin/cos pair whose
+    squares sum to 1 so the summed power stays constant through a transition
+    between two sources. A single fade to silence has no such constraint,
+    and there is no single industry-standard curve for one; DAWs offer a
+    choice (linear, exponential, logarithmic, S-curve).
+
+    Measured at the fade midpoint:
+        linear       -> -6.0 dB
+        sine         -> -3.0 dB   (the actual "equal-power" curve)
+        sine-squared -> -6.0 dB   (this one)
+
+    So this matches linear at the halfway point but, unlike linear, has zero
+    slope at BOTH ends - no corner at the start or the end of the fade. That
+    is the usual reason to prefer an S-curve for a fade-out.
 
     Handles the degenerate cases the sliders make reachable: a fade longer
     than the track itself, and a fade-in plus fade-out that would otherwise
@@ -65,7 +77,7 @@ def apply_fade(audio, sr, fade_in_ms=10, fade_out_ms=3000):
 
     envelope = np.ones(n, dtype=np.float64)
     if in_samples > 1:
-        # sin(0..pi/2): 0 -> 1, equal power
+        # sin^2(0..pi/2): 0 -> 1, S-curve (zero slope at both ends)
         envelope[:in_samples] = np.sin(
             np.linspace(0.0, np.pi / 2, in_samples)
         ) ** 2
@@ -89,7 +101,7 @@ def apply_fade(audio, sr, fade_in_ms=10, fade_out_ms=3000):
         "fade_out_ms": out_ms,
         "fade_in_samples": int(in_samples),
         "fade_out_samples": int(out_samples),
-        "curve": "equal-power (sine squared)",
+        "curve": "raised-cosine S-curve (sine squared)",
     }
 
 
@@ -1664,6 +1676,10 @@ def strip_metadata_tags(in_path, out_path):
     subprocess.run(
         ["ffmpeg", "-v", "quiet", "-y", "-i", str(in_path),
          "-map", "0:a", "-map_metadata", "-1", "-map_chapters", "-1",
+         # +bitexact also suppresses ffmpeg's own "Lavf<version>" encoder
+         # tag, which -map_metadata -1 does not remove (see _STRIP_ARGS in
+         # server.py for the per-format verification).
+         "-fflags", "+bitexact", "-flags:a", "+bitexact",
          "-c", "copy", str(out_path)],
         check=True,
     )

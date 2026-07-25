@@ -45,7 +45,7 @@ class FadeTests(unittest.TestCase):
         self.assertAlmostEqual(float(np.abs(out[-1]).max()), 0.0, places=6)
 
     def test_curve_is_monotonic_and_smooth(self):
-        """An equal-power curve, not a linear ramp, and no steps."""
+        """A smooth S-curve, not a linear ramp, and no steps."""
         audio = _tone()
         out, _ = chain.apply_fade(audio, SR, fade_in_ms=1000, fade_out_ms=0)
         n = int(1.0 * SR)

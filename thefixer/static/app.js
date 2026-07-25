@@ -179,7 +179,7 @@
     { id: "normalize_lufs", group: "chainGroupMaster", name: "LUFS loudness normalization", desc: "Targets -14 LUFS, the standard streaming-platform loudness reference.", info: "lufs" },
     { id: "multiband_compress", group: "chainGroupMaster", name: "Multiband compression", desc: "Gentle 3-band dynamics smoothing for tonal balance.", info: "tool_multiband_compress" },
     { id: "true_peak_limit", group: "chainGroupMaster", name: "True-peak limiter", desc: "Brick-wall safety ceiling at -1dBTP, accounting for inter-sample peaks.", info: "tool_true_peak_limit" },
-    { id: "fade", group: "chainGroupMaster", name: "Fade in / fade out", desc: "Equal-power fade at the start and end of the track. Runs last, after the limiter, so no later gain stage undoes it.", info: "tool_fade" },
+    { id: "fade", group: "chainGroupMaster", name: "Fade in / fade out", desc: "Smooth S-curve fade at the start and end of the track. Runs last, after the limiter, so no later gain stage undoes it.", info: "tool_fade" },
   ];
 
   // BUG FIX (second adversarial audit round): the analysis-response race
@@ -868,7 +868,7 @@
               <input type="range" id="fadeOutSlider" min="10" max="10000" step="10" value="${state.fadeOutMs}">
               <span class="slider-value mono" id="fadeOutValue">${fmtFadeMs(state.fadeOutMs)}</span>
             </div>
-            <div class="cnn-mode-hint">Equal-power curve. Applied after the limiter so nothing later undoes it.</div>
+            <div class="cnn-mode-hint">Smooth S-curve fade. Applied after the limiter so nothing later undoes it.</div>
           </div>`;
         }
         // BUG FIX (Codex MAJOR / Fable B3, verified directly): multiband_compress

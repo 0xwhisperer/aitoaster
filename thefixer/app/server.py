@@ -217,6 +217,34 @@ def resolve_output_format(requested_format, original_upload_path):
                     f"delivering as .wav instead of matching the original format")
 
 
+# Metadata-suppression args applied to EVERY ffmpeg encode of a delivered
+# file. -map_metadata -1 drops anything carried from the input; +bitexact
+# additionally stops ffmpeg writing its OWN self-identifying encoder tag
+# ("Lavf<version>"), which -map_metadata alone does not touch.
+#
+# Verified per format with byte-level inspection, not just ffprobe:
+#   flac -> no encoder tag, no "Lavf" anywhere in the file
+#   m4a  -> no encoder tag, no "Lavf" anywhere in the file
+#   mp3  -> no encoder tag, and with -id3v2_version 0 no ID3 header at all
+#
+# NOT applied: -write_xing 0. It would remove the last "Lavf" string (which
+# lives in the Xing/LAME info frame, part of the bitstream rather than a
+# tag), but the Xing header carries the VBR duration/seek table. Measured
+# directly: dropping it made a 3.000s file report as 2.980s, breaking
+# seeking and gapless playback. Not worth trading real playback correctness
+# to hide a string that identifies ffmpeg, not the user or the source.
+#
+# Also unavoidable: libmp3lame stamps "LAME3.100" into the frame data
+# itself. No ffmpeg flag suppresses it; removing it would mean rewriting
+# the encoded frames.
+_STRIP_ARGS = [
+    "-map_metadata", "-1",
+    "-map_chapters", "-1",
+    "-fflags", "+bitexact",
+    "-flags:a", "+bitexact",
+]
+
+
 def encode_final_output(audio, sr, out_format, dest_path_no_ext, mp3_mode="vbr0"):
     """Write the final processed audio to disk in the requested format, with
     ALL container/ID3 metadata stripped regardless of format (WAV via
@@ -251,15 +279,20 @@ def encode_final_output(audio, sr, out_format, dest_path_no_ext, mp3_mode="vbr0"
             else:
                 mp3_args = ["-q:a", "0"]
             cmd = ["ffmpeg", "-v", "quiet", "-y", "-i", str(tmp_wav),
-                   "-map_metadata", "-1", "-codec:a", "libmp3lame", *mp3_args,
+                   *_STRIP_ARGS,
+                   # suppress the ID3v2 container ffmpeg writes purely to
+                   # hold its own encoder tag - verified: with this the file
+                   # no longer starts with an "ID3" header at all
+                   "-id3v2_version", "0",
+                   "-codec:a", "libmp3lame", *mp3_args,
                    str(final_path)]
         elif out_format == "flac":
             cmd = ["ffmpeg", "-v", "quiet", "-y", "-i", str(tmp_wav),
-                   "-map_metadata", "-1", "-codec:a", "flac",
+                   *_STRIP_ARGS, "-codec:a", "flac",
                    str(final_path)]
         elif out_format == "m4a":
             cmd = ["ffmpeg", "-v", "quiet", "-y", "-i", str(tmp_wav),
-                   "-map_metadata", "-1", "-codec:a", "aac", "-b:a", "256k",
+                   *_STRIP_ARGS, "-codec:a", "aac", "-b:a", "256k",
                    "-f", "mp4", str(final_path)]
         else:
             raise ValueError(f"unknown output format: {out_format}")
