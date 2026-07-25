@@ -289,7 +289,7 @@
               lastResult: null, spectrumViewMode: "both", waveformViewMode: "both" };
     $("workspace").classList.remove("active");
     $("results").classList.remove("active");
-    $("preprocessGrid").classList.remove("hidden");
+    $("detectorAnalysisPanel").classList.remove("hidden");
     $("progressPanel").classList.remove("active");
     $("spectrumLegend").classList.remove("active");
     $("waveformLegend").classList.remove("active");
@@ -352,7 +352,7 @@
 
       $("workspace").classList.add("active");
       $("results").classList.remove("active");
-      $("preprocessGrid").classList.remove("hidden");
+      $("detectorAnalysisPanel").classList.remove("hidden");
       renderToolChain();
       await runAnalysis();
     } catch (err) {
@@ -1243,17 +1243,6 @@
         $("runBtn").disabled = false;
         $("cancelJobBtn").classList.add("hidden");
         state.result = data.result;
-        // BUG FIX (direct user report): renderResults() hides the whole
-        // #preprocessGrid (which #progressPanel/its log live inside), but
-        // hiding is not clearing - the finished job's log content stayed
-        // sitting in the DOM until the NEXT run's click handler wiped it,
-        // so anything that could make the panel visible again in between
-        // (a stray toggle, a future feature, simple bad hygiene) would show
-        // a completed job's stale log instead of nothing. Clear it the
-        // moment the job that produced it is actually done, not on a
-        // delay tied to when the user happens to start another one.
-        $("progressPanel").classList.remove("active");
-        $("logBox").innerHTML = "";
         renderResults(data.result);
       } else if (data.status === "error") {
         stopElapsedTimer();
@@ -1275,17 +1264,10 @@
   // ---------- results ----------
   function renderResults(result) {
     $("results").classList.add("active");
-    // BUG FIX (direct user report): the pre-processing "Detector Analysis"
-    // panel (left column of the upload/tool-picker grid) had no visibility
-    // gating at all - it stayed on screen showing the ORIGINAL file's
-    // scores/transient count forever, even once real post-processing
-    // results were shown right below/beside it. Confirmed directly this
-    // read as instrument disagreement ("why does it say CNN 0.0% here but
-    // 2.5% down there") when it was actually just a stale pre-job snapshot
-    // with nothing distinguishing it from current state. Hide it the
-    // moment real results are available - runAnalysis()/resetWorkspace()
-    // already show it again for the next file.
-    $("preprocessGrid").classList.add("hidden");
+    // BUG FIX (direct user report): nothing in the pre-processing grid
+    // (Detector Analysis, the Processing log, Signal Chain) gets hidden
+    // when results render - the user explicitly wants all of it to stay on
+    // screen alongside the results panel, not disappear.
 
     const passBanner = $("verdictBanner");
     $("verdictFilename").textContent = state.filename || "";
