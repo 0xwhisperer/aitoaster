@@ -133,6 +133,21 @@ class ParallelActivePrototypeTests(unittest.TestCase):
             second.grad, first.grad, rtol=0, atol=0
         )
 
+    def test_modulation_penalty_detects_fluttering_correction(self):
+        sr = 16_000
+        seconds = 4
+        time = torch.arange(sr * seconds) / sr
+        original = torch.full_like(time, 0.1)
+        steady = torch.full_like(time, 0.001)
+        flutter = steady * (
+            1.0 + 0.8 * torch.sin(2 * torch.pi * 5.0 * time)
+        )
+        context = CachedCNNQualityPenalty(original)
+        self.assertGreater(
+            context.modulation(flutter),
+            context.modulation(steady) * 100,
+        )
+
     def test_sentinels_are_deterministic_and_cover_endpoints(self):
         positions = list(range(100))
         first = active._sentinel_positions(positions, count=8)

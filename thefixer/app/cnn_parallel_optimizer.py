@@ -33,6 +33,30 @@ from .cnn_low_iteration_prototype import (
 from .cnn_quality_context import CachedCNNQualityPenalty
 from .cnn_real_scanner import ParallelRealScoreScanner
 
+# Weight on the flutter/modulation penalty.
+#
+# CALIBRATION (this was originally 20_000, which is ~1000x too large and made
+# the optimizer unusable): 20_000 was tuned against a SYNTHETIC constant-
+# envelope signal, where modulation() returns ~1e-6. On real music the same
+# term returns ~7.8e-02 - five orders of magnitude larger - because genuine
+# music has a constantly varying envelope that never fully flattens.
+#
+# Measured on the real track at a representative delta (max|grad| of each
+# quality term's own lambda-weighted contribution):
+#
+#     perceptual (lambda 2000)   3.4e-01
+#     band       (lambda 5000)   6.5e+00   <- previously the largest
+#     tonality   (lambda 50)     2.8e-02
+#     modulation (lambda 20000)  7.1e+03   <- 1099x the band term
+#
+# At 20_000 the modulation gradient dominated every other term combined, so
+# Adam drove the delta somewhere that made the downstream real-score scan
+# fail outright ("parallel CNN real-score worker failed" on step 0's
+# certificate, reproducible on the real track and absent with lambda=0).
+# 18.0 makes it a co-equal regularizer with the band term (~0.55x) rather
+# than the sole objective.
+DEFAULT_LAMBDA_MODULATION = 18.0
+
 
 def _initial_weights(
     positions: list[int],
@@ -113,6 +137,7 @@ def optimize_parallel_active(
     max_repair_rounds: int = 3,
     gradient_workers: int = 5,
     gradient_threads: int = 2,
+    lambda_modulation: float = DEFAULT_LAMBDA_MODULATION,
     delivery_transform=None,
     delivery_check_steps: tuple[int, ...] = (50, 60),
     progress_cb=None,
@@ -184,6 +209,7 @@ def optimize_parallel_active(
                 lambda_perceptual=DEFAULT_LAMBDA_PERCEPTUAL,
                 lambda_band=DEFAULT_LAMBDA_BAND,
                 lambda_tonality=DEFAULT_LAMBDA_TONALITY,
+                lambda_modulation=lambda_modulation,
             )
             quality.backward()
             _check_gradient(delta, whole_track=False)

@@ -151,6 +151,53 @@ class CachedCNNQualityPenalty:
         normalized = chunked / (chunked.sum(dim=0) + 1e-12).unsqueeze(0)
         return normalized.square().sum(dim=0).max()
 
+    def modulation(
+        self,
+        delta: torch.Tensor,
+        *,
+        frame_sec: float = 0.02,
+        smooth_sec: float = 1.0,
+    ) -> torch.Tensor:
+        """Penalize flutter-like changes in correction strength.
+
+        Measure the correction envelope relative to the music envelope, then
+        remove its slow one-second trend.  The residual captures rapid
+        pumping/flutter without demanding a constant correction through
+        silence or through genuine musical dynamics.
+        """
+        frame = max(1, int(frame_sec * self.sr))
+        n_frames = len(delta) // frame
+        if n_frames < 3:
+            return delta.new_tensor(0.0)
+        stop = n_frames * frame
+        delta_frames = delta[:stop].reshape(n_frames, frame)
+        original_frames = self.original[:stop].reshape(n_frames, frame)
+        delta_rms = torch.sqrt(
+            delta_frames.square().mean(dim=1) + 1e-12
+        )
+        original_rms = torch.sqrt(
+            original_frames.detach().square().mean(dim=1) + 1e-12
+        ).clamp_min(1e-3)
+        relative_envelope = delta_rms / original_rms
+        kernel = max(3, int(smooth_sec / frame_sec) | 1)
+        pad = kernel // 2
+        padded = F.pad(
+            relative_envelope.view(1, 1, -1),
+            (pad, pad),
+            mode="reflect",
+        )
+        slow = F.avg_pool1d(
+            padded, kernel_size=kernel, stride=1
+        ).view(-1)
+        flutter_power = (relative_envelope - slow).square().view(1, 1, -1)
+        local_frames = max(1, int(1.0 / frame_sec))
+        local = F.avg_pool1d(
+            flutter_power,
+            kernel_size=min(local_frames, n_frames),
+            stride=1,
+        )
+        return local.max()
+
     def loss(
         self,
         delta: torch.Tensor,
@@ -158,9 +205,11 @@ class CachedCNNQualityPenalty:
         lambda_perceptual: float,
         lambda_band: float,
         lambda_tonality: float,
+        lambda_modulation: float = 0.0,
     ) -> torch.Tensor:
         return (
             lambda_perceptual * self.perceptual(delta)
             + lambda_band * self.band(delta)
             + lambda_tonality * self.tonality(delta)
+            + lambda_modulation * self.modulation(delta)
         )
