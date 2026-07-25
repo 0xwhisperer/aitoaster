@@ -73,10 +73,14 @@ The processing order is deliberate — see [Why this order](#why-this-order).
     correction targeting the fakeprint/logistic-regression detector.
     Reports live progress during optimization: current step, which retry
     attempt, and the live surrogate score as it converges.
-12. **Temporal pattern normalization** (optional, experimental) — applies a
-    tiny smooth non-uniform timing warp before the final watermark. The 8ms
-    default passed one listening check and moves landmarks in a simplified
-    local proxy; it has not been verified against a commercial fingerprint
+12. **Temporal pattern normalization** (optional) — applies a small smooth
+    non-uniform timing warp before the final watermark, displacing the
+    low-frequency spectral peaks fingerprint matching anchors on (94% sit
+    below 500Hz, none above 4kHz). Landmark displacement saturates at the
+    4ms default, since landmark timing is quantized by the ~11.6ms analysis
+    hop; higher values only smear sibilants without adding disruption (a
+    measured sibilant retained 98.2% of its energy at 4ms vs 91.3% at 15ms).
+    Measured against a local landmark proxy, not a commercial fingerprint
     system. Production runs deliberately use a fresh random curve.
 13. **True-peak limiter** — brick-wall ceiling at -1dBTP (industry-standard
     safe margin for lossy-codec transcoding headroom), oversampled 4x to

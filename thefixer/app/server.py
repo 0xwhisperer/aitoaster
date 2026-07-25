@@ -1003,7 +1003,9 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 from .timewarp import generate_warp_curve
                 from scipy.interpolate import interp1d
                 n = len(audio)
-                max_drift_ms = options.get("temporal_max_drift_ms", 8.0)
+                # 4ms default: landmark displacement saturates there (see the
+                # slider's own note and generate_warp_curve's docstring).
+                max_drift_ms = options.get("temporal_max_drift_ms", 4.0)
                 # The shipped UI intentionally does not send temporal_seed:
                 # production warps use OS entropy and are non-reproducible so
                 # a fixed curve does not itself become a repeated signature.
