@@ -506,9 +506,31 @@ canvas#waveformOverviewCanvas {
    that stretched height instead of stopping at their own content size. */
 #preprocessGrid { grid-template-rows: auto 1fr; align-items: stretch; }
 #preprocessGrid > .panel:first-child { grid-column: 1; grid-row: 1; }
-#progressPanel { grid-column: 1; grid-row: 2; }
+/* BUG FIX (direct user report, second round): min-height: 0 on .panel-body
+   alone was not enough - #progressPanel itself is the actual GRID ITEM
+   sitting in the 1fr row track, and a grid item's default min-height is
+   also its content size (the exact same shrink-to-fit trap as the flex
+   child case below), so the panel itself kept growing taller with every
+   log line instead of staying bounded by its row's 1fr share, and
+   .panel-body's flex:1 then had an ever-increasing space to fill rather
+   than a fixed one. #progressPanel needs to be BOTH a shrinkable grid item
+   (min-height: 0) AND a flex container in its own right (so panel-head
+   stays a fixed size and panel-body gets the real remaining space) for the
+   bound to actually reach the log box at the bottom of this chain. */
+#progressPanel { grid-column: 1; grid-row: 2; min-height: 0; }
+#progressPanel.active { display: flex; flex-direction: column; }
 #progressPanel .panel-body { display: flex; flex-direction: column; flex: 1; min-height: 0; }
-#progressPanel .log-box { flex: 1; height: auto; min-height: 160px; }
+/* BUG FIX (direct user report): min-height: 160px above (a leftover from
+   the log-box's original fixed-height design) fought the flex-shrink this
+   stretched layout actually needs - a flex item's min-height defaults to
+   its CONTENT size, so without an explicit override the log box grew to
+   fit every appended line instead of staying bounded by the panel's
+   stretched height, which meant overflow-y: auto never had anything to
+   scroll (scrollHeight never exceeded the ever-growing visible box). 0
+   lets it actually shrink to the flex container's allotted space, so the
+   internal scrollbar (and the existing scrollTop = scrollHeight
+   auto-scroll-to-bottom in appendLog) works again. */
+#progressPanel .log-box { flex: 1; height: auto; min-height: 0; }
 #preprocessGrid > .panel:last-child { grid-column: 2; grid-row: 1 / span 2; }
 .progress-step-row {
   display: flex; justify-content: space-between; align-items: baseline;
