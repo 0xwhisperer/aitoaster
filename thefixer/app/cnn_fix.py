@@ -52,14 +52,120 @@ def _transfer_delta_to_stereo(stereo_audio, sr, delta_16k):
     # beginning specifically. The silence guard's whole purpose is to
     # prevent exactly this, so re-apply it at the NATIVE rate against the
     # NATIVE source, after the resample that breaks it.
+    native_mono = stereo_audio[:n_delta].mean(axis=1)
     native_delta = _apply_native_silence_guard(
         native_delta[:n_delta],
-        stereo_audio[:n_delta].mean(axis=1),
+        native_mono,
         sr,
+    )
+
+    # BUG FIX (the actually-audible flutter, measured on "North Star"): the
+    # guard above is BROADBAND, and broadband loudness is the wrong question
+    # for this model.  The CNN is a CQT-cepstrum detector over 500Hz-8kHz,
+    # and a cepstrum is scale-invariant - it sees spectral SHAPE, not level.
+    # On a bass-only intro the track reads as loud (-25dBFS broadband, guard
+    # gate 1.000) while 500Hz-8kHz sits at -45 to -74dBFS, so a tiny absolute
+    # change swings the cepstral shape enormously.  Measured: the model's own
+    # gradient there is 1.58e+03 versus ~2-10 in the body of the track, a
+    # grad/source ratio of 2.6e+05 versus ~20-100.
+    #
+    # Nothing downstream restrained that.  perceptual_penalty's masking
+    # multiplier bottoms out at 0.05 for quiet bins, which makes injecting
+    # into an EMPTY band ~10x CHEAPER than injecting into a loud one -
+    # backwards, since unmasked energy is precisely what the ear picks out.
+    # The delivered correction reached -0.4dB relative to the in-band source
+    # at t=0.60s, and 23 of the 30 worst blocks across 277s landed in the
+    # first 5 seconds: 4.57dB of envelope modulation in 0-5s against
+    # 0.11-0.22dB through the rest of the track.
+    #
+    # Cap the correction against the source's LOCAL IN-BAND level so it stays
+    # masked by the music it actually sits under.
+    native_delta = _apply_inband_audibility_ceiling(
+        native_delta, native_mono, sr
     )
     output[:n_delta, 0] += native_delta
     output[:n_delta, 1] += native_delta
     return output
+
+
+# The model's own analysis band (models/config.yaml: cqt.fmin=500, 48 bins
+# at 12 per octave -> 4 octaves -> 8kHz).  Correction energy is concentrated
+# here because this is the only place it can influence the detector.
+_BAND_LO_HZ = 500
+_BAND_HI_HZ = 8000
+# Headroom below the in-band source level.  Chosen by sweeping this value
+# against the real "North Star" correction and measuring both flutter (dB
+# std of the 1-8kHz envelope ratio over 0-5s) and how much of the detector
+# correction survives:
+#
+#     headroom   flutter 0-5s   correction retained
+#      -12dB        2.707dB           99.79%
+#      -18dB        1.256dB           99.71%
+#      -24dB        0.467dB           96.77%   <- knee
+#      -30dB        0.191dB           59.21%
+#      -36dB        0.092dB           29.68%
+#
+# -24dB is the knee: flutter lands near the 0.11-0.22dB baseline measured
+# across the untouched body of the track while still keeping ~97% of the
+# correction.  Going further buys little audible improvement and starts
+# destroying the fix outright.
+_INBAND_HEADROOM_DB = -24.0
+
+
+def _band_block_rms(signal, sr, win, lo_hz=_BAND_LO_HZ, hi_hz=_BAND_HI_HZ):
+    """Per-block RMS of `signal` restricted to the model's analysis band."""
+    spectrum = np.fft.rfft(signal)
+    freqs = np.fft.rfftfreq(len(signal), 1.0 / sr)
+    spectrum[(freqs < lo_hz) | (freqs >= hi_hz)] = 0
+    filtered = np.fft.irfft(spectrum, len(signal))
+    n_blocks = (len(filtered) + win - 1) // win
+    pad = n_blocks * win - len(filtered)
+    if pad:
+        filtered = np.pad(filtered, (0, pad))
+    blocks = filtered.reshape(n_blocks, win)
+    return np.sqrt((blocks ** 2).mean(axis=1) + 1e-20), n_blocks
+
+
+def _apply_inband_audibility_ceiling(delta, mono_source, sr, win_sec=0.02):
+    """Hold the correction a fixed margin below the local in-band source.
+
+    Measures both the source and the correction inside 500Hz-8kHz only, then
+    attenuates any block where the correction rises above
+    `_INBAND_HEADROOM_DB` relative to the source in that band.  Blocks that
+    are already masked are returned untouched, so this costs the detector fix
+    nothing wherever the music actually covers it.
+
+    The per-block gain is smoothed into a per-sample envelope (and clamped so
+    smoothing can only ever attenuate) because a hard 20ms gain step is
+    itself a 50Hz amplitude modulation - the same artifact being removed.
+    """
+    n = len(delta)
+    if n == 0:
+        return delta
+    win = max(1, int(win_sec * sr))
+    source_band, n_blocks = _band_block_rms(mono_source, sr, win)
+    delta_band, _ = _band_block_rms(delta, sr, win)
+
+    ceiling = source_band * (10.0 ** (_INBAND_HEADROOM_DB / 20.0))
+    gain = np.ones(n_blocks, dtype=np.float64)
+    over = delta_band > ceiling
+    gain[over] = ceiling[over] / (delta_band[over] + 1e-20)
+
+    # Take a running minimum over each block and its neighbours BEFORE
+    # interpolating.  Clamping after interpolation (with np.minimum against
+    # each block's own gain) leaves a one-sample cliff at a quiet->loud
+    # boundary: the envelope is held down through the quiet block and then
+    # released instantly, measured as a 0.031 -> 0.494 jump at exactly the
+    # boundary sample.  Shrinking the neighbourhood first means the ramp
+    # starts from an already-safe value and rises smoothly, so the envelope
+    # is both conservative and continuous.
+    padded_gain = np.concatenate(([gain[0]], gain, [gain[-1]]))
+    safe_gain = np.minimum.reduce(
+        [padded_gain[:-2], padded_gain[1:-1], padded_gain[2:]]
+    )
+    centers = np.arange(n_blocks) * win + win / 2.0
+    envelope = np.interp(np.arange(n), centers, safe_gain)
+    return (delta * envelope.astype(delta.dtype)).astype(delta.dtype)
 
 
 def _apply_native_silence_guard(delta, mono_source, sr, win_sec=0.02):
