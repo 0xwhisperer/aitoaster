@@ -7,3 +7,6 @@ __pycache__/
 electron/node_modules
 electron/dist
 .env
+
+server_*.log
+.playwright-mcp/

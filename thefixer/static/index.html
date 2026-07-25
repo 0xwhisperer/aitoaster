@@ -236,7 +236,11 @@ header {
   /* on a single column, every panel just stacks in natural source order -
      the explicit two-column placement below only applies at desktop
      widths where the grid actually has two columns to place into. */
+  #preprocessGrid { grid-template-rows: auto; align-items: start; }
   #preprocessGrid > .panel:first-child { grid-column: 1; grid-row: auto; }
+  #progressPanel { grid-column: 1; grid-row: auto; }
+  #progressPanel .panel-body { flex: none; }
+  #progressPanel .log-box { flex: none; height: 160px; }
   #preprocessGrid > .panel:last-child { grid-column: 1; grid-row: auto; }
 }
 
@@ -479,18 +483,32 @@ canvas#waveformOverviewCanvas {
 .run-count { font-size: 12px; color: var(--text-faint); margin-left: auto; }
 
 /* ---------- Progress ---------- */
-.progress-panel { display: none; grid-column: 1; grid-row: 2; }
-.progress-panel.active { display: block; }
-/* explicit grid placement (see the layout comment above #preprocessGrid's
-   markup): source order is [Detector Analysis, Processing, Signal Chain],
-   but Processing should stack under Detector Analysis in the LEFT column,
-   not sit beside it as a 3rd auto-placed grid item - and Signal Chain
-   should span both rows on the right so it stays one tall column next to
-   the shorter left-side stack, instead of the whole grid collapsing
-   Processing down below both columns and leaving a large empty gap under
-   Detector Analysis while Signal Chain is still taller. */
-#preprocessGrid { grid-template-rows: auto auto; }
+.progress-panel { display: none; }
+.progress-panel.active { display: flex; flex-direction: column; }
+/* BUG FIX (direct user report + screenshot): the previous rules here relied
+   on #preprocessGrid > .panel:first-child / :last-child, but #preprocessGrid
+   actually has THREE .panel children in source order [Detector Analysis,
+   Processing, Signal Chain] - :first-child correctly matched Detector
+   Analysis and :last-child correctly matched Signal Chain, but the MIDDLE
+   child (#progressPanel) matched neither selector at all, so it fell back to
+   CSS Grid's default auto-placement instead of the intended "stack under
+   Detector Analysis" position. Combined with .grid's own `align-items:
+   start` (every grid item sized to its own content and top-aligned, never
+   stretched) and this grid's `grid-template-rows: auto auto` (row 2 sized
+   to Processing's own short content height, not to whatever space is
+   actually available), the auto-placed panel ended up far down the page
+   with a large empty gap above it, and even when correctly placed, would
+   never have stretched down to match Signal Chain's height on the right.
+   Fixed by giving #progressPanel its own explicit, unambiguous ID-based
+   placement (not a source-order pseudo-class that doesn't match a middle
+   child), making the grid rows genuinely stretch to fill the row's
+   available height, and making the panel + its log box flex/grow to fill
+   that stretched height instead of stopping at their own content size. */
+#preprocessGrid { grid-template-rows: auto 1fr; align-items: stretch; }
 #preprocessGrid > .panel:first-child { grid-column: 1; grid-row: 1; }
+#progressPanel { grid-column: 1; grid-row: 2; }
+#progressPanel .panel-body { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+#progressPanel .log-box { flex: 1; height: auto; min-height: 160px; }
 #preprocessGrid > .panel:last-child { grid-column: 2; grid-row: 1 / span 2; }
 .progress-step-row {
   display: flex; justify-content: space-between; align-items: baseline;

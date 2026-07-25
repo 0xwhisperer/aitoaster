@@ -175,7 +175,22 @@ def job_log(job_id, msg):
 def job_set_step(job_id, step_idx, total_steps, step_name):
     """Track which step in the tool chain is currently running, so the UI
     can show real step-aware progress ('step 3 of 6: CNN model fix') instead
-    of a single undifferentiated percentage."""
+    of a single undifferentiated percentage.
+
+    BUG FIX (direct user report + screenshot): post-chain reverify passes
+    (cnn_fix_reverify, cnn_fix_reverify_lufs, and their linear equivalents)
+    run entirely AFTER the numbered tool loop finishes and never called this
+    function - so current_step_idx/total_steps/current_step_name stayed
+    frozen on whatever the LAST real tool-loop entry was (e.g. "True-peak
+    limiter", Tool 13 of 13) for the entire duration of a reverify pass,
+    while sub_progress (the optimization-step counter) kept updating
+    independently. The result: a live job could show "Tool 13 of 13
+    (True-peak limiter) / Optimization step 14 of 516" when what was
+    actually running was a CNN re-verification retry that has nothing to
+    do with the limiter and isn't part of the 13-tool count at all.
+    step_idx=None/total_steps=None now marks a step as OUTSIDE the numbered
+    chain (a reverify pass) - the frontend renders step_name alone with no
+    misleading "Tool N of N" wrapper in that case."""
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if job is None:
@@ -891,6 +906,7 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 if recheck_score >= 0.01 + LINEAR_RECHECK_MARGIN:
                     check_cancelled(job_id)
                     job_log(job_id, "  above target - re-running linear_fix once more on the final signal")
+                    job_set_step(job_id, None, None, "Linear re-verification pass")
                     from .linear_fix import fix_linear
                     t0 = time.time()
                     audio, reverify_info = fix_linear(
@@ -981,6 +997,7 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 if cnn_recheck_score >= 0.08 + CNN_RECHECK_MARGIN:
                     check_cancelled(job_id)
                     job_log(job_id, "  cnn lost its safety margin (or regressed) after later chain stages - re-running cnn_fix once more on the final signal")
+                    job_set_step(job_id, None, None, "CNN re-verification pass")
                     from .cnn_fix import fix_cnn
                     t0 = time.time()
 
@@ -1177,6 +1194,7 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                             if post_lufs_linear >= 0.01 + LINEAR_RECHECK_MARGIN:
                                 check_cancelled(job_id)
                                 job_log(job_id, "  LUFS gain change disturbed the linear model - re-running linear_fix once more")
+                                job_set_step(job_id, None, None, "Linear re-verification pass")
                                 from .linear_fix import fix_linear
                                 t0 = time.time()
 
@@ -1209,6 +1227,7 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                             if post_lufs_cnn >= 0.08 + CNN_RECHECK_MARGIN:
                                 check_cancelled(job_id)
                                 job_log(job_id, "  LUFS gain change disturbed the cnn model - re-running cnn_fix once more")
+                                job_set_step(job_id, None, None, "CNN re-verification pass")
                                 from .cnn_fix import fix_cnn
                                 t0 = time.time()
 
@@ -1392,6 +1411,7 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         # The full, real true_peak_limit is the correct, safe tool here.
         if "true_peak_limit" in tools:
             check_cancelled(job_id)
+            job_set_step(job_id, None, None, "True-peak limiter (post-watermark safety pass)")
             t0 = time.time()
             post_wm_audio, post_wm_limiter_info = chain.true_peak_limit(
                 audio, sr, ceiling_db=options.get("ceiling_db", -1.0))

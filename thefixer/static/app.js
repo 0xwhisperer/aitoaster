@@ -988,6 +988,43 @@
       return;
     }
 
+    // BUG FIX (direct user report + screenshot): post-chain reverify passes
+    // (a CNN or linear model getting re-run because a later stage disturbed
+    // it) run entirely OUTSIDE the numbered 13-tool chain - the backend now
+    // marks this by sending current_step_idx/total_steps as null while
+    // still setting current_step_name and sub_progress. This used to fall
+    // straight into the "job just started, no step info yet" branch below,
+    // which threw away sub_progress entirely and froze the progress bar at
+    // a flat 4% - so a multi-minute CNN retry showed a dead progress bar
+    // and (before current_step_name existed for this case) the stale
+    // heading/count from whichever tool ran last in the real chain (e.g.
+    // "Tool 13 of 13 (True-peak limiter)" while a CNN re-verification pass
+    // was actually running for several more minutes). Handle it as its own
+    // case: show the real reverify label with no misleading "Tool N of N"
+    // wrapper, and still render sub_progress so the optimization-step
+    // counter and live score estimate keep working exactly as they do
+    // inside the normal chain.
+    if (idx == null && data.current_step_name) {
+      $("progressStepLabel").textContent = data.current_step_name;
+      let subText = "";
+      if (data.sub_progress && data.sub_progress.total) {
+        const sp = data.sub_progress;
+        const fracWithinStep = Math.min(1, sp.current / sp.total);
+        $("progressFill").style.width = `${Math.min(99, Math.round(fracWithinStep * 100))}%`;
+        subText = `step ${sp.current} of ${sp.total}`;
+        if (sp.attempt && sp.max_attempts) subText += ` · attempt ${sp.attempt}/${sp.max_attempts}`;
+        if (sp.score_pct !== undefined) subText += ` · live estimate ${sp.score_pct}% AI`;
+        if (sp.windows_total !== undefined) {
+          const passing = sp.windows_total - sp.windows_failing;
+          subText += ` · real-detector check: ${passing}/${sp.windows_total} spots passing (worst spot ${sp.real_max_score_pct}% AI)`;
+        }
+      } else {
+        $("progressFill").style.width = "99%";
+      }
+      $("progressStepCount").textContent = subText;
+      return;
+    }
+
     if (total == null || idx == null) {
       // no step info yet (job just started)
       $("progressFill").style.width = "4%";
@@ -1200,6 +1237,17 @@
         $("runBtn").disabled = false;
         $("cancelJobBtn").classList.add("hidden");
         state.result = data.result;
+        // BUG FIX (direct user report): renderResults() hides the whole
+        // #preprocessGrid (which #progressPanel/its log live inside), but
+        // hiding is not clearing - the finished job's log content stayed
+        // sitting in the DOM until the NEXT run's click handler wiped it,
+        // so anything that could make the panel visible again in between
+        // (a stray toggle, a future feature, simple bad hygiene) would show
+        // a completed job's stale log instead of nothing. Clear it the
+        // moment the job that produced it is actually done, not on a
+        // delay tied to when the user happens to start another one.
+        $("progressPanel").classList.remove("active");
+        $("logBox").innerHTML = "";
         renderResults(data.result);
       } else if (data.status === "error") {
         stopElapsedTimer();

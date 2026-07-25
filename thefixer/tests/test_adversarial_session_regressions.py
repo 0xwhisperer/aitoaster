@@ -833,6 +833,125 @@ class PipelineArtifactRegressionTests(unittest.TestCase):
         )
 
 
+class ReverifyPassStepLabelRegressionTests(unittest.TestCase):
+    # BUG FIX (direct user report + screenshot): post-chain reverify passes
+    # (a CNN or linear re-run triggered because a later chain stage
+    # disturbed it) run entirely OUTSIDE the numbered 13-tool loop and never
+    # called job_set_step - so the UI's "Tool N of N" heading stayed frozen
+    # on whatever tool ran LAST in the real chain (e.g. "True-peak limiter",
+    # Tool 13 of 13) for the entire multi-minute duration of an unrelated
+    # CNN retry, while the optimization-step sub-counter kept updating
+    # independently. This drives run_pipeline through a forced CNN reverify
+    # and captures the job's own step-tracking fields AT THE MOMENT fix_cnn
+    # is actually invoked for the reverify - proving the heading is updated
+    # to a reverify-specific label, not left on the prior tool.
+    def setUp(self):
+        with server.JOBS_LOCK:
+            server.JOBS.clear()
+            server.JOBS["audit-job"] = {
+                "status": "running", "log": [], "result": None, "error": None,
+                "progress_msg": "", "current_step_idx": None, "total_steps": None,
+                "current_step_name": None, "sub_progress": None,
+                "cancel_requested": False,
+            }
+
+    def tearDown(self):
+        with server.JOBS_LOCK:
+            server.JOBS.clear()
+
+    def test_cnn_reverify_pass_updates_the_frozen_step_heading(self):
+        audio = np.full((44_100, 2), 0.1, dtype=np.float32)
+        captured_step_during_reverify = {}
+
+        class FakeCnnDetector:
+            def predict(self, path):
+                # first call (post-chain recheck) reports a regression to
+                # force the reverify branch; any call made FROM INSIDE the
+                # reverify's own fix_cnn (there are none here, since fix_cnn
+                # itself is mocked) would not reach this.
+                return {"probability": 0.99}
+
+        class FakeLinearDetector:
+            def predict(self, path):
+                # the CNN reverify's own final linear sanity check (always
+                # runs afterward regardless of whether linear_fix was
+                # selected) - report comfortably under target so it doesn't
+                # trigger its own warning path.
+                return {"probability": 0.001}
+
+        class FakeScorer:
+            cnn = FakeCnnDetector()
+            linear = FakeLinearDetector()
+
+            def score(self, path):
+                return {
+                    "linear": {"probability": 0.0}, "cnn": {"probability": 0.0},
+                    "linear_pct": 0.0, "cnn_pct": 0.0,
+                    "passes_linear": True, "passes_cnn": True, "passes_both": True,
+                }
+
+        def fake_fix_cnn(a, sr, **kwargs):
+            # snapshot the job's step-tracking fields exactly as they stand
+            # the moment the reverify's own fix_cnn call starts - this is
+            # the window a live user would be watching during the retry.
+            with server.JOBS_LOCK:
+                job = server.JOBS["audit-job"]
+                captured_step_during_reverify["current_step_idx"] = job["current_step_idx"]
+                captured_step_during_reverify["total_steps"] = job["total_steps"]
+                captured_step_during_reverify["current_step_name"] = job["current_step_name"]
+            return a.copy(), {"applied": True}
+
+        simple_tilt = {"low (20-250Hz)": 0.0, "mid (250-4000Hz)": 0.0, "high (4000-20000Hz)": 0.0}
+        simple_waveform = {"duration_sec": 1.0, "times": [], "min": [], "max": []}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch.object(server, "OUTPUT_DIR", Path(tmp)),
+                patch.object(server, "_find_upload_path", return_value=Path("source.wav")),
+                patch.object(server, "load_stereo", return_value=audio.copy()),
+                patch.object(server, "save_stereo"),
+                patch.object(server, "encode_final_output", side_effect=lambda a, sr, fmt, dest, mp3_mode="vbr0": Path(f"{dest}.wav")),
+                patch.object(server, "get_scorer", return_value=FakeScorer()),
+                patch.object(chain, "detect_transients", return_value=[]),
+                patch.object(chain, "measure_lufs", return_value=-14.0),
+                patch.object(chain, "stereo_correlation", return_value=1.0),
+                patch.object(chain, "spectral_tilt_report", return_value=(simple_tilt, [], [])),
+                patch.object(chain, "waveform_peaks", return_value=simple_waveform),
+                patch.object(watermark, "embed_watermark", side_effect=lambda mono, _sr: mono),
+                patch.object(
+                    watermark, "detect_watermark",
+                    return_value=(True, 2, {"match_fraction": 1.0, "method": "test"}),
+                ),
+                patch("app.cnn_fix.fix_cnn", side_effect=fake_fix_cnn),
+            ):
+                server.run_pipeline(
+                    "audit-job", "file-id",
+                    tools=["cnn_fix"],
+                    options={},
+                    output_format="wav",
+                )
+
+        self.assertEqual(server.JOBS["audit-job"]["status"], "done")
+        self.assertTrue(
+            captured_step_during_reverify,
+            "the reverify's own fix_cnn was never invoked - the recheck-"
+            "triggers-a-redo branch this test targets did not fire.",
+        )
+        self.assertIsNone(
+            captured_step_during_reverify["current_step_idx"],
+            "a post-chain reverify pass must mark current_step_idx as None "
+            "(outside the numbered tool chain), not leave it pointing at "
+            "whichever tool ran last in the real 13-tool loop.",
+        )
+        self.assertIsNone(captured_step_during_reverify["total_steps"])
+        self.assertIn(
+            "re-verification", captured_step_during_reverify["current_step_name"].lower(),
+            "the step heading during a reverify pass must say so explicitly "
+            f"(got {captured_step_during_reverify['current_step_name']!r}), "
+            "not silently keep the prior tool's name.",
+        )
+
+
 class HighPassAppliedRegressionTests(unittest.TestCase):
     def test_pure_tone_without_subsonic_content_is_not_flagged_as_needing_highpass(self):
         sr = 44_100
