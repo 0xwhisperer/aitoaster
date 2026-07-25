@@ -799,7 +799,10 @@ def _tool_status_line(tool, info):
     if tool == "multiband_compress":
         bands = info.get("bands") or []
         max_reduction = min((b.get("max_reduction_db", 0.0) for b in bands), default=0.0)
-        return f"pass (up to {abs(max_reduction):.1f}dB gentle reduction across {len(bands)} bands)"
+        passes = info.get("passes", 1)
+        pass_note = f", {passes} passes" if passes > 1 else ""
+        return (f"pass (up to {abs(max_reduction):.1f}dB gentle reduction across "
+                f"{len(bands)} bands{pass_note})")
 
     if tool == "temporal_normalize":
         # "pass" here means the operation completed and produced valid

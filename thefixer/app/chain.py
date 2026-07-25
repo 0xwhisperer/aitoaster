@@ -744,9 +744,92 @@ def detect_band_peakiness(audio, sr, bands=None,
     return results
 
 
-def multiband_compress(audio, sr, bands=None,
-                        ratio=1.3, threshold_db=-12.0):
-    """Gentle 3-band downward compression for tonal-balance smoothing -
+def multiband_compress(audio, sr, bands=None, ratio=1.3, threshold_db=-12.0,
+                        max_passes=12, target_over_db=0.5):
+    """Gentle 3-band tonal-balance smoothing, repeated until the FILE is
+    actually balanced rather than once and then handed back to the user.
+
+    BUG FIX (direct user report): this used to run exactly one pass, and the
+    UI told the user "Still 7.2dB over target in the 0-200Hz band - gentle by
+    design, may take another pass or two to fully clear", which reads as an
+    instruction to re-upload and re-run the file by hand.
+
+    That was real work being pushed onto the user. The gentle ratio (1.3, by
+    design - see _multiband_compress_pass) only removes 1 - 1/1.3 = 23.1% of
+    the excess per pass, so closing a 7.2dB overshoot takes eight passes:
+
+        pass 0  7.20dB      pass 4  2.52dB
+        pass 1  5.54dB      pass 8  0.88dB
+
+    The gentleness is correct and worth keeping - it is what stops this
+    tool from audibly pumping. What was wrong is where the loop lived. It
+    now iterates internally, driven by detect_band_peakiness (the file's own
+    measured condition, NOT the compressor grading its own diminishing
+    returns - see that function's docstring for why that distinction
+    matters), and stops as soon as the worst band is within target_over_db
+    or when no pass makes further progress.
+
+    Bounded by max_passes so a pathological file cannot loop forever, and
+    the returned info reports how many passes actually ran.
+    """
+    # `bands` stays None here on purpose: both the per-pass compressor and
+    # detect_band_peakiness derive the same Nyquist-aware default from sr,
+    # so passing None keeps those two in agreement instead of freezing a
+    # copy of the default at this level.
+    current = audio
+    passes = 0
+    last_info = None
+    previous_worst = None
+
+    for _ in range(int(max_passes)):
+        peakiness = detect_band_peakiness(current, sr, bands=bands,
+                                           threshold_db=threshold_db)
+        worst = max((b["peak_over_db"] for b in peakiness), default=0.0)
+        if worst <= target_over_db:
+            break
+        # stop if the previous pass bought essentially nothing - a real file
+        # can sit slightly over target in a band the compressor cannot reach
+        # (e.g. content right at a band edge), and spinning to max_passes on
+        # it would just add filter round-trips for no measurable gain.
+        if previous_worst is not None and previous_worst - worst < 0.05:
+            break
+        previous_worst = worst
+
+        stepped, info = _multiband_compress_pass(
+            current, sr, bands=bands, ratio=ratio, threshold_db=threshold_db
+        )
+        if not info["applied"]:
+            break
+        current = stepped
+        last_info = info
+        passes += 1
+
+    if passes == 0:
+        return audio, {
+            "applied": False, "ratio": ratio, "threshold_db": threshold_db,
+            "passes": 0,
+            "bands": (last_info or _multiband_compress_pass(
+                audio, sr, bands=bands, ratio=ratio, threshold_db=threshold_db
+            )[1])["bands"],
+        }
+
+    final_peakiness = detect_band_peakiness(current, sr, bands=bands,
+                                             threshold_db=threshold_db)
+    return current, {
+        "applied": True,
+        "ratio": ratio,
+        "threshold_db": threshold_db,
+        "passes": passes,
+        "bands": last_info["bands"],
+        "worst_over_db_after": float(
+            max((b["peak_over_db"] for b in final_peakiness), default=0.0)
+        ),
+    }
+
+
+def _multiband_compress_pass(audio, sr, bands=None,
+                              ratio=1.3, threshold_db=-12.0):
+    """ONE pass of gentle 3-band downward compression -
     reduces peaky dynamic imbalance between low/mid/high without touching
     overall spectral tilt aggressively. Conservative defaults (low ratio,
     higher threshold) by design: this should only be shaping the loudest

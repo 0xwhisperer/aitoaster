@@ -429,6 +429,18 @@
     clearProcessingLog();
   }
 
+  function stopAllPlayback() {
+    // Every <audio> on the page: the upload preview, the A/B pair, and the
+    // correction-overlay players. Starting a new job must silence all of
+    // them - otherwise the previous run's output keeps playing over the top
+    // of a job that is busy replacing it.
+    document.querySelectorAll("audio").forEach(a => {
+      if (!a.paused) a.pause();
+    });
+    const playBtn = $("playBtn");
+    if (playBtn) playBtn.textContent = "▶";
+  }
+
   function clearResultCharts() {
     // Wipe everything the PREVIOUS run's results rendered, so clicking
     // "Process file" again does not leave the old run's spectrum, waveform
@@ -876,22 +888,19 @@
             <div class="cnn-mode-hint">Smooth S-curve fade. Applied after the limiter so nothing later undoes it.</div>
           </div>`;
         }
-        // BUG FIX (Codex MAJOR / Fable B3, verified directly): multiband_compress
-        // is deliberately gentle (least-change-necessary by design) and can take
-        // several passes to fully clear its own recommendation on a strongly
-        // peaky file - a flat repeated "Recommended" badge with no further
-        // context looked like the tool wasn't doing anything, when in fact real,
-        // measurable progress (peak_over_db decaying) was happening every pass.
-        // Surface the actual per-band numbers (from /api/analyze's band_peakiness)
-        // so a re-upload after one pass shows real headroom remaining, not just
-        // an unqualified repeat of the same badge.
+        // Show WHAT this file's imbalance is, so the recommendation has a
+        // reason attached. It used to end with "may take another pass or two
+        // to fully clear", which read as an instruction to re-upload and
+        // re-run by hand - the tool now iterates internally until the file's
+        // measured peakiness stops improving, so there is nothing for the
+        // user to repeat.
         let peakinessHint = "";
         if (t.id === "multiband_compress" && recommended && state.analysis && state.analysis.band_peakiness) {
           const worstBand = state.analysis.band_peakiness.reduce(
             (a, b) => (b.peak_over_db > a.peak_over_db ? b : a)
           );
           if (worstBand.peak_over_db > 0) {
-            peakinessHint = `<div class="cnn-mode-hint">Still ${worstBand.peak_over_db.toFixed(1)}dB over target in the ${worstBand.range_hz[0]}-${worstBand.range_hz[1]}Hz band - gentle by design, may take another pass or two to fully clear.</div>`;
+            peakinessHint = `<div class="cnn-mode-hint">${worstBand.peak_over_db.toFixed(1)}dB over target in the ${worstBand.range_hz[0]}-${worstBand.range_hz[1]}Hz band. Runs as many gentle passes as it takes to settle.</div>`;
           }
         }
         return `
@@ -1033,6 +1042,9 @@
     // cursor and silently drop every early line - the bug the third
     // adversarial audit round found here. It also removes .active, so it
     // must run BEFORE the panel is shown below.
+    // Silence anything currently playing before the new job starts - the
+    // audio being played is about to be replaced by this run's output.
+    stopAllPlayback();
     clearProcessingLog();
     // Reset the previous run's result charts too - hiding #results leaves the
     // old spectrum/waveform pixels and legends intact underneath, so they
