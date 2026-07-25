@@ -193,6 +193,12 @@
   // sequence number in effect when IT started, and only applies its
   // result if no newer upload has started since.
   let uploadSequence = 0;
+  // Declared up here rather than next to pollJob because clearProcessingLog
+  // (called from clearAnalysisDisplay, far above pollJob) assigns it; a `let`
+  // sits in the temporal dead zone until its declaration executes, so
+  // leaving it below its first assignment site is a latent ReferenceError
+  // the moment anything clears the log during initial page setup.
+  let seenLogCount = 0;
   let state = {
     fileId: null,
     filename: null,
@@ -290,7 +296,9 @@
     $("workspace").classList.remove("active");
     $("results").classList.remove("active");
     $("detectorAnalysisPanel").classList.remove("hidden");
-    $("progressPanel").classList.remove("active");
+    // Hiding the progress panel alone leaves the previous run's lines inside
+    // it, which flash back the moment the next run re-shows the panel.
+    clearProcessingLog();
     $("spectrumLegend").classList.remove("active");
     $("waveformLegend").classList.remove("active");
     $("analyzingState").classList.remove("active");
@@ -398,6 +406,24 @@
     $("waveformDuration").textContent = "";
     $("spectrumLegend").classList.remove("active");
     $("waveformLegend").classList.remove("active");
+    // The Processing log belongs to whichever file was last RUN, so leaving
+    // it on screen after uploading or re-analyzing a different file shows a
+    // log that no longer describes the audio in the workspace. Clear it on
+    // the same path that clears the Detector Analysis panel.
+    clearProcessingLog();
+  }
+
+  function clearProcessingLog() {
+    $("logBox").innerHTML = "";
+    $("progressPanel").classList.remove("active");
+    $("progressFill").style.width = "0%";
+    $("elapsedTime").textContent = "";
+    // seenLogCount is pollJob's cursor into the job's log array and is NOT
+    // derived from the DOM - blanking logBox without resetting it makes the
+    // next job slice its short log against a stale larger cursor and drop
+    // every early line (the same bug the third adversarial audit round found
+    // on the runBtn path).
+    seenLogCount = 0;
   }
 
   // BUG FIX (adversarial audit): runAnalysis had no way to tell, once its
@@ -927,19 +953,15 @@
 
   $("runBtn").addEventListener("click", async () => {
     if (!state.fileId || state.selected.size === 0) return;
-    // BUG FIX (third adversarial audit round): $("logBox").innerHTML = ""
-    // clears the VISIBLE log, but seenLogCount (the cursor pollJob uses to
-    // only append NEW lines each poll) is a separate, persistent variable
-    // that was never reset alongside it. Running a second job in the same
-    // page session without a full reload left seenLogCount holding
-    // whatever count the FIRST job reached - pollJob would then slice the
-    // new job's much-shorter log array against that stale, larger cursor,
-    // silently dropping every one of its early lines until the new job's
-    // own log caught up past the old count.
-    seenLogCount = 0;
+    // clearProcessingLog resets the visible log AND seenLogCount together
+    // (pollJob's cursor into the job's log array): blanking one without the
+    // other makes the next job slice its short log against a stale larger
+    // cursor and silently drop every early line - the bug the third
+    // adversarial audit round found here. It also removes .active, so it
+    // must run BEFORE the panel is shown below.
+    clearProcessingLog();
     $("progressPanel").classList.add("active");
     $("results").classList.remove("active");
-    $("logBox").innerHTML = "";
     $("progressFill").style.width = "6%";
     $("runBtn").disabled = true;
     $("cancelJobBtn").classList.remove("hidden");
@@ -1208,7 +1230,6 @@
     box.scrollTop = box.scrollHeight;
   }
 
-  let seenLogCount = 0;
   // BUG FIX (third adversarial audit round): pollJob captured state.jobId
   // only implicitly (reading it fresh each recursive setTimeout call), but
   // a single in-flight fetch has no record of WHICH job it was requested

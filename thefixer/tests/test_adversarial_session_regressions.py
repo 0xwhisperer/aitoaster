@@ -1341,12 +1341,51 @@ class EntireAppReauditRegressionTests(unittest.TestCase):
             : app_js.index('  $("cancelJobBtn").addEventListener')
         ]
 
-        self.assertIn(
-            "seenLogCount = 0",
-            run_handler,
+        # The reset now lives in clearProcessingLog(), which the run handler
+        # calls, so that uploading or re-analyzing a different file clears the
+        # log the same way. Accept either the inline assignment or that call,
+        # but still require the guarantee itself: the cursor must be reset on
+        # every run.
+        self.assertTrue(
+            "seenLogCount = 0" in run_handler
+            or "clearProcessingLog()" in run_handler,
             "Each processing run must reset the log cursor; otherwise a second "
             "job silently drops its initial log lines.",
         )
+        self.assertIn(
+            "seenLogCount = 0",
+            self._clear_processing_log_source(),
+            "clearProcessingLog must reset the log cursor alongside the "
+            "visible log, or the next job drops its initial lines.",
+        )
+
+    def _clear_processing_log_source(self):
+        app_js = self._frontend_source()
+        start = app_js.index("  function clearProcessingLog()")
+        return app_js[start : app_js.index("\n  }", start)]
+
+    def test_frontend_clears_processing_log_when_analysis_display_resets(self):
+        """A stale Processing log must not outlive the file it describes.
+
+        The log belongs to whichever file was last processed, so uploading a
+        new file or analyzing a different one has to clear it, exactly like
+        the Detector Analysis panel it sits beside.
+        """
+        app_js = self._frontend_source()
+        clear_display = app_js[
+            app_js.index("  function clearAnalysisDisplay()")
+            : app_js.index("\n  }", app_js.index("  function clearAnalysisDisplay()"))
+        ]
+        self.assertIn(
+            "clearProcessingLog()",
+            clear_display,
+            "clearAnalysisDisplay must also clear the Processing log, or a "
+            "new file shows the previous file's processing output.",
+        )
+
+        body = self._clear_processing_log_source()
+        self.assertIn('$("logBox").innerHTML = ""', body)
+        self.assertIn('$("progressPanel").classList.remove("active")', body)
 
     def test_frontend_ignores_a_poll_response_for_an_old_job(self):
         app_js = self._frontend_source()
