@@ -80,6 +80,37 @@ def save_stereo(path, audio, sr=44100):
     sf.write(str(path), audio_clipped, sr, subtype="PCM_16")
 
 
+def save_correction_overlays(out_id, overlay_sources, sr):
+    """Save true-level and normalized detector-correction listening files."""
+    sources = dict(overlay_sources)
+    if "linear" in sources and "cnn" in sources:
+        n = min(len(sources["linear"]), len(sources["cnn"]))
+        sources["combined"] = sources["linear"][:n] + sources["cnn"][:n]
+    info = {}
+    for kind, overlay in sources.items():
+        peak = float(np.abs(overlay).max(initial=0))
+        if peak < 1e-10:
+            continue
+        sf.write(
+            OUTPUT_DIR / f"{out_id}_overlay_{kind}.wav",
+            overlay,
+            sr,
+            subtype="FLOAT",
+        )
+        preview_gain = min(1000.0, 0.5 / peak)
+        sf.write(
+            OUTPUT_DIR / f"{out_id}_overlay_{kind}_loud.wav",
+            np.clip(overlay * preview_gain, -0.95, 0.95),
+            sr,
+            subtype="FLOAT",
+        )
+        info[kind] = {
+            "preview_gain_db": float(20 * np.log10(preview_gain)),
+            "peak": peak,
+        }
+    return info
+
+
 OUTPUT_FORMAT_EXTENSIONS = {"wav": ".wav", "mp3": ".mp3", "flac": ".flac", "m4a": ".m4a"}
 
 
@@ -466,19 +497,16 @@ def analyze(file_id):
 # ceiling. Both AI fixes already have their own last-resort peak clamp, but
 # that's a blunt sample-peak scale-down, not an inter-sample-peak-aware
 # limiter, so true_peak_limit still belongs after them as the real final stage.
-# cnn_fix runs BEFORE linear_fix, not after - flipped from the original
-# order based on evidence gathered across many production runs: cnn_fix is
-# the far more fragile, harder-to-converge fix (even after tightening its
-# sampling density, it's still only marginal on real files), while
-# linear_fix is fast, reliable, and already has a cheap, working post-chain
-# re-verification pass. Both fixes can disturb each other when run back to
-# back (documented separately for each direction: a verified linear score
-# regressing after cnn_fix ran on top of it, and a verified cnn_fix score
-# regressing after linear's re-verify pass ran on top of IT) - so ordering
-# alone can't fully solve this, but putting the fast/cheap-to-redo fix
-# (linear) LAST means ITS re-verify pass is the final safety net, rather
-# than leaving the slow/expensive fix (cnn) unprotected at the very end of
-# the chain, which is what the previous order did.
+# The position-sensitive detector fixes run after temporal normalization.
+# A real 4:37 production job proved the old order was untenable: CNN spent
+# 23 minutes reaching a certified result, then linear EQ plus a 15ms timing
+# warp changed that signal and the final CNN score jumped to 99.742%, forcing
+# another 18-minute whole-track solve.  Linear now runs first because its
+# feature-domain solve is cheap and reliable; Thorough CNN then optimizes and
+# certifies the actual post-linear waveform.  The independent final checks
+# below remain authoritative because either correction can still perturb the
+# other, but ordinary temporal/linear processing no longer guarantees a full
+# CNN restart by construction.
 # Post-chain re-verification margins. linear_fix and cnn_fix already certify
 # their output below a real_target threshold (0.008-0.01 for linear, 0.08 for
 # cnn) before they hand off - that certification is the whole point of their
@@ -560,8 +588,12 @@ TOOL_ORDER = [
     "strip_metadata", "trim_silence", "dc_offset", "fix_transients",
     "spectral_revive", "high_pass",
     "fix_phase", "normalize_lufs", "multiband_compress",
-    "cnn_fix", "linear_fix",
     "temporal_normalize",
+    # Timing changes must precede the position-sensitive detector fixes.
+    # Run the cheap/reliable linear solve first and the exact-window CNN
+    # solve on that final spectral signal, so Thorough CNN no longer pays
+    # for a complete redo after temporal normalization or linear EQ.
+    "linear_fix", "cnn_fix",
     "true_peak_limit",
 ]
 
@@ -685,6 +717,20 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
 
         scorer = get_scorer()
         steps = []
+        correction_overlays = {}
+
+        def _record_detector_overlay(kind, before, after):
+            """Accumulate only the waveform added by one detector fix."""
+            n = min(len(before), len(after))
+            if n == 0:
+                return
+            change = np.zeros_like(after)
+            change[:n] = after[:n] - before[:n]
+            existing = correction_overlays.get(kind)
+            if existing is None or existing.shape != change.shape:
+                correction_overlays[kind] = change
+            else:
+                existing += change
 
         ordered_tools = [t for t in TOOL_ORDER if t in tools]
         lead_samples_trimmed = 0
@@ -764,13 +810,16 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 audio, info = chain.high_pass_filter(audio, sr, cutoff_hz=options.get("high_pass_hz", 30))
             elif tool == "linear_fix":
                 from .linear_fix import fix_linear
+                before_fix = audio.copy()
                 audio, info = fix_linear(
                     audio, sr, target=options.get("linear_target", 0.01),
                     progress_cb=_cancel_aware_log,
                     step_progress_cb=_linear_step_cb,
                 )
+                _record_detector_overlay("linear", before_fix, audio)
             elif tool == "cnn_fix":
                 from .cnn_fix import fix_cnn
+                before_fix = audio.copy()
                 cnn_max_steps = options.get("cnn_max_steps", 300)
 
                 def _cnn_step_cb(s, mx, surrogate_score, real_check_extra):
@@ -788,9 +837,9 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                         extra["windows_total"] = int(real_check_extra["n_windows"])
                     job_set_sub_progress(job_id, s, mx, extra=extra)
 
-                cnn_mode = options.get("cnn_mode", "eot")
+                cnn_mode = options.get("cnn_mode", "thorough")
                 if cnn_mode not in ("simple", "eot", "thorough"):
-                    cnn_mode = "eot"
+                    cnn_mode = "thorough"
                 audio, info = fix_cnn(audio, sr,
                                        max_steps=cnn_max_steps,
                                        min_steps=options.get("cnn_min_steps", 100),
@@ -798,6 +847,7 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                                        progress_cb=_cancel_aware_log,
                                        step_progress_cb=_cnn_step_cb,
                                        mode=cnn_mode)
+                _record_detector_overlay("cnn", before_fix, audio)
             elif tool == "fix_phase":
                 # Use the same 0.1 safety bar the results table uses, so a
                 # weakly-positive 0.05 correlation is not called "no change
@@ -909,10 +959,14 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                     job_set_step(job_id, None, None, "Linear re-verification pass")
                     from .linear_fix import fix_linear
                     t0 = time.time()
+                    before_fix = audio.copy()
                     audio, reverify_info = fix_linear(
                         audio, sr, target=options.get("linear_target", 0.01),
                         progress_cb=_cancel_aware_log,
                         step_progress_cb=_linear_step_cb,
+                    )
+                    _record_detector_overlay(
+                        "linear", before_fix, audio
                     )
                     late_mutation_after_temporal = (
                         late_mutation_after_temporal
@@ -1000,6 +1054,7 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                     job_set_step(job_id, None, None, "CNN re-verification pass")
                     from .cnn_fix import fix_cnn
                     t0 = time.time()
+                    before_fix = audio.copy()
 
                     def _cnn_reverify_step_cb(s, mx, surrogate_score, real_check_extra):
                         check_cancelled(job_id)
@@ -1010,9 +1065,9 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                             extra["windows_total"] = int(real_check_extra["n_windows"])
                         job_set_sub_progress(job_id, s, mx, extra=extra)
 
-                    _cnn_reverify_mode = options.get("cnn_mode", "eot")
+                    _cnn_reverify_mode = options.get("cnn_mode", "thorough")
                     if _cnn_reverify_mode not in ("simple", "eot", "thorough"):
-                        _cnn_reverify_mode = "eot"
+                        _cnn_reverify_mode = "thorough"
                     audio, cnn_reverify_info = fix_cnn(
                         audio, sr,
                         max_steps=options.get("cnn_max_steps", 300),
@@ -1021,6 +1076,9 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                         progress_cb=_cancel_aware_log,
                         step_progress_cb=_cnn_reverify_step_cb,
                         mode=_cnn_reverify_mode,
+                    )
+                    _record_detector_overlay(
+                        "cnn", before_fix, audio
                     )
                     late_mutation_after_temporal = (
                         late_mutation_after_temporal
@@ -1197,6 +1255,7 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                                 job_set_step(job_id, None, None, "Linear re-verification pass")
                                 from .linear_fix import fix_linear
                                 t0 = time.time()
+                                before_fix = audio.copy()
 
                                 def _post_lufs_linear_step_cb(step, mx, score, attempt, max_attempts):
                                     check_cancelled(job_id)
@@ -1214,6 +1273,9 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                                     progress_cb=_cancel_aware_log,
                                     step_progress_cb=_post_lufs_linear_step_cb,
                                 )
+                                _record_detector_overlay(
+                                    "linear", before_fix, audio
+                                )
                                 post_lufs_linear_info["tool"] = "linear_fix_reverify_lufs"
                                 post_lufs_linear_info["label"] = "AI-detector fix: linear model (post-LUFS-correction pass)"
                                 post_lufs_linear_info["elapsed_sec"] = round(time.time() - t0, 2)
@@ -1230,6 +1292,7 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                                 job_set_step(job_id, None, None, "CNN re-verification pass")
                                 from .cnn_fix import fix_cnn
                                 t0 = time.time()
+                                before_fix = audio.copy()
 
                                 def _post_lufs_cnn_step_cb(s, mx, surrogate_score, real_check_extra):
                                     check_cancelled(job_id)
@@ -1240,9 +1303,9 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                                         extra["windows_total"] = int(real_check_extra["n_windows"])
                                     job_set_sub_progress(job_id, s, mx, extra=extra)
 
-                                _post_lufs_cnn_mode = options.get("cnn_mode", "eot")
+                                _post_lufs_cnn_mode = options.get("cnn_mode", "thorough")
                                 if _post_lufs_cnn_mode not in ("simple", "eot", "thorough"):
-                                    _post_lufs_cnn_mode = "eot"
+                                    _post_lufs_cnn_mode = "thorough"
                                 audio, post_lufs_cnn_info = fix_cnn(
                                     audio, sr,
                                     max_steps=options.get("cnn_max_steps", 300),
@@ -1251,6 +1314,9 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                                     progress_cb=_cancel_aware_log,
                                     step_progress_cb=_post_lufs_cnn_step_cb,
                                     mode=_post_lufs_cnn_mode,
+                                )
+                                _record_detector_overlay(
+                                    "cnn", before_fix, audio
                                 )
                                 post_lufs_cnn_info["tool"] = "cnn_fix_reverify_lufs"
                                 post_lufs_cnn_info["label"] = "AI-detector fix: CNN model (post-LUFS-correction pass)"
@@ -1475,6 +1541,14 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         orig_path = OUTPUT_DIR / f"{out_id}_orig.wav"
         save_stereo(orig_path, aligned_original, sr)
 
+        # Let the user hear the actual detector corrections in isolation.
+        # Keep a floating-point true-level file (so a tiny correction is not
+        # rounded away) and a clearly labeled normalized preview for each
+        # selected detector plus their combined overlay.
+        overlay_info = save_correction_overlays(
+            out_id, correction_overlays, sr
+        )
+
         job_log(job_id, "re-scoring with AI detectors")
         scores_after = scorer.score(str(scoring_wav_path))
         scores_before = scorer.score(str(path))
@@ -1591,6 +1665,7 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
             "transients_after_count": len(transients_after),
             "passes_both_after": scores_after["passes_both"],
             "duration_sec": n / sr,
+            "correction_overlays": overlay_info,
         }
 
         with JOBS_LOCK:
@@ -1715,6 +1790,23 @@ def serve_audio(kind, file_id):
     elif kind == "output_orig":
         path = _find_output_path(file_id, suffix="_orig")
         default_name = f"{file_id}_original{path.suffix if path else '.wav'}"
+    elif kind.startswith("overlay_"):
+        overlay_name = kind.removeprefix("overlay_")
+        if overlay_name not in {
+            "linear",
+            "linear_loud",
+            "cnn",
+            "cnn_loud",
+            "combined",
+            "combined_loud",
+        }:
+            return jsonify({"error": "invalid overlay kind"}), 400
+        path = _find_output_path(
+            file_id, suffix=f"_overlay_{overlay_name}"
+        )
+        default_name = (
+            f"{file_id}_{overlay_name}_correction.wav"
+        )
     else:
         return jsonify({"error": "invalid kind"}), 400
 

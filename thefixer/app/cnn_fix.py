@@ -17,6 +17,30 @@ from .cnn_wholetrack_optimizer_v2 import (
 )
 
 
+def _transfer_delta_to_stereo(stereo_audio, sr, delta_16k):
+    """Transfer a model-rate mono correction onto both native channels."""
+    if len(delta_16k) == 0:
+        return stereo_audio.copy()
+    delta_peak = float(np.abs(delta_16k).max(initial=0))
+    if delta_peak < 1e-9:
+        return stereo_audio.copy()
+    # Normalizing before ffmpeg resampling prevents a very quiet correction
+    # from being rounded away.  Undo the normalization after transfer.
+    scale = 0.9 / delta_peak
+    normalized = delta_16k * scale
+    native_normalized = (
+        _resample_mono(normalized, CNN_SR, sr)
+        if sr != CNN_SR
+        else normalized
+    )
+    native_delta = native_normalized / scale
+    output = stereo_audio.copy()
+    n_delta = min(len(output), len(native_delta))
+    output[:n_delta, 0] += native_delta[:n_delta]
+    output[:n_delta, 1] += native_delta[:n_delta]
+    return output
+
+
 def _resample_mono(audio, sr_in, sr_out):
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf_in:
         in_path = tf_in.name
@@ -34,7 +58,7 @@ def _resample_mono(audio, sr_in, sr_out):
 
 def fix_cnn(stereo_audio, sr, max_steps=300, min_steps=100, hop_sec=0.5,
             real_check_interval=10, progress_cb=None, step_progress_cb=None,
-            mode="eot"):
+            mode="eot", parallel_lr=0.00005):
     """Whole-track CNN fix. stereo_audio: [N,2] float32 at native sr.
     Returns (fixed_stereo, info). progress_cb receives log-line strings;
     step_progress_cb(step, max_steps, max_surrogate_score, real_check_extra)
@@ -62,10 +86,11 @@ def fix_cnn(stereo_audio, sr, max_steps=300, min_steps=100, hop_sec=0.5,
       multiple rounds of tuning). Costs ~5-6x more than "simple" but far
       less than "thorough", while directly targeting the actual failure
       mode instead of brute-forcing coverage around it.
-    - "thorough": the original dense-whole-track approach (hundreds of
-      overlapping windows). Expensive (can take 10+ minutes) and, per the
-      same review, treats a symptom rather than the cause - kept available
-      for comparison/fallback, not the recommended default going forward."""
+    - "thorough": parallel exact-window optimization over every 0.5-second
+      production start plus the deployed detector's fractional starts and
+      timing neighborhoods. Safe windows leave the repeated gradient set but
+      remain covered by sentinels, mandatory rescans, and the complete native
+      delivered-file certificate."""
     mono = stereo_audio.mean(axis=1)
     mono_16k = _resample_mono(mono, sr, CNN_SR) if sr != CNN_SR else mono.copy()
 
@@ -73,12 +98,78 @@ def fix_cnn(stereo_audio, sr, max_steps=300, min_steps=100, hop_sec=0.5,
         mode_desc = {
             "simple": "the real detector's own 5 fixed positions only, no shift-robustness",
             "eot": "the real detector's 5 fixed positions, trained for +-0.5s shift-robustness",
-            "thorough": "dense overlapping windows across the whole track",
+            "thorough": "parallel exact windows across the whole track with native-output verification",
         }.get(mode, mode)
         progress_cb(f"cnn: optimizing {len(mono_16k)/CNN_SR:.1f}s of audio ({mode_desc}) - this can take a while")
 
     try:
-        if mode == "eot":
+        if mode == "thorough":
+            from .cnn_adaptive_dense_prototype import (
+                required_exact_positions,
+            )
+            from .cnn_parallel_optimizer import (
+                optimize_parallel_active,
+            )
+
+            # Native transfer is part of the still-live optimizer session.
+            # If this certificate fails at step 50, the same correction,
+            # Adam moments, weights, and worker pools continue to step 60+
+            # with the failed starts reactivated.  No full-track restart.
+            def _delivery_transform(candidate_delta):
+                candidate = _transfer_delta_to_stereo(
+                    stereo_audio, sr, candidate_delta
+                )
+                candidate_mono = candidate.mean(axis=1)
+                return (
+                    _resample_mono(
+                        candidate_mono, sr, CNN_SR
+                    )
+                    if sr != CNN_SR
+                    else candidate_mono
+                )
+
+            parallel_max_steps = min(max(1, int(max_steps)), 80)
+            total_positions = len(
+                required_exact_positions(mono_16k)[0]
+            )
+
+            def _parallel_progress(
+                phase, step, total, estimate, active_count
+            ):
+                if step_progress_cb is None:
+                    return
+                real_extra = None
+                if phase == "delivery":
+                    real_extra = {
+                        "real_max_score": estimate,
+                        "n_windows_bad": active_count,
+                        "n_windows": (
+                            total_positions
+                        ),
+                    }
+                step_progress_cb(
+                    step, total, estimate, real_extra
+                )
+
+            delta_16k, parallel_scan, parallel_timing = (
+                optimize_parallel_active(
+                    mono_16k,
+                    max_steps=parallel_max_steps,
+                    min_steps=min(40, parallel_max_steps),
+                    real_check_interval=10,
+                    full_check_interval=30,
+                    lr=parallel_lr,
+                    max_repair_rounds=0,
+                    delivery_transform=_delivery_transform,
+                    delivery_check_steps=(50, 60, 70, 80),
+                    progress_cb=_parallel_progress,
+                )
+            )
+            positions = parallel_scan.positions
+            total_positions = len(positions)
+            seg_len = 10 * CNN_SR
+            pre_transfer_worst = parallel_scan.worst_score
+        elif mode == "eot":
             delta_16k, positions, seg_len, pre_transfer_worst = optimize_eot_verified(
                 mono_16k, max_steps=max_steps, min_steps=min_steps,
                 real_check_interval=real_check_interval, verbose=True,
@@ -94,7 +185,15 @@ def fix_cnn(stereo_audio, sr, max_steps=300, min_steps=100, hop_sec=0.5,
         return stereo_audio, {"applied": False, "reason": str(e)}
 
     if progress_cb:
-        progress_cb(f"cnn: pre-transfer certified worst score (post-silence-guard): {pre_transfer_worst * 100:.2f}% AI")
+        if mode == "thorough" and parallel_timing.get(
+            "accepted_delivery"
+        ):
+            progress_cb(
+                "cnn: in-session native-output certificate reached "
+                f"{pre_transfer_worst * 100:.2f}% worst-window AI"
+            )
+        else:
+            progress_cb(f"cnn: pre-transfer certified worst score (post-silence-guard): {pre_transfer_worst * 100:.2f}% AI")
 
     # tracks shorter than the real detector's segment length get zero-padded
     # internally before optimization (see optimize_whole_track_verified) so
@@ -108,19 +207,7 @@ def fix_cnn(stereo_audio, sr, max_steps=300, min_steps=100, hop_sec=0.5,
     if delta_peak < 1e-9:
         return stereo_audio, {"applied": False, "reason": "optimizer found zero-magnitude delta"}
 
-    scale = 0.9 / delta_peak
-    delta_norm_16k = delta_16k * scale
-    delta_native_norm = _resample_mono(delta_norm_16k, CNN_SR, sr) if sr != CNN_SR else delta_norm_16k
-    delta_native = delta_native_norm / scale
-
-    # apply the correction only where a delta exists (resampling can leave
-    # delta_native a few samples shorter/longer than stereo_audio) but carry
-    # the FULL original track through unchanged elsewhere - never truncate
-    # the delivered audio down to however much the delta happened to cover.
-    n_delta = min(len(stereo_audio), len(delta_native))
-    out = stereo_audio.copy()
-    out[:n_delta, 0] += delta_native[:n_delta]
-    out[:n_delta, 1] += delta_native[:n_delta]
+    out = _transfer_delta_to_stereo(stereo_audio, sr, delta_16k)
     n = len(out)
 
     # emergency anti-clipping safety net ONLY (not the app's real loudness
@@ -159,7 +246,20 @@ def fix_cnn(stereo_audio, sr, max_steps=300, min_steps=100, hop_sec=0.5,
     out_mono_16k = _resample_mono(out_mono_native, sr, CNN_SR) if sr != CNN_SR else out_mono_native
     n_16k = len(out_mono_16k)
 
-    if mode == "eot":
+    if mode == "thorough":
+        from .cnn_adaptive_dense_prototype import required_exact_positions
+        from .cnn_real_scanner import ParallelRealScoreScanner
+
+        post_positions, post_seg_len = required_exact_positions(
+            out_mono_16k
+        )
+        with ParallelRealScoreScanner() as scanner:
+            post_transfer_scores = scanner.scan(
+                out_mono_16k, post_positions, post_seg_len
+            )
+        positions = post_positions
+        seg_len = post_seg_len
+    elif mode == "eot":
         # BUG FIX (adversarial audit, verified directly): _worst_shift_score
         # now returns None (not 0.0) when a position has no valid in-bounds
         # window at all - filter those out explicitly here, the same way
@@ -231,4 +331,9 @@ def fix_cnn(stereo_audio, sr, max_steps=300, min_steps=100, hop_sec=0.5,
         "pre_transfer_worst_score": float(pre_transfer_worst),
         "worst_score_after_transfer": float(worst_after_transfer) if worst_after_transfer is not None else None,
         "verified_after_transfer": verified,
+        **(
+            {"parallel_timing": parallel_timing}
+            if mode == "thorough"
+            else {}
+        ),
     }

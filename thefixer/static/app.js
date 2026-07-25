@@ -135,8 +135,8 @@
     cnn_mode: {
       title: "CNN fix mode: Simple vs. Shift-robust vs. Thorough",
       body: `<p><strong>Simple</strong> optimizes ONLY the exact 5 fixed positions the real CNN detector itself checks (an even spread across the track, skipping the first/last 5 seconds) - what an off-the-shelf, uncustomized deployment of this detector would actually test against. Fastest, but the resulting fix can be fragile: it's tuned to that exact spot and can fail if the delivered file's exact alignment drifts by even a fraction of a second.</p>
-             <p><strong>Shift-robust</strong> (recommended, default) optimizes the same 5 positions, but trains the fix to hold up across small (±0.5s) shifts around each one, not just the exact spot - directly targeting why Simple can be fragile, at a modest extra cost (~5-6x Simple, still far cheaper than Thorough).</p>
-             <p><strong>Thorough</strong> optimizes a dense window every 0.5 seconds across the ENTIRE track - far more coverage than the standard 5-position check. Much slower (can take 10+ minutes on a full track) and, in testing, not necessarily more reliable than Shift-robust - kept available for comparison.</p>`,
+             <p><strong>Shift-robust</strong> optimizes the same 5 positions across small (±0.5s) shifts. It is retained for comparison with the original optimizer.</p>
+             <p><strong>Thorough</strong> (recommended, default) protects every 0.5-second whole-track window plus the detector's exact fractional test positions and timing neighborhoods. It evaluates exact windows in parallel, stops repeating gradient work on safe regions, and verifies the native delivered signal while the optimizer is still warm. A failed native check continues from the existing correction instead of restarting the track.</p>`,
     },
   };
 
@@ -206,7 +206,7 @@
     waveData: null,
     outputFormat: "same",
     mp3Mode: "vbr0",
-    cnnMode: "eot",
+    cnnMode: "thorough",
     temporalMaxDriftMs: 8,
   };
 
@@ -277,6 +277,12 @@
     const ao = $("audioOrig"), af = $("audioFixed");
     if (ao && !ao.paused) ao.pause();
     if (af && !af.paused) af.pause();
+    document.querySelectorAll("#correctionOverlayList audio").forEach(a => {
+      a.pause();
+      a.removeAttribute("src");
+      a.load();
+    });
+    $("correctionOverlayPanel")?.classList.add("hidden");
     const playBtn = $("playBtn");
     if (playBtn) playBtn.textContent = "▶";
     state = { ...state, fileId: null, analysis: null, selected: new Set(), jobId: null, result: null,
@@ -1397,6 +1403,49 @@
     }
 
     setupABPlayer(result);
+    renderCorrectionOverlays(result);
+  }
+
+  function renderCorrectionOverlays(result) {
+    const panel = $("correctionOverlayPanel");
+    const list = $("correctionOverlayList");
+    const overlays = result.correction_overlays || {};
+    const kinds = ["linear", "cnn", "combined"].filter(k => overlays[k]);
+    if (!kinds.length) {
+      list.innerHTML = "";
+      panel.classList.add("hidden");
+      return;
+    }
+    const labels = {
+      linear: "Linear correction",
+      cnn: "CNN correction",
+      combined: "Combined",
+    };
+    list.innerHTML = kinds.map(kind => {
+      const gain = Number(overlays[kind].preview_gain_db || 0);
+      return `
+        <div class="overlay-row">
+          <div class="overlay-label">${labels[kind]}</div>
+          <div>
+            <span class="overlay-player-label">Actual level</span>
+            <audio controls preload="none" src="/api/audio/overlay_${kind}/${result.out_id}"></audio>
+          </div>
+          <div>
+            <span class="overlay-player-label">Amplified preview (+${gain.toFixed(1)} dB)</span>
+            <audio controls preload="none" src="/api/audio/overlay_${kind}_loud/${result.out_id}"></audio>
+          </div>
+        </div>`;
+    }).join("");
+    list.querySelectorAll("audio").forEach(player => {
+      player.addEventListener("play", () => {
+        $("audioOrig").pause();
+        $("audioFixed").pause();
+        list.querySelectorAll("audio").forEach(other => {
+          if (other !== player) other.pause();
+        });
+      });
+    });
+    panel.classList.remove("hidden");
   }
 
   function renderSpectrumView() {
