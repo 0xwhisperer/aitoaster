@@ -736,14 +736,12 @@
     // transient/pop flags: small triangle markers at each detected glitch's
     // exact timestamp, so it's visible ON the waveform where a problem was
     // found, not just as a bare count in the stats panel
-    canvas._transientMarkers = [];
     if (markers && markers.length) {
       const crit = styles.getPropertyValue("--crit").trim();
       const durationSec = (wave && wave.duration_sec) || (overlayWave && overlayWave.duration_sec) || 0;
       if (durationSec > 0) {
         for (const m of markers) {
           const x = (m.time_sec / durationSec) * w;
-          canvas._transientMarkers.push({ x, time_sec: m.time_sec });
 
           // vertical guide line through the whole waveform
           ctx.strokeStyle = crit;
@@ -1400,7 +1398,7 @@
       $("waveformLegend").innerHTML = `
         <div class="item"><span class="swatch" style="background: var(--before)"></span>Before</div>
         <div class="item"><span class="swatch" style="background: var(--accent)"></span>After</div>
-        ${hasTransientMarkers ? `<div class="item"><span class="swatch" style="background: var(--crit)"></span>Fixed transient/pop (hover for time)</div>` : ""}
+        ${hasTransientMarkers ? `<div class="item"><span class="swatch" style="background: var(--crit)"></span>Fixed transient/pop${result.transients_found.length > 1 ? ` (${result.transients_found.length})` : ""} — timestamp shown at each marker</div>` : ""}
       `;
       document.querySelector("#waveformOverviewCanvas").closest(".spectrum-wrap").querySelector(".chart-view-row").classList.add("active");
     }

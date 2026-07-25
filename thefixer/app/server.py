@@ -53,6 +53,83 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 app = Flask(__name__, static_folder=None)
 
+# How many completed jobs keep their full file set on disk. Each job writes 8
+# files - the delivered output, the A/B original, and six correction overlays
+# that are each ~2x the audio's size - so outputs/ grew without bound (measured
+# at 6.4GB, which filled the disk to 99% and started failing runs). The overlay
+# players and the A/B player both read from these paths, so a finished job's
+# files cannot simply be deleted while the user might still be looking at it;
+# instead keep the N most recent jobs whole and prune older ones.
+KEEP_RECENT_JOBS = 5
+
+# Suffixes written per job, beyond the delivered file itself. Everything here
+# is regenerable diagnostic material - the source upload and the delivered
+# output are what actually matter.
+_JOB_ARTIFACT_SUFFIXES = (
+    "_orig.wav",
+    "_overlay_cnn.wav",
+    "_overlay_cnn_loud.wav",
+    "_overlay_combined.wav",
+    "_overlay_combined_loud.wav",
+    "_overlay_linear.wav",
+    "_overlay_linear_loud.wav",
+)
+
+
+def _job_id_from_output(path):
+    """Recover the out_id a file in OUTPUT_DIR belongs to."""
+    name = path.name
+    for suffix in _JOB_ARTIFACT_SUFFIXES:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return path.stem
+
+
+def prune_old_outputs(keep=KEEP_RECENT_JOBS):
+    """Delete artifacts from all but the `keep` most recent jobs.
+
+    Groups every file in OUTPUT_DIR by its job id, orders the groups by their
+    newest file's mtime, and removes the older groups entirely (delivered file
+    included - an old job's output is no longer reachable from the UI, which
+    only ever shows the current result). Returns (jobs_removed, bytes_freed).
+
+    Deliberately conservative: it only ever touches OUTPUT_DIR, never the
+    uploads or anything outside it, and it never removes the newest `keep`
+    jobs, so the run the user is currently looking at - and several before
+    it - stay completely intact.
+    """
+    try:
+        files = [p for p in OUTPUT_DIR.iterdir() if p.is_file()]
+    except FileNotFoundError:
+        return 0, 0
+
+    jobs = {}
+    for path in files:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            continue
+        entry = jobs.setdefault(_job_id_from_output(path), {"paths": [], "mtime": 0})
+        entry["paths"].append(path)
+        entry["mtime"] = max(entry["mtime"], stat.st_mtime)
+
+    if len(jobs) <= keep:
+        return 0, 0
+
+    ordered = sorted(jobs.items(), key=lambda kv: kv[1]["mtime"], reverse=True)
+    removed_jobs = 0
+    freed = 0
+    for _job_id, entry in ordered[keep:]:
+        for path in entry["paths"]:
+            try:
+                freed += path.stat().st_size
+                path.unlink()
+            except FileNotFoundError:
+                continue
+        removed_jobs += 1
+    return removed_jobs, freed
+
+
 _scorer = None
 _scorer_lock = threading.Lock()
 
@@ -1428,6 +1505,12 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         # detector work, right before final encode, so it's the last thing
         # to touch the signal and nothing downstream can disturb it.
         job_log(job_id, "running: wm")
+        # This stage runs OUTSIDE the per-tool loop, so it never reaches that
+        # loop's centralized "done (Xs)" emission - it had no timing at all
+        # and showed up in the live log as the only stage between two timed
+        # ones with no Done line. Time it here so every stage reports
+        # uniformly (same for the save and final re-score stages below).
+        wm_t0 = time.time()
         try:
             from .watermark import embed_watermark, detect_watermark
             mono_for_mark = audio.mean(axis=1)
@@ -1444,6 +1527,9 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
             # this pipeline - proves the mark is really recoverable on
             # THIS file, not just in isolated module testing.
             wm_found, wm_version, wm_detail = detect_watermark(audio.mean(axis=1), sr)
+            # "done" before the result line, matching the per-tool loop's own
+            # ordering (done first, then the status line).
+            job_log(job_id, f"  done ({round(time.time() - wm_t0, 2)}s)")
             if wm_found:
                 job_log(job_id, f"wm: pass (version {wm_version}, "
                                  f"{wm_detail.get('match_fraction', 0) * 100:.0f}% confidence, "
@@ -1455,6 +1541,9 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
             # never let the watermark stage block a user's actual delivery -
             # this is a footprint-measurement feature, not a core function;
             # if it fails for any reason, log it and ship the file anyway.
+            # Still emit "done" so the stage is not left dangling in the log
+            # on the error path either.
+            job_log(job_id, f"  done ({round(time.time() - wm_t0, 2)}s)")
             job_log(job_id, f"wm: error, shipping without it ({e})")
 
         # BUG FIX (third adversarial audit round, verified directly): the
@@ -1523,6 +1612,7 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         if format_fallback_warning:
             job_log(job_id, f"NOTE: {format_fallback_warning}")
         job_log(job_id, f"saving output file (format: {resolved_format})")
+        save_t0 = time.time()
         out_path = encode_final_output(audio, sr, resolved_format, OUTPUT_DIR / out_id, mp3_mode=mp3_mode)
         scoring_wav_path = out_path
 
@@ -1548,10 +1638,16 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         overlay_info = save_correction_overlays(
             out_id, correction_overlays, sr
         )
+        # Covers the whole save stage the log announced: the final encode plus
+        # the A/B original and the correction overlays, which is everything
+        # written before scoring starts.
+        job_log(job_id, f"  done ({round(time.time() - save_t0, 2)}s)")
 
         job_log(job_id, "re-scoring with AI detectors")
+        rescore_t0 = time.time()
         scores_after = scorer.score(str(scoring_wav_path))
         scores_before = scorer.score(str(path))
+        job_log(job_id, f"  done ({round(time.time() - rescore_t0, 2)}s)")
         if not scores_after["passes_both"]:
             failing = []
             if not scores_after["passes_linear"]:
@@ -1671,6 +1767,19 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         with JOBS_LOCK:
             JOBS[job_id]["status"] = "done"
             JOBS[job_id]["result"] = result
+
+        # Prune older jobs' files now that this one is safely recorded. Runs
+        # AFTER the result is stored so a cleanup failure can never cost the
+        # user the run they just waited for - hence the broad except: this is
+        # housekeeping, never a delivery gate.
+        try:
+            pruned_jobs, freed_bytes = prune_old_outputs()
+            if pruned_jobs:
+                job_log(job_id, f"cleanup: removed {pruned_jobs} older job(s), "
+                                f"freed {freed_bytes / 1e9:.2f}GB")
+        except Exception as e:
+            job_log(job_id, f"cleanup: skipped ({e})")
+
         job_log(job_id, "complete")
 
     except JobCancelled:
