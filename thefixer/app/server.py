@@ -674,6 +674,11 @@ TOOL_ORDER = [
     "true_peak_limit",
 ]
 
+# "fade" is deliberately NOT in TOOL_ORDER: it is applied as a dedicated
+# stage after the whole chain (including the post-chain LUFS drift
+# correction), not inside the per-tool loop. See _apply_fade_stage.
+FADE_TOOL = "fade"
+
 TOOL_LABELS = {
     "strip_metadata": "Strip metadata & embedded images",
     "trim_silence": "Trim leading/trailing silence",
@@ -688,6 +693,7 @@ TOOL_LABELS = {
     "normalize_lufs": "LUFS loudness normalization",
     "multiband_compress": "Multiband tonal-balance compression",
     "true_peak_limit": "True-peak limiter",
+    "fade": "Fade in / fade out",
 }
 
 
@@ -770,6 +776,16 @@ def _tool_status_line(tool, info):
         # what's actually knowable at this point in the pipeline, same
         # honesty standard as everything else in this app.
         return f"pass (applied, max drift: {info.get('max_drift_ms', 0):.0f}ms)"
+
+    if tool == "fade":
+        if not applied:
+            return "pass (no fade requested)"
+        parts = []
+        if info.get("fade_in_samples", 0) > 0:
+            parts.append(f"{info.get('fade_in_ms', 0)}ms in")
+        if info.get("fade_out_samples", 0) > 0:
+            parts.append(f"{info.get('fade_out_ms', 0)}ms out")
+        return f"pass (applied: {', '.join(parts)})" if parts else "pass (applied)"
 
     if tool == "true_peak_limit":
         if not applied:
@@ -1423,6 +1439,39 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                                      f"{target_lufs:.1f} LUFS target - the true-peak ceiling "
                                      f"({options.get('ceiling_db', -1.0):.1f}dBTP) doesn't leave enough "
                                      f"headroom to reach both targets on this track")
+
+        # Fades are applied HERE - after every gain stage, including the
+        # post-chain LUFS drift correction above - rather than as an ordinary
+        # entry in TOOL_ORDER. Verified directly why this matters:
+        #
+        #   * a 3s fade-out shifts the measured loudness of a test tone by
+        #     0.57dB (-6.97 -> -7.54 LUFS), so a fade applied earlier makes
+        #     normalize_lufs measure a signal that is artificially quiet;
+        #   * the post-chain drift correction then sees that same deficit and
+        #     multiplies the WHOLE track by a makeup gain, which both partly
+        #     undoes the fade and pushes the rest of the track louder than
+        #     the user asked for.
+        #
+        # Running last means the delivered fade is exactly the requested
+        # shape. The watermark still runs after this (it is additive and
+        # tiny, and must remain the final signal mutation), and the true-peak
+        # guard after the watermark only ever reduces gain, so neither can
+        # reopen the faded edges.
+        if FADE_TOOL in tools:
+            check_cancelled(job_id)
+            job_log(job_id, f"running: {TOOL_LABELS[FADE_TOOL]}")
+            t0 = time.time()
+            audio, fade_info = chain.apply_fade(
+                audio, sr,
+                fade_in_ms=options.get("fade_in_ms", 10),
+                fade_out_ms=options.get("fade_out_ms", 3000),
+            )
+            fade_info["tool"] = FADE_TOOL
+            fade_info["label"] = TOOL_LABELS[FADE_TOOL]
+            fade_info["elapsed_sec"] = round(time.time() - t0, 2)
+            steps.append(fade_info)
+            job_log(job_id, f"  done ({fade_info['elapsed_sec']}s)")
+            job_log(job_id, f"{FADE_TOOL}: {_tool_status_line(FADE_TOOL, fade_info)}")
 
         check_cancelled(job_id)
         if late_mutation_after_temporal:

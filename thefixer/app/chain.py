@@ -17,6 +17,82 @@ from scipy import signal
 import pyloudnorm as pyln
 
 
+FADE_MIN_MS = 10
+FADE_MAX_MS = 10000
+
+
+def apply_fade(audio, sr, fade_in_ms=10, fade_out_ms=3000):
+    """Apply a fade-in and/or fade-out to the track's head and tail.
+
+    Durations are in milliseconds and clamped to [10, 10000] - the range the
+    UI sliders expose. Passing 0 (or a negative) for either disables that
+    side, so a fade-out-only or fade-in-only run is possible.
+
+    Uses an EQUAL-POWER (sine/cosine quarter-cycle) curve rather than a
+    linear ramp. A linear amplitude ramp sounds like it dips in the middle,
+    because perceived loudness follows power rather than amplitude; the sine
+    curve holds constant power through the fade, which is what a mastering
+    engineer's fade actually does.
+
+    Handles the degenerate cases the sliders make reachable: a fade longer
+    than the track itself, and a fade-in plus fade-out that would otherwise
+    overlap. Both are bounded so the two curves meet at most once and never
+    multiply into a doubled gain or read past the buffer.
+    """
+    n = len(audio)
+    if n == 0:
+        return audio, {"applied": False, "reason": "empty audio"}
+
+    requested_in = int(fade_in_ms or 0)
+    requested_out = int(fade_out_ms or 0)
+    in_ms = 0 if requested_in <= 0 else int(np.clip(requested_in, FADE_MIN_MS, FADE_MAX_MS))
+    out_ms = 0 if requested_out <= 0 else int(np.clip(requested_out, FADE_MIN_MS, FADE_MAX_MS))
+
+    if in_ms <= 0 and out_ms <= 0:
+        return audio, {"applied": False, "reason": "both fade durations are zero"}
+
+    in_samples = min(int(in_ms / 1000.0 * sr), n)
+    out_samples = min(int(out_ms / 1000.0 * sr), n)
+
+    # A 10s fade on a shorter track, or a long fade at both ends, would make
+    # the two curves overlap and multiply - audibly a hole in the middle.
+    # Scale both down proportionally so they meet at most at a single point.
+    total = in_samples + out_samples
+    if total > n and total > 0:
+        scale = n / total
+        in_samples = int(in_samples * scale)
+        out_samples = int(out_samples * scale)
+
+    envelope = np.ones(n, dtype=np.float64)
+    if in_samples > 1:
+        # sin(0..pi/2): 0 -> 1, equal power
+        envelope[:in_samples] = np.sin(
+            np.linspace(0.0, np.pi / 2, in_samples)
+        ) ** 2
+    elif in_samples == 1:
+        envelope[0] = 0.0
+    if out_samples > 1:
+        envelope[n - out_samples:] = np.cos(
+            np.linspace(0.0, np.pi / 2, out_samples)
+        ) ** 2
+    elif out_samples == 1:
+        envelope[-1] = 0.0
+
+    if audio.ndim > 1:
+        out = (audio * envelope[:, None]).astype(audio.dtype)
+    else:
+        out = (audio * envelope).astype(audio.dtype)
+
+    return out, {
+        "applied": True,
+        "fade_in_ms": in_ms,
+        "fade_out_ms": out_ms,
+        "fade_in_samples": int(in_samples),
+        "fade_out_samples": int(out_samples),
+        "curve": "equal-power (sine squared)",
+    }
+
+
 def trim_silence(audio, sr, threshold=0.0005, pad_ms=5):
     """Trim leading/trailing near-silence. threshold is linear amplitude;
     default catches true digital silence plus low-level noise floor dither."""

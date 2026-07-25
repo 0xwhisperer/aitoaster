@@ -179,6 +179,7 @@
     { id: "normalize_lufs", group: "chainGroupMaster", name: "LUFS loudness normalization", desc: "Targets -14 LUFS, the standard streaming-platform loudness reference.", info: "lufs" },
     { id: "multiband_compress", group: "chainGroupMaster", name: "Multiband compression", desc: "Gentle 3-band dynamics smoothing for tonal balance.", info: "tool_multiband_compress" },
     { id: "true_peak_limit", group: "chainGroupMaster", name: "True-peak limiter", desc: "Brick-wall safety ceiling at -1dBTP, accounting for inter-sample peaks.", info: "tool_true_peak_limit" },
+    { id: "fade", group: "chainGroupMaster", name: "Fade in / fade out", desc: "Equal-power fade at the start and end of the track. Runs last, after the limiter, so no later gain stage undoes it.", info: "tool_fade" },
   ];
 
   // BUG FIX (second adversarial audit round): the analysis-response race
@@ -214,6 +215,11 @@
     mp3Mode: "vbr0",
     cnnMode: "thorough",
     temporalMaxDriftMs: 8,
+    // 10ms in by default: trim_silence already removes the leading silence,
+    // so this only needs to be long enough to avoid a click at the very
+    // first sample. 3000ms out is a conventional musical fade.
+    fadeInMs: 10,
+    fadeOutMs: 3000,
   };
 
   // ---------- output format switch ----------
@@ -369,6 +375,11 @@
       }
       console.error(err);
     }
+  }
+
+  function fmtFadeMs(ms) {
+    // sub-second values read better in ms; past that, seconds
+    return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(ms % 1000 === 0 ? 0 : 1)}s`;
   }
 
   function fmtDuration(sec) {
@@ -844,6 +855,21 @@
             </div>
             <div class="cnn-mode-hint">Higher values are untested for audibility - lower this if you notice anything.</div>
           </div>`;
+        } else if (t.id === "fade" && checked) {
+          settingsRow = `
+          <div class="tool-settings-row">
+            <div class="chain-group-label">Fade in</div>
+            <div class="slider-row">
+              <input type="range" id="fadeInSlider" min="10" max="10000" step="10" value="${state.fadeInMs}">
+              <span class="slider-value mono" id="fadeInValue">${fmtFadeMs(state.fadeInMs)}</span>
+            </div>
+            <div class="chain-group-label">Fade out</div>
+            <div class="slider-row">
+              <input type="range" id="fadeOutSlider" min="10" max="10000" step="10" value="${state.fadeOutMs}">
+              <span class="slider-value mono" id="fadeOutValue">${fmtFadeMs(state.fadeOutMs)}</span>
+            </div>
+            <div class="cnn-mode-hint">Equal-power curve. Applied after the limiter so nothing later undoes it.</div>
+          </div>`;
         }
         // BUG FIX (Codex MAJOR / Fable B3, verified directly): multiband_compress
         // is deliberately gentle (least-change-necessary by design) and can take
@@ -914,6 +940,20 @@
         document.getElementById("temporalDriftValue").textContent = `${state.temporalMaxDriftMs}ms`;
       });
       temporalSliderEl.addEventListener("click", (e) => e.stopPropagation());
+    }
+    for (const [sliderId, valueId, key] of [
+      ["fadeInSlider", "fadeInValue", "fadeInMs"],
+      ["fadeOutSlider", "fadeOutValue", "fadeOutMs"],
+    ]) {
+      const el = document.getElementById(sliderId);
+      if (!el) continue;
+      el.addEventListener("input", (e) => {
+        state[key] = Number(e.target.value);
+        document.getElementById(valueId).textContent = fmtFadeMs(state[key]);
+      });
+      // without this the click bubbles to the tool row and toggles the tool
+      // off mid-drag, the same reason the drift slider stops propagation
+      el.addEventListener("click", (e) => e.stopPropagation());
     }
 
     const countIds = { chainGroupCleanup: "countCleanup", chainGroupAI: "countAI", chainGroupMaster: "countMaster" };
@@ -1007,7 +1047,7 @@
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        tools: Array.from(state.selected), options: { cnn_mode: state.cnnMode, temporal_max_drift_ms: state.temporalMaxDriftMs },
+        tools: Array.from(state.selected), options: { cnn_mode: state.cnnMode, temporal_max_drift_ms: state.temporalMaxDriftMs, fade_in_ms: state.fadeInMs, fade_out_ms: state.fadeOutMs },
         output_name: outputName || undefined,
         output_format: state.outputFormat,
         mp3_mode: state.mp3Mode,
@@ -1197,13 +1237,13 @@
     // regex + a friendly-name lookup covers all of them instead of a
     // separate hand-written pattern per tool (which is exactly how several
     // tools ended up with no status line at all before this).
-    [/^\s*(strip_metadata|trim_silence|dc_offset|fix_transients|spectral_revive|high_pass|fix_phase|normalize_lufs|multiband_compress|temporal_normalize|true_peak_limit): (pass|check) \((.+)\)$/, (m) => {
+    [/^\s*(strip_metadata|trim_silence|dc_offset|fix_transients|spectral_revive|high_pass|fix_phase|normalize_lufs|multiband_compress|temporal_normalize|true_peak_limit|fade): (pass|check) \((.+)\)$/, (m) => {
       const FRIENDLY_TOOL_NAME = {
         strip_metadata: "Metadata strip", trim_silence: "Silence trim", dc_offset: "DC offset correction",
         fix_transients: "Transient/pop fix", spectral_revive: "High-frequency fill-in", high_pass: "High-pass filter",
         fix_phase: "Stereo phase correction", normalize_lufs: "Loudness normalization",
         multiband_compress: "Multiband compression", temporal_normalize: "Temporal pattern denormalization",
-        true_peak_limit: "True-peak limiter",
+        true_peak_limit: "True-peak limiter", fade: "Fade in / fade out",
       };
       const name = FRIENDLY_TOOL_NAME[m[1]] || m[1];
       return { text: `${name}: ${m[3]}`, badge: m[2] === "pass" ? "pass" : "retry" };
