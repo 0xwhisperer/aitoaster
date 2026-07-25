@@ -140,7 +140,8 @@ def high_pass_filter(audio, sr, cutoff_hz=30, order=4):
     return out, {"applied": bool(meaningful), "cutoff_hz": cutoff_hz, "order": order}
 
 
-def detect_transients(audio, sr, jump_threshold=0.35, envelope_ratio_threshold=8.0, min_gap_sec=0.01):
+def detect_transients(audio, sr, jump_threshold=0.35, envelope_ratio_threshold=8.0, min_gap_sec=0.01,
+                      burst_window_sec=0.03, max_burst_crossings=8):
     """Find genuine click/pop/glitch artifacts - NOT ordinary musical
     transients like kick/snare hits, which have fast-but-natural attacks and
     must never trigger this. A real digital pop is characterized by an
@@ -205,8 +206,52 @@ def detect_transients(audio, sr, jump_threshold=0.35, envelope_ratio_threshold=8
     # independent of min_gap - see Round 1 history above for why the
     # PEAK search radius and the dedup SKIP distance must be separate
     # values, not the same one.
+    # BUG FIX (direct user report, "the transient tool is blowing out the t's
+    # in the vocal", verified on the reported track): a vocal PLOSIVE or
+    # FRICATIVE ("t", "s", "k") satisfies both tests above and was being
+    # deleted as if it were a digital click.
+    #
+    # Two things conspire. A consonant is a broadband burst whose waveform
+    # oscillates fast enough to clear jump_threshold over and over, and
+    # singing often sits in a quiet gap where the 200ms envelope has
+    # collapsed - measured on the reported track at 35.9s, the local envelope
+    # fell to 0.0417 from 0.1410 half a second earlier, so the burst also
+    # cleared the 8.0 envelope ratio easily. 25 separate samples triggered
+    # inside 90ms there, and 19 of the track's 25 total detections were
+    # consonants rather than clicks.
+    #
+    # The discriminator is DURATION, which is what physically separates the
+    # two events. A digital click is a near-instantaneous discontinuity: one
+    # or two samples cross the jump threshold and the waveform is continuous
+    # either side. A consonant is a SUSTAINED burst lasting tens of
+    # milliseconds, so it crosses the threshold hundreds of times in a row
+    # (measured: 115-182 crossings per 60ms window at the reported spots,
+    # versus 2-5 for the genuine one-off clicks elsewhere in the same track).
+    #
+    # This matters more than a normal false positive because fix_transient
+    # repairs a click by DELETING it - replacing the region with linear
+    # interpolation between clean neighbours - so a false positive here does
+    # not merely duck the consonant, it erases it (measured: 42% of the
+    # consonant's 4-12kHz energy gone, -4.8dB).
+    burst_window = max(1, int(burst_window_sec * sr))
+    over_jump = (jump > jump_threshold).astype(np.int32)
+    # Count threshold crossings in the window centred on each sample, via a
+    # cumulative sum so this stays O(n) on a full-length track.
+    cumulative = np.concatenate([[0], np.cumsum(over_jump)])
+    half = burst_window // 2
+
     while i < n:
         if jump[i] > jump_threshold and ratio[i] > envelope_ratio_threshold:
+            lo = max(0, i - half)
+            hi = min(n, i + half)
+            crossings = int(cumulative[hi] - cumulative[lo])
+            if crossings > max_burst_crossings:
+                # Sustained broadband burst - a consonant or other musical
+                # texture, not a discontinuity. Skip past the whole burst
+                # rather than one sample, so its remaining crossings do not
+                # each get re-tested.
+                i = hi
+                continue
             peak_lo = max(0, i - jump_search)
             peak_hi = min(n, i + jump_search)
             click_peak_idx = peak_lo + int(np.argmax(np.abs(mono[peak_lo:peak_hi])))
