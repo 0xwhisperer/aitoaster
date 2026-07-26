@@ -802,7 +802,18 @@
       const crit = styles.getPropertyValue("--crit").trim();
       const durationSec = (wave && wave.duration_sec) || (overlayWave && overlayWave.duration_sec) || 0;
       if (durationSec > 0) {
-        for (const m of markers) {
+        // BUG FIX (direct user report, illegible labels): the timestamps were
+        // drawn as bare 9px red text on a 0.12-alpha wash, which disappeared
+        // against the green waveform, and every label sat at the SAME y - so
+        // two markers a few seconds apart printed straight over each other
+        // and neither could be read. Draw them as solid pills with real
+        // contrast, and stagger onto a second row when they would collide.
+        const LABEL_FONT = "600 10px ui-monospace, SF Mono, Menlo, monospace";
+        ctx.font = LABEL_FONT;
+        const placed = [];
+        const sorted = [...markers].sort((a, b) => a.time_sec - b.time_sec);
+
+        for (const m of sorted) {
           const x = (m.time_sec / durationSec) * w;
 
           // vertical guide line through the whole waveform
@@ -824,21 +835,37 @@
           ctx.closePath();
           ctx.fill();
 
-          // always-visible timestamp label so the marker is self-explanatory
-          // without requiring a hover - the legend explains WHAT the flag
-          // means, this shows WHERE/WHEN
           const label = fmtDuration(m.time_sec);
-          ctx.font = "9px ui-monospace, monospace";
-          const labelWidth = ctx.measureText(label).width;
-          const labelX = Math.min(Math.max(x - labelWidth / 2, 2), w - labelWidth - 2);
+          const tw = ctx.measureText(label).width;
+          const padX = 4, boxW = tw + padX * 2, boxH = 13;
+          let boxX = Math.min(Math.max(x - boxW / 2, 1), w - boxW - 1);
+
+          // find the first row where this pill does not touch one already
+          // drawn; each extra row steps down by the pill height plus a gap
+          let row = 0;
+          while (placed.some(p => p.row === row && boxX < p.x2 + 3 && boxX + boxW > p.x1 - 3)) {
+            row++;
+            if (row > 3) break;   // give up rather than run off the chart
+          }
+          const boxY = 9 + row * (boxH + 2);
+          placed.push({ row, x1: boxX, x2: boxX + boxW });
+
+          // solid pill so the text never competes with the waveform behind it
           ctx.fillStyle = crit;
-          ctx.globalAlpha = 0.12;
-          ctx.fillRect(labelX - 2, 9, labelWidth + 4, 11);
-          ctx.globalAlpha = 1;
-          ctx.fillStyle = crit;
-          ctx.textBaseline = "top";
-          ctx.fillText(label, labelX, 10);
+          if (ctx.roundRect) {
+            ctx.beginPath();
+            ctx.roundRect(boxX, boxY, boxW, boxH, 3);
+            ctx.fill();
+          } else {
+            ctx.fillRect(boxX, boxY, boxW, boxH);
+          }
+          // white text on the solid fill - readable over any waveform colour
+          ctx.fillStyle = "#fff";
+          ctx.textBaseline = "middle";
+          ctx.textAlign = "left";
+          ctx.fillText(label, boxX + padX, boxY + boxH / 2 + 0.5);
         }
+        ctx.textBaseline = "alphabetic";
       }
     }
   }
