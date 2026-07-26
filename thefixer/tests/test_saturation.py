@@ -250,6 +250,23 @@ class AutoGainTests(unittest.TestCase):
             "auto-gain becomes an unrequested volume change",
         )
 
+    def test_makeup_is_measured_with_the_same_estimator_as_the_input(self):
+        """Using whole-file RMS for the output while the input used a
+        percentile mismatches the two populations and shifted delivered level
+        by +2.4 to +2.7dB."""
+        mono = _music()
+        # a quiet tail makes whole-file RMS and the percentile diverge
+        with_tail = np.concatenate([mono, (mono * 0.02)[:int(4 * SR)]]).astype(np.float32)
+        _, plain = chain.saturate(_stereo(mono), SR, "medium")
+        _, tailed = chain.saturate(_stereo(with_tail), SR, "medium")
+        self.assertAlmostEqual(
+            plain["makeup_db"], tailed["makeup_db"], delta=0.5,
+            msg=f"makeup moved {plain['makeup_db']:+.2f} -> "
+                f"{tailed['makeup_db']:+.2f}dB when a quiet tail was added - "
+                "the input and output levels are measured with different "
+                "estimators, so their populations do not match",
+        )
+
     def test_makeup_actually_compensates_level(self):
         """Removing the makeup gain entirely passed the original suite."""
         mono = _music()
@@ -265,10 +282,10 @@ class AutoGainTests(unittest.TestCase):
         self.assertNotEqual(info["makeup_db"], 0.0,
                             "makeup gain was never applied")
 
-    def test_level_estimator_uses_a_high_percentile(self):
+    def test_level_estimator_ignores_quiet_passages(self):
         """A median (50th) estimator is dragged down by quiet passages, so
-        loud sections saturate harder. Verified by giving the same music a
-        long quiet tail: a percentile-based estimate must barely move."""
+        loud sections saturate harder. This pins the LOWER bound only - see
+        test_level_estimator_is_not_the_maximum for the upper one."""
         loud = _music(seconds=4.0)
         quiet_tail = np.concatenate([loud, (loud * 0.02)[:int(4 * SR)]]).astype(np.float32)
         a = chain._program_rms(_stereo(loud), SR)
@@ -278,6 +295,104 @@ class AutoGainTests(unittest.TestCase):
             msg=f"level estimate moved {20 * np.log10(b / a):+.2f}dB when a "
                 "quiet tail was appended - the estimator is not tracking the "
                 "level the track plays at",
+        )
+
+    def test_level_estimator_is_not_the_maximum(self):
+        """The UPPER bound: percentile 100 (= peak block) is a real defect.
+
+        It was nearly dismissed as unobservable on the strength of a
+        measurement taken on this file's own 4-second synthetic fixture,
+        which is ten blocks of statistically identical noise - so p95 and
+        p100 agree there to 0.007dB BY CONSTRUCTION. On real music the two
+        differ by 1.09-1.50dB, which changes delivered distortion by
+        1.26-1.38x. Measuring a property of the test fixture and
+        generalising it to real audio is how a real gap gets retired on bad
+        evidence.
+
+        So this builds material with genuine block-to-block variance and
+        asserts the estimate sits measurably BELOW the loudest block.
+        """
+        rng = np.random.RandomState(21)
+        # A realistic level distribution: mostly moderate, with a FEW
+        # genuinely loudest moments. Repeating the same peak level many times
+        # would put p95 and p100 on the same value and prove nothing - the
+        # distinction only exists when the top of the distribution is sparse,
+        # which is exactly how real music behaves.
+        pieces = []
+        for i in range(40):
+            scale = 0.9 if i in (17, 31) else 0.10 + 0.02 * (i % 5)
+            pieces.append((rng.randn(int(1.0 * SR)) * scale).astype(np.float32))
+        audio = _stereo(np.concatenate(pieces))
+
+        est = chain._program_rms(audio, SR)
+        block = int(0.4 * SR)
+        n = (audio.shape[0] // block) * block
+        per_block = np.sqrt(
+            (audio[:n, 0].astype(np.float64).reshape(-1, block) ** 2).mean(axis=1))
+        loudest = float(per_block.max())
+
+        self.assertLess(
+            est, loudest,
+            f"the level estimate ({est:.6f}) equals the loudest block "
+            f"({loudest:.6f}) - the estimator is a maximum, so a single loud "
+            "moment sets the drive for the whole track",
+        )
+        headroom_db = 20 * np.log10(loudest / est)
+        self.assertGreater(
+            headroom_db, 0.5,
+            f"the estimate sits only {headroom_db:.3f}dB under the loudest "
+            "block - too close to a maximum to be a robust percentile",
+        )
+
+
+class ChannelBalanceTests(unittest.TestCase):
+    """The level estimator must see BOTH channels.
+
+    Reading only channel 0 is the same bug class as reading only the mono sum
+    (which skipped anti-phase material as silent), reintroduced in the other
+    direction: on a mix whose left channel is far quieter, a channel-0
+    estimator under-reads the level and over-drives the loud channel.
+    Measured on such a mix, residual distortion went to 52% versus 2% correct.
+    """
+
+    def test_a_channel_imbalanced_mix_is_not_over_driven(self):
+        mono = _music()
+        # right channel 26dB hotter than left
+        audio = np.stack([mono * 0.05, mono], axis=1).astype(np.float32)
+        out, info = chain.saturate(audio, SR, "medium")
+        self.assertTrue(info["applied"])
+
+        # compare against the same loud channel treated on its own: an
+        # estimator that ignores the quiet channel would drive much harder
+        alone = np.stack([mono, mono], axis=1).astype(np.float32)
+        out_alone, _ = chain.saturate(alone, SR, "medium")
+
+        def residual_pct(src, dst, ch):
+            a = src[:, ch].astype(np.float64)
+            b = dst[:, ch].astype(np.float64)
+            scale = np.sqrt((a ** 2).mean()) / max(np.sqrt((b ** 2).mean()), 1e-20)
+            return 100 * np.sqrt(((b * scale - a) ** 2).mean()) / max(np.sqrt((a ** 2).mean()), 1e-20)
+
+        imbalanced = residual_pct(audio, out, 1)
+        balanced = residual_pct(alone, out_alone, 1)
+        self.assertLess(
+            imbalanced, balanced * 2.0 + 1.0,
+            f"the loud channel saw {imbalanced:.2f}% residual in a "
+            f"channel-imbalanced mix versus {balanced:.2f}% when balanced - "
+            "the level estimator is reading only one channel",
+        )
+
+    def test_the_estimator_uses_the_louder_channel(self):
+        mono = _music()
+        quiet_left = np.stack([mono * 0.05, mono], axis=1).astype(np.float32)
+        quiet_right = np.stack([mono, mono * 0.05], axis=1).astype(np.float32)
+        a = chain._program_rms(quiet_left, SR)
+        b = chain._program_rms(quiet_right, SR)
+        self.assertAlmostEqual(
+            a, b, delta=a * 0.02,
+            msg=f"swapping which channel is loud changed the estimate "
+                f"{a:.6f} -> {b:.6f} - the estimator is channel-order "
+                "dependent",
         )
 
 

@@ -1447,8 +1447,9 @@ def saturate(audio, sr, amount="medium", oversample=SATURATION_OVERSAMPLE):
        above Nyquist which fold back as inharmonic content, and it lands
        BELOW 8kHz - inside both detectors' analysis band, where nothing
        downstream can remove it. Measured two-tone alias products below 8kHz
-       at drive 1.6: -40.3dB at 1x, -79.3dB at 2x, -84.7dB at 4x, and no
-       further improvement at 8x or 16x. 4x is the knee. It costs about 2.5s
+       -30 to -50dB at 1x depending on drive, and -78 to -97dB at 4x, with
+       no further improvement at 8x or 16x. 4x is the knee. (At the default
+       drive specifically: -40.3dB at 1x, -87.6dB at 4x.) It costs about 2.5s
        on a 150s track, under 2% of pipeline runtime.
 
     3. A DC GUARD, FOR THE SYMMETRIC CURVE TOO. tanh is an odd function, so
@@ -1464,15 +1465,15 @@ def saturate(audio, sr, amount="medium", oversample=SATURATION_OVERSAMPLE):
     Output level is RMS-matched to input. That makes the stage nearly
     loudness-neutral, but NOT exactly: RMS matching is not LUFS matching,
     because LUFS is K-weighted and gated. Measured integrated loudness change
-    is +0.04 LU at light, +0.10 to +0.11 LU at medium, and +0.29 to +0.36 LU
-    at strong. Small enough that normalize_lufs downstream reclaims almost
+    is at most +0.07 LU at light, +0.14 LU at medium and +0.35 LU at strong
+    (worst case across two real tracks). Small enough that normalize_lufs downstream reclaims almost
     none of it - unlike a broad EQ move, of which only 28-65% survives - but
     an earlier version of this docstring claimed "within 0.002 LU", which was
     wrong by 50-180x.
 
     What this does NOT do: it is not an EQ. Broadband tonal balance moves by
-    at most 0.07dB at light, 0.18dB at medium and 0.57dB at strong (largest
-    octave-band change, measured on two real tracks). The audible effect is
+    at most 0.10dB at light, 0.21dB at medium and 0.56dB at strong (largest
+    octave-band change, worst case across two real tracks). The audible effect is
     peak-density reduction - short-term crest falls 0.46-0.77dB at drive 1.6 -
     not tonal colour. It is not "warmth" in the tonal sense.
     """
@@ -1519,7 +1520,11 @@ def saturate(audio, sr, amount="medium", oversample=SATURATION_OVERSAMPLE):
     # every case - a clamp that always binds is a bug, not a safety net.
     sat = np.tanh(up * drive) / drive
     out = _sig.resample_poly(sat, 1, oversample, axis=0).astype(np.float64)
-    # resample_poly can return a slightly different length; keep the original
+    # Defensive only, and knowingly untestable: for every integer oversample
+    # factor (2,3,4,5,7,8,16) and every length checked, resample_poly up then
+    # down returns EXACTLY the input length, so this branch is unreachable and
+    # no test can observe its removal. Kept because relying on that as a
+    # documented guarantee of scipy's would be unwise, not because it fires.
     if out.shape[0] != audio.shape[0]:
         if out.shape[0] > audio.shape[0]:
             out = out[:audio.shape[0]]
