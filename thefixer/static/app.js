@@ -180,7 +180,7 @@
     { id: "cnn_fix", group: "chainGroupAI", name: "CNN model fix", desc: "Shift-robust optimization targeting the CQT-cepstrum CNN detector. Slower.", info: "cnn_passes" },
     { id: "temporal_normalize", group: "chainGroupAI", name: "Temporal pattern denormalization", desc: "Applies a small, smooth, non-uniform timing drift, displacing the low-frequency spectral peaks that fingerprint matching uses as anchors. Off by default.", info: "temporal_normalize" },
     { id: "fix_phase", group: "chainGroupMaster", name: "Stereo phase correction", desc: "Corrects out-of-phase content that would cancel out in mono playback.", info: "tool_fix_phase" },
-    { id: "normalize_lufs", group: "chainGroupMaster", name: "LUFS loudness normalization", desc: "Targets -14 LUFS, the standard streaming-platform loudness reference.", info: "lufs" },
+    { id: "normalize_lufs", group: "chainGroupMaster", name: "LUFS loudness normalization", desc: "Sets integrated loudness. Runs second-to-last, immediately before the limiter, so nothing after it moves the delivered level off target.", info: "lufs" },
     { id: "multiband_compress", group: "chainGroupMaster", name: "Multiband compression", desc: "Gentle 3-band dynamics smoothing for tonal balance. Repeats itself until the imbalance settles, so a peaky track is handled in one run.", info: "tool_multiband_compress" },
     { id: "true_peak_limit", group: "chainGroupMaster", name: "True-peak limiter", desc: "Brick-wall safety ceiling at -1dBTP, accounting for inter-sample peaks.", info: "tool_true_peak_limit" },
     { id: "fade", group: "chainGroupMaster", name: "Fade in / fade out", desc: "Smooth S-curve fade at the start and end of the track. Runs last, after the limiter, so no later gain stage undoes it.", info: "tool_fade" },
@@ -228,6 +228,12 @@
     // first sample. 3000ms out is a conventional musical fade.
     fadeInMs: 10,
     fadeOutMs: 3000,
+    // -14 LUFS: Spotify/YouTube/Amazon/Tidal all normalize PLAYBACK to -14
+    // and turn down anything louder, so mastering past it buys nothing on
+    // streaming while costing dynamics. The slider spans -16 (Apple Music's
+    // target) to -9 (club/Beatport, where playback is not normalized the
+    // same way).
+    lufsTarget: -14,
   };
 
   // ---------- output format switch ----------
@@ -383,6 +389,13 @@
       }
       console.error(err);
     }
+  }
+
+  function lufsTargetHint(v) {
+    if (v <= -15.5) return "Apple Music's normalization target.";
+    if (v <= -13) return "Streaming standard — Spotify, YouTube, Amazon and Tidal all normalize playback to −14 and turn down anything louder.";
+    if (v <= -11) return "Louder than streaming normalization; platforms will turn this down, so the extra level only shows where normalization is off.";
+    return "Club / Beatport territory — DJ playback and download stores don't normalize the same way. Costs dynamics on streaming for no gain.";
   }
 
   function fmtFadeMs(ms) {
@@ -871,9 +884,29 @@
   }
 
   // ---------- tool chain UI ----------
+  // The order the pipeline ACTUALLY runs these in (server.py TOOL_ORDER,
+  // then the post-chain fade stage). The UI used to list tools in whatever
+  // order the TOOLS array happened to be written in, which no longer matched
+  // the real signal path - so the page implied one chain while the audio got
+  // another. Sorting the display by this list keeps the two honest; a tool
+  // missing from it sorts last rather than disappearing.
+  const CHAIN_RUN_ORDER = [
+    "strip_metadata", "trim_silence", "dc_offset", "high_pass",
+    "fix_transients", "fix_phase", "spectral_revive",
+    "multiband_compress", "temporal_normalize",
+    "linear_fix", "cnn_fix",
+    "normalize_lufs", "true_peak_limit", "fade",
+  ];
+
   function renderToolChain() {
     const groups = { chainGroupCleanup: [], chainGroupAI: [], chainGroupMaster: [] };
-    for (const t of TOOLS) groups[t.group].push(t);
+    const runIndex = (id) => {
+      const i = CHAIN_RUN_ORDER.indexOf(id);
+      return i === -1 ? CHAIN_RUN_ORDER.length : i;
+    };
+    for (const t of [...TOOLS].sort((a, b) => runIndex(a.id) - runIndex(b.id))) {
+      groups[t.group].push(t);
+    }
 
     for (const [groupId, tools] of Object.entries(groups)) {
       const rec = state.analysis ? new Set(state.analysis.recommended_tools) : new Set();
@@ -916,6 +949,16 @@
               <span class="slider-value mono" id="fadeOutValue">${fmtFadeMs(state.fadeOutMs)}</span>
             </div>
             <div class="cnn-mode-hint">Smooth S-curve fade. Applied after the limiter so nothing later undoes it.</div>
+          </div>`;
+        } else if (t.id === "normalize_lufs" && checked) {
+          settingsRow = `
+          <div class="tool-settings-row">
+            <div class="chain-group-label">Integrated loudness target</div>
+            <div class="slider-row">
+              <input type="range" id="lufsTargetSlider" min="-16" max="-9" step="0.5" value="${state.lufsTarget}">
+              <span class="slider-value mono" id="lufsTargetValue">${state.lufsTarget.toFixed(1)} LUFS</span>
+            </div>
+            <div class="cnn-mode-hint">${lufsTargetHint(state.lufsTarget)}</div>
           </div>`;
         }
         // Show WHAT this file's imbalance is, so the recommendation has a
@@ -998,6 +1041,17 @@
       // without this the click bubbles to the tool row and toggles the tool
       // off mid-drag, the same reason the drift slider stops propagation
       el.addEventListener("click", (e) => e.stopPropagation());
+    }
+    const lufsSliderEl = document.getElementById("lufsTargetSlider");
+    if (lufsSliderEl) {
+      lufsSliderEl.addEventListener("input", (e) => {
+        state.lufsTarget = Number(e.target.value);
+        document.getElementById("lufsTargetValue").textContent =
+          `${state.lufsTarget.toFixed(1)} LUFS`;
+        const hint = lufsSliderEl.closest(".tool-settings-row").querySelector(".cnn-mode-hint");
+        if (hint) hint.textContent = lufsTargetHint(state.lufsTarget);
+      });
+      lufsSliderEl.addEventListener("click", (e) => e.stopPropagation());
     }
 
     const countIds = { chainGroupCleanup: "countCleanup", chainGroupAI: "countAI", chainGroupMaster: "countMaster" };
@@ -1094,7 +1148,7 @@
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        tools: Array.from(state.selected), options: { cnn_mode: state.cnnMode, temporal_max_drift_ms: state.temporalMaxDriftMs, fade_in_ms: state.fadeInMs, fade_out_ms: state.fadeOutMs },
+        tools: Array.from(state.selected), options: { cnn_mode: state.cnnMode, temporal_max_drift_ms: state.temporalMaxDriftMs, fade_in_ms: state.fadeInMs, fade_out_ms: state.fadeOutMs, lufs_target: state.lufsTarget },
         output_name: outputName || undefined,
         output_format: state.outputFormat,
         mp3_mode: state.mp3Mode,

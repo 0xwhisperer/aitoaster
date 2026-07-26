@@ -745,32 +745,36 @@ def detect_band_peakiness(audio, sr, bands=None,
 
 
 def multiband_compress(audio, sr, bands=None, ratio=1.3, threshold_db=-12.0,
-                        max_passes=12, target_over_db=0.5):
-    """Gentle 3-band tonal-balance smoothing, repeated until the FILE is
-    actually balanced rather than once and then handed back to the user.
+                        max_passes=1, target_over_db=0.5):
+    """Gentle 3-band tonal-balance smoothing. ONE pass by default.
 
-    BUG FIX (direct user report): this used to run exactly one pass, and the
-    UI told the user "Still 7.2dB over target in the 0-200Hz band - gentle by
-    design, may take another pass or two to fully clear", which reads as an
-    instruction to re-upload and re-run the file by hand.
+    CRITICAL FIX (adversarial mastering audit): this briefly defaulted to
+    iterating up to 12 passes, to stop the UI telling users to re-run the
+    file by hand. That was the wrong answer and it silently turned a gentle
+    tool into a crusher.
 
-    That was real work being pushed onto the user. The gentle ratio (1.3, by
-    design - see _multiband_compress_pass) only removes 1 - 1/1.3 = 23.1% of
-    the excess per pass, so closing a 7.2dB overshoot takes eight passes:
+    The gain law is `gain_db = -over * (1 - 1/ratio)` applied to the ALREADY
+    COMPRESSED output each pass, so the over-threshold excess decays as
+    (1/ratio)^passes and the EFFECTIVE ratio compounds:
 
-        pass 0  7.20dB      pass 4  2.52dB
-        pass 1  5.54dB      pass 8  0.88dB
+        1 pass   -> 1.30:1        6 passes  ->  4.83:1
+        3 passes -> 2.20:1        9 passes  -> 10.60:1   <- typical run
+                                 12 passes  -> 23.30:1
 
-    The gentleness is correct and worth keeping - it is what stops this
-    tool from audibly pumping. What was wrong is where the loop lived. It
-    now iterates internally, driven by detect_band_peakiness (the file's own
-    measured condition, NOT the compressor grading its own diminishing
-    returns - see that function's docstring for why that distinction
-    matters), and stops as soon as the worst band is within target_over_db
-    or when no pass makes further progress.
+    Nine passes at a -12dB threshold is hard multiband limiting on the BODY
+    of a pop master, not peak control - while the log still called it "up to
+    1.3dB gentle reduction". Worse, the exit condition was an absolute
+    measure of the FILE, so a dense, commercially-loud mix (which legitimately
+    sits well over -12dB in the 200-2000Hz band) always drove it to the
+    ceiling: the more normal the source, the harder it was crushed.
 
-    Bounded by max_passes so a pathological file cannot loop forever, and
-    the returned info reports how many passes actually ran.
+    Note also that _multiband_compress_pass has NO attack or release - it is
+    zero-phase sosfiltfilt with per-sample gain from a 20ms median envelope.
+    That is tolerable applied once as gentle spectral levelling; applied nine
+    times deep it is exactly how a master ends up flat and squeezed.
+
+    max_passes stays a parameter (a caller can still ask for more) but the
+    DEFAULT is 1. Target <=2dB total gain reduction for pop.
     """
     # `bands` stays None here on purpose: both the per-pass compressor and
     # detect_band_peakiness derive the same Nyquist-aware default from sr,

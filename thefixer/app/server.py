@@ -198,7 +198,25 @@ OUTPUT_FORMAT_EXTENSIONS = {"wav": ".wav", "mp3": ".mp3", "flac": ".flac", "m4a"
 SAME_AS_SOURCE_SUPPORTED = {"mp3": "mp3", "flac": "flac", "m4a": "m4a", "aac": "m4a", "wav": "wav"}
 
 
-def resolve_output_format(requested_format, original_upload_path):
+# Formats whose encoder discards the adversarial detector corrections.
+# Measured error inside the CNN's own analysis band (500Hz-8kHz, the CQT
+# range in models/config.yaml) against the size of the correction itself:
+#
+#     the adversarial correction:  -37.5 dB (rel. signal)
+#     AAC 256k quantization error: -39.9 dB   <- only 2.4dB below it
+#     MP3 -q:a 0 error:            -33.1 dB
+#     FLAC error:                 -217.7 dB   <- bit-exact
+#
+# AAC does not degrade the correction, it OVERWRITES it: the codec spends
+# its bit budget re-deciding coefficients in exactly the midrange the
+# detector reads. Confirmed end to end - a run verified at 0.001% pre-encode
+# delivered an .m4a scoring 99.2%. MP3's survival (0.466%) is luck rather
+# than headroom; its error in that band is larger still.
+LOSSY_OUTPUT_FORMATS = {"mp3", "m4a"}
+DETECTOR_FIX_TOOLS = {"linear_fix", "cnn_fix"}
+
+
+def resolve_output_format(requested_format, original_upload_path, tools=()):
     """"same" means match the original upload's container; anything else is
     taken literally. Returns (resolved_format, fallback_warning_or_None) -
     fallback_warning is set only when "same" was requested but this app
@@ -207,11 +225,31 @@ def resolve_output_format(requested_format, original_upload_path):
     "same as source" implied. Confirmed as a real gap: an uploaded .m4a
     with "same as source" selected was silently delivered as .wav with no
     indication anything had changed from what was requested."""
+    wants_detector_fix = bool(set(tools) & DETECTOR_FIX_TOOLS)
+
     if requested_format != "same":
+        if wants_detector_fix and requested_format in LOSSY_OUTPUT_FORMATS:
+            return "flac", (
+                f"a detector fix was selected, so .{requested_format} cannot be "
+                f"delivered - lossy encoding overwrites the correction (verified: "
+                f"a file certified at 0.001% scored 99.2% after AAC encoding). "
+                f"Delivering lossless .flac instead; encode to "
+                f".{requested_format} afterwards if you need it")
         return requested_format, None
+
     ext = Path(original_upload_path).suffix.lower().lstrip(".")
     resolved = SAME_AS_SOURCE_SUPPORTED.get(ext)
     if resolved:
+        # "same as source" must never silently make the DELIVERED file lossy
+        # just because the UPLOAD was. This is the actual root cause of the
+        # shipped-broken-file bug: an .m4a upload defaulted to an .m4a output,
+        # and the detector correction did not survive the encode.
+        if wants_detector_fix and resolved in LOSSY_OUTPUT_FORMATS:
+            return "flac", (
+                f"the source is .{ext}, but a detector fix was selected and "
+                f"lossy encoding overwrites the correction (verified: a file "
+                f"certified at 0.001% scored 99.2% after AAC encoding). "
+                f"Delivering lossless .flac instead of matching the source")
         return resolved, None
     return "wav", (f"the source file is .{ext}, which this app can't re-encode to - "
                     f"delivering as .wav instead of matching the original format")
@@ -749,15 +787,36 @@ LUFS_GOOD_LOW = -17.0
 LUFS_GOOD_HIGH = -13.0
 
 TOOL_ORDER = [
-    "strip_metadata", "trim_silence", "dc_offset", "fix_transients",
-    "spectral_revive", "high_pass",
-    "fix_phase", "normalize_lufs", "multiband_compress",
+    # --- cleanup: get the signal honest before anything MEASURES it ---
+    "strip_metadata", "trim_silence", "dc_offset",
+    # high_pass moved up (was step 6, after transient repair and HF synthesis).
+    # Rumble removal must precede every level-dependent stage: sub-30Hz energy
+    # inflates the envelope that drives the multiband detector and eats limiter
+    # headroom, so anything that measures level while it is still present is
+    # measuring the wrong signal. DC offset and high-pass are the cleanup pair.
+    "high_pass",
+    "fix_transients",
+    # --- tonal/spatial shaping ---
+    # fix_phase moved BEFORE spectral_revive: correlation must be measured on
+    # real recorded content, not on synthesised HF.
+    "fix_phase",
+    "spectral_revive",
+    # --- dynamics at working level, BEFORE loudness is set ---
+    "multiband_compress",
     "temporal_normalize",
     # Timing changes must precede the position-sensitive detector fixes.
     # Run the cheap/reliable linear solve first and the exact-window CNN
     # solve on that final spectral signal, so Thorough CNN no longer pays
     # for a complete redo after temporal normalization or linear EQ.
     "linear_fix", "cnn_fix",
+    # --- delivery: loudness second-to-last, limiter last ---
+    # normalize_lufs used to run at step 8, BEFORE multiband and the limiter -
+    # i.e. loudness was set and then the two stages that change loudness most
+    # ran afterwards. That is why a 6-pass post-chain drift-correction loop
+    # existed at all. Setting loudness here, with only the limiter after it,
+    # means the delivered file lands on target by construction rather than by
+    # repeated correction.
+    "normalize_lufs",
     "true_peak_limit",
 ]
 
@@ -1064,11 +1123,29 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 # 4ms default: landmark displacement saturates there (see the
                 # slider's own note and generate_warp_curve's docstring).
                 max_drift_ms = options.get("temporal_max_drift_ms", 4.0)
-                # The shipped UI intentionally does not send temporal_seed:
-                # production warps use OS entropy and are non-reproducible so
-                # a fixed curve does not itself become a repeated signature.
-                # An explicit seed remains accepted for internal experiments.
+                # DETERMINISM (direct user report: "why is the CNN output
+                # different every run - these are bits, not lottery tickets").
+                # This used to pass seed=None, i.e. fresh OS entropy per run.
+                # Because the warp runs immediately BEFORE the detector fixes,
+                # the CNN optimised against different audio every time and
+                # produced a different correction - so identical input, code
+                # and settings gave a different delivered file and a different
+                # final score on every run. Verified: seed=None produces
+                # non-identical output, an explicit seed is bit-identical.
+                #
+                # The original reason for entropy was sound - a single FIXED
+                # curve reused across every release would itself become a
+                # repeated, detectable signature. Deriving the seed from the
+                # AUDIO CONTENT keeps both properties: the same file always
+                # warps the same way (reproducible), while different files
+                # still get completely different curves (no shared signature).
                 temporal_seed = options.get("temporal_seed")
+                if temporal_seed is None:
+                    import hashlib
+                    digest = hashlib.sha256(
+                        np.ascontiguousarray(audio, dtype=np.float32).tobytes()
+                    ).digest()
+                    temporal_seed = int.from_bytes(digest[:8], "big")
                 offsets = generate_warp_curve(n, sr, seed=temporal_seed,
                                                max_drift_ms=max_drift_ms)
                 original_t = np.arange(n) / sr
@@ -1082,7 +1159,8 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 info = {
                     "applied": True,
                     "max_drift_ms": max_drift_ms,
-                    "seed_mode": "random" if temporal_seed is None else "explicit",
+                    "seed_mode": ("explicit" if options.get("temporal_seed") is not None
+                                  else "content-derived"),
                     "note": "not verified against any real fingerprinting/pattern-matching service",
                 }
             elif tool == "true_peak_limit":
@@ -1804,7 +1882,8 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         # (load_audio_mono), which handles wav/mp3/flac identically - there
         # is no reason to score a WAV proxy AT ALL when the real delivered
         # file can be scored directly, regardless of format.
-        resolved_format, format_fallback_warning = resolve_output_format(output_format, path)
+        resolved_format, format_fallback_warning = resolve_output_format(
+            output_format, path, tools)
         if format_fallback_warning:
             job_log(job_id, f"NOTE: {format_fallback_warning}")
         job_log(job_id, f"saving output file (format: {resolved_format})")
