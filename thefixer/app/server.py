@@ -1193,8 +1193,11 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 _record_detector_overlay("cnn", before_fix, audio)
             elif tool == "fix_phase":
                 # stereo_field_correct replaces fix_phase_issues' whole-track
-                # scalar approach: bass-mono below 120Hz, phase repair confined
-                # to 120-300Hz, and gentle width above the bass crossover. It
+                # scalar approach: bass-mono below 120Hz and phase repair
+                # confined to 120-300Hz. It does NOT widen - an earlier draft
+                # had a width stage and both this comment and the function's
+                # own docstring went on claiming it long after it was removed.
+                # It
                 # keeps this slot in TOOL_ORDER deliberately - the position was
                 # already right (before spectral_revive, so correlation is
                 # measured on real recorded content rather than synthesised
