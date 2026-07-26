@@ -599,7 +599,7 @@ def _correlation_of(audio):
 
 def stereo_field_correct(audio, sr, bass_mono_hz=BASS_MONO_HZ,
                           phase_band_hz=PHASE_BAND_HZ):
-    """Bass-mono, low-band phase repair, and gentle width - all automatic.
+    """Bass-mono and low-band phase repair - both automatic.
 
     Replaces fix_phase_issues' whole-track approach, which measured ONE
     correlation figure across the entire file and applied ONE mid/side blend
@@ -607,7 +607,7 @@ def stereo_field_correct(audio, sr, bass_mono_hz=BASS_MONO_HZ,
     confined to the low end, so a whole-track average simultaneously
     under-corrects a genuine bass issue and narrows an image that was fine.
 
-    Three stages, in this order:
+    Two stages, in this order:
 
     1. BASS-MONO below bass_mono_hz. Sums the low band to mono. The ear
        localises very little down there, that band carries most of the
@@ -619,7 +619,11 @@ def stereo_field_correct(audio, sr, bass_mono_hz=BASS_MONO_HZ,
        is still negatively correlated after step 1. Mid/side blending, the
        same mechanism as before but confined to where it belongs.
 
-
+    This function deliberately does NOT widen. An earlier draft had a third
+    "gentle width" stage and this docstring still described it long after the
+    stage was removed. Widening is a separate concern with its own mono-
+    compatibility risk, and it must not be entangled with a function whose
+    job is to make the low end MORE mono.
     """
     if audio.ndim != 2 or audio.shape[1] != 2:
         return audio, {"applied": False, "reason": "not stereo"}
