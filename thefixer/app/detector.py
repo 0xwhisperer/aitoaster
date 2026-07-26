@@ -216,6 +216,15 @@ class CNNDetector:
         return {
             "probability": final_prob,
             "is_ai": final_prob > 0.5,
+            # The WORST window, exposed alongside the median. The median
+            # answers "is this track AI-generated?", which is what this
+            # detector is for. It is the wrong question for "is this
+            # delivered file certified?": a file can show a passing median
+            # while individual windows sit near 100%. Measured on a real
+            # delivered file, the median understated the worst window by
+            # roughly 260x. Delivery gating uses this; the detector's own
+            # verdict is unchanged.
+            "worst_segment_prob": float(max(probabilities)) if probabilities else final_prob,
             "segment_probs": probabilities,
             "segment_positions_sec": [p / self.sample_rate for p in positions],
         }
@@ -237,7 +246,11 @@ class Scorer:
             "cnn": cnn,
             "linear_pct": lin["probability"] * 100,
             "cnn_pct": cnn["probability"] * 100,
+            "cnn_worst_pct": cnn.get("worst_segment_prob", cnn["probability"]) * 100,
             "passes_linear": lin["probability"] < 0.01,
             "passes_cnn": cnn["probability"] < 0.5,
+            # A file is only certified when its WORST window passes, not its
+            # median. See worst_segment_prob above.
+            "passes_cnn_worst": cnn.get("worst_segment_prob", cnn["probability"]) < 0.5,
             "passes_both": lin["probability"] < 0.01 and cnn["probability"] < 0.5,
         }

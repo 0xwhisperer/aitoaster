@@ -241,7 +241,25 @@ def save_stereo(path, audio, sr=44100, dither=False):
     # beyond a +-1 LSB dither's reach. It matters only for input that never
     # went through the limiter.
     audio_clipped = np.clip(audio, -1.0, 1.0)
-    sf.write(str(path), audio_clipped, sr, subtype="PCM_16")
+
+    # QUANTIZE BY ROUNDING, not by libsndfile's float->PCM_16 conversion,
+    # which truncates toward -infinity. Measured directly: +0.5 LSB writes as
+    # 0 while -0.5 LSB writes as -1, a systematic -0.5 LSB bias on EVERY
+    # sample. That is where the delivered files' DC offset came from - a
+    # digital-silence write measured -0.4998 LSB mean, and both real outputs
+    # landed at about -1.6e-05, above this app's own 1e-05 lossless
+    # re-check floor, so a finished file immediately re-recommended
+    # dc_offset on re-upload.
+    #
+    # The dither was not at fault: its own mean measures -0.0002 LSB. No
+    # zero-mean dither can correct a biased quantizer, which is why running
+    # dc_offset and re-writing simply restored the same offset.
+    #
+    # np.rint is round-half-to-even, so it has no bias in either direction.
+    quantized = np.rint(audio_clipped.astype(np.float64) / _PCM16_LSB)
+    quantized = np.clip(quantized, -32768.0, 32767.0)
+    sf.write(str(path), (quantized * _PCM16_LSB).astype(np.float32), sr,
+             subtype="PCM_16")
 
 
 def save_correction_overlays(out_id, overlay_sources, sr):
@@ -600,6 +618,35 @@ def upload():
 _FILE_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 
 
+
+def _trail_looks_like_a_fade(audio, sr, trail_ms, floor_db=-66.0):
+    """True when the trailing region decays smoothly rather than being flat.
+
+    trim_silence uses a -66dBFS threshold, not digital zero, so the tail of a
+    fade-out reads as "silence". Recommending a trim there tells the user to
+    delete the fade they asked for - and acting on it shifts the timeline and
+    invalidates the CNN certification (measured: a delivered file went from
+    0.00205% to 0.33750% median, with individual windows at 99.62%).
+
+    A fade decays monotonically over its whole length; genuine trailing
+    silence is flat at the noise floor. Comparing the first and last thirds
+    of the trailing region separates them cleanly: a fade shows a large drop,
+    flat silence shows almost none.
+    """
+    if trail_ms <= 0:
+        return False
+    mono = audio.mean(axis=1) if audio.ndim > 1 else audio
+    n = int(trail_ms * 0.001 * sr)
+    if n < int(0.05 * sr) or n > len(mono):
+        return False
+    tail = mono[-n:]
+    third = max(1, n // 3)
+    first_db = 20 * np.log10(np.sqrt((tail[:third].astype(np.float64) ** 2).mean()) + 1e-12)
+    last_db = 20 * np.log10(np.sqrt((tail[-third:].astype(np.float64) ** 2).mean()) + 1e-12)
+    # a fade keeps falling across the region; flat silence does not
+    return (first_db - last_db) > 6.0
+
+
 def _find_upload_path(file_id):
     # file_id must be exactly the 12-char hex ID this app itself generates
     # (uuid.uuid4().hex[:12] at upload time) - without this check, a glob
@@ -716,7 +763,26 @@ def analyze(file_id):
     # this app already trimmed could still show this as recommended again.
     # 100ms is comfortably above that kind of processing residue while
     # still well below anything a listener would perceive as a real gap.
-    if silence_info.get("lead_ms", 0) > 100 or silence_info.get("trail_ms", 0) > 100:
+    #
+    # BUG FIX (external audit, reproduced): a 3000ms fade-out ends in
+    # near-silence BY DESIGN, and trim_silence's threshold is -66dBFS rather
+    # than digital zero, so re-uploading a file this app just delivered
+    # recommended cutting 280.7ms off its own fade. Acting on that
+    # recommendation shifts the timeline, and every CNN analysis window
+    # position derives from len(audio) - measured, it took a delivered file
+    # from 0.00205% to 0.33750% median with two sampled windows at 99.62% and
+    # 97.92%. That is the exact failure the post-chain corrective trim was
+    # deleted for; leaving it reachable through the recommender just moved it
+    # one step away.
+    #
+    # A trail that DECAYS SMOOTHLY into the noise floor is a fade, not
+    # silence to be trimmed. Real leading/trailing silence is flat. So a
+    # trailing region is only worth recommending a trim for if it does not
+    # look like a fade.
+    lead_ms = silence_info.get("lead_ms", 0)
+    trail_ms = silence_info.get("trail_ms", 0)
+    trail_is_a_fade = _trail_looks_like_a_fade(audio, 44100, trail_ms)
+    if lead_ms > 100 or (trail_ms > 100 and not trail_is_a_fade):
         recommendations.append("trim_silence")
     if transients:
         recommendations.append("fix_transients")
@@ -2227,10 +2293,19 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         # margin the optimizer was targeting. This is a report, not a silent
         # pass, and it is the difference between "we checked" and "we
         # certified".
+        elif not scores_after.get("passes_cnn_worst", True):
+            worst = scores_after.get("cnn_worst_pct", 0.0)
+            job_log(job_id,
+                    f"WARNING: the delivered file passes on the median window "
+                    f"({scores_after['cnn_pct']:.3f}%) but its WORST window "
+                    f"scores {worst:.1f}% - the median can hide a failing "
+                    f"window, so this file is not safely certified")
         elif scores_after["cnn"]["probability"] >= CNN_DELIVERED_MARGIN:
             job_log(job_id,
                     f"NOTE: delivered file passes but with little margin "
-                    f"(cnn={scores_after['cnn_pct']:.3f}%, bar is 50%, the "
+                    f"(cnn={scores_after['cnn_pct']:.3f}% median, "
+                    f"{scores_after.get('cnn_worst_pct', 0):.3f}% worst window; "
+                    f"bar is 50%, the "
                     f"optimizer targets {CNN_DELIVERED_MARGIN * 100:.0f}%) - "
                     f"it is certified, but a re-encode or a different decoder "
                     f"could move it")
