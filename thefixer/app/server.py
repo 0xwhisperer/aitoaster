@@ -1361,19 +1361,54 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         if "normalize_lufs" in tools:
             target_lufs = options.get("lufs_target", -14.0)
             final_lufs = chain.measure_lufs(audio, sr)
-            if np.isfinite(final_lufs) and abs(final_lufs - target_lufs) > 0.5:
+            # BUG FIX (direct user report: an export landed at -13.5 against a
+            # -14.0 target with no correction and no warning). The threshold
+            # was 0.5dB, but the drift these later stages actually introduce
+            # measured 0.48dB on a real track - just under the bar, so the
+            # guard never fired and the file shipped half a dB off target.
+            #
+            # Measured drift through the chain on that file:
+            #     after normalize_lufs  -14.00
+            #     after multiband       -13.40   (the largest single step)
+            #     after true_peak_limit -13.51
+            #     after fade            -13.52
+            #
+            # 0.1dB is below the ~1dB level difference a listener can detect
+            # on programme material, so anything above it is worth correcting;
+            # the correction itself is one gain multiply plus a peak re-check.
+            if np.isfinite(final_lufs) and abs(final_lufs - target_lufs) > 0.1:
                 job_log(job_id, f"post-chain LUFS check: {final_lufs:.1f} vs target {target_lufs:.1f} "
                                  f"- correcting drift introduced by later processing stages")
                 t0 = time.time()
-                gain_db = target_lufs - final_lufs
-                gain_linear = 10 ** (gain_db / 20)
-                audio = audio * gain_linear
                 late_mutation_after_temporal = (
                     late_mutation_after_temporal or "temporal_normalize" in tools
                 )
-                peak = np.abs(audio).max()
-                if peak > 0.999:
-                    audio = audio * (0.999 / peak)
+                # Iterate: an UPWARD correction has to be re-limited (raising
+                # gain can push the true peak back over the ceiling the
+                # limiter just enforced - the sample-peak clamp below only
+                # guards raw digital overflow, not inter-sample peaks), and
+                # that re-limiting pulls the loudness back down again.
+                # Measured on a dense test signal, a single pass overshot to
+                # -14.24 for exactly this reason. Loop until the target is met
+                # or an extra pass stops helping, bounded so a track that
+                # genuinely cannot hit both targets terminates instead of
+                # spinning.
+                gain_db = target_lufs - final_lufs
+                for _lufs_pass in range(6):
+                    current = chain.measure_lufs(audio, sr)
+                    if not np.isfinite(current):
+                        break
+                    step_db = target_lufs - current
+                    if abs(step_db) <= 0.1:
+                        break
+                    audio = audio * (10 ** (step_db / 20))
+                    peak = np.abs(audio).max()
+                    if peak > 0.999:
+                        audio = audio * (0.999 / peak)
+                    if step_db > 0 and "true_peak_limit" in tools:
+                        audio, _tp_info = chain.true_peak_limit(
+                            audio, sr, ceiling_db=options.get("ceiling_db", -1.0)
+                        )
                 lufs_reverify_info = {
                     "tool": "normalize_lufs_reverify",
                     "label": "LUFS loudness normalization (post-chain drift correction)",
