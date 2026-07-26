@@ -559,6 +559,181 @@ def stereo_correlation(audio):
     return float(np.corrcoef(l, r)[0, 1])
 
 
+# Below this, stereo information is collapsed to mono. 120Hz is the standard
+# pop/club choice: the ear localises very little down here (wavelengths are
+# long relative to head spacing), the low end carries most of a mix's energy,
+# and out-of-phase bass is what actually cancels on mono playback and causes
+# cutting problems on vinyl and club systems.
+BASS_MONO_HZ = 120.0
+# Phase correction is confined below this. Mono compatibility is a low-end
+# problem in practice; correcting the whole spectrum needlessly narrows an
+# image that was fine.
+PHASE_BAND_HZ = 300.0
+
+
+def _band_split(audio, sr, cutoff_hz, order=4):
+    """Split into (below, above) with Linkwitz-Riley-style complementary parts.
+
+    Cascading two Butterworth sections gives a Linkwitz-Riley response, whose
+    halves sum back to the original signal without the level bump plain
+    Butterworth bands produce at the crossover. The high band is derived by
+    SUBTRACTION rather than a second filter, which makes the reconstruction
+    exact by construction: low + high == input, always.
+    """
+    nyq = sr / 2.0
+    cutoff = min(max(cutoff_hz, 1.0), nyq - 1.0)
+    sos = signal.butter(order, cutoff / nyq, btype="lowpass", output="sos")
+    low = np.stack(
+        [signal.sosfiltfilt(sos, audio[:, ch]) for ch in range(audio.shape[1])],
+        axis=1,
+    )
+    return low, audio - low
+
+
+def _correlation_of(audio):
+    left, right = audio[:, 0], audio[:, 1]
+    if left.std() < 1e-9 or right.std() < 1e-9:
+        return 1.0
+    value = float(np.corrcoef(left, right)[0, 1])
+    return 1.0 if not np.isfinite(value) else value
+
+
+def stereo_field_correct(audio, sr, bass_mono_hz=BASS_MONO_HZ,
+                          phase_band_hz=PHASE_BAND_HZ):
+    """Bass-mono, low-band phase repair, and gentle width - all automatic.
+
+    Replaces fix_phase_issues' whole-track approach, which measured ONE
+    correlation figure across the entire file and applied ONE mid/side blend
+    to all of it. Real phase problems are frequency-dependent and usually
+    confined to the low end, so a whole-track average simultaneously
+    under-corrects a genuine bass issue and narrows an image that was fine.
+
+    Three stages, in this order:
+
+    1. BASS-MONO below bass_mono_hz. Sums the low band to mono. The ear
+       localises very little down there, that band carries most of the
+       energy, and out-of-phase bass is precisely what cancels when a track
+       is summed for mono playback - or what makes a cut unplayable on
+       vinyl. This alone removes the failure mode the old tool existed for.
+
+    2. PHASE correction between bass_mono_hz and phase_band_hz, if that band
+       is still negatively correlated after step 1. Mid/side blending, the
+       same mechanism as before but confined to where it belongs.
+
+
+    """
+    if audio.ndim != 2 or audio.shape[1] != 2:
+        return audio, {"applied": False, "reason": "not stereo"}
+
+    audio = np.asarray(audio, dtype=np.float32)
+    correlation_before = _correlation_of(audio)
+
+    # A genuinely mono source must stay mono - never fabricate width.
+    if np.allclose(audio[:, 0], audio[:, 1], atol=1e-7):
+        return audio, {
+            "applied": False,
+            "reason": "source is mono",
+            "bass_mono_hz": bass_mono_hz,
+            "correlation_before": correlation_before,
+            "correlation_after": correlation_before,
+        }
+
+    low, high = _band_split(audio, sr, bass_mono_hz)
+
+    # 1. bass to mono.
+    #
+    # NOT a plain (L+R)/2. When the low band is anti-phase - which is exactly
+    # the case this stage exists for - the average is ZERO, so summing would
+    # "fix" the cancellation by deleting the bass outright. Verified: on a
+    # perfectly out-of-phase 60Hz test signal the mono sum retained 20% of the
+    # original bass energy rather than the full amount.
+    #
+    # Instead, when the two sides oppose each other, flip one before summing
+    # so their energy ADDS. Below 120Hz the ear cannot localise the result, so
+    # inverting one side is inaudible - while the energy it preserves is the
+    # whole point of the stage.
+    # The inversion is CROSSFADED and gated, never a hard branch on the sign.
+    # Branching on `low_corr < 0` fires identically at -0.001 and at -1.0, and
+    # near zero the two branches produce essentially uncorrelated outputs
+    # (measured r = 0.02) - so bass polarity would be decided by estimator
+    # noise, and two renders of near-identical material could disagree. There
+    # is also nothing to rescue at -0.1: (L-R)/2 there discards the correlated
+    # bass note and keeps only the decorrelated room, which is the opposite of
+    # preserving energy.
+    #
+    # So: do nothing until the bass is DECISIVELY anti-phase, then ramp the
+    # inversion in smoothly between -0.2 and -0.5.
+    low_corr = _correlation_of(low)
+    invert_weight = float(np.clip((-low_corr - 0.2) / 0.3, 0.0, 1.0))
+    if invert_weight > 0.0:
+        right_effective = low[:, 1] * (1.0 - 2.0 * invert_weight)
+        bass_mono = (low[:, 0] + right_effective) / 2.0
+    else:
+        bass_mono = low.mean(axis=1)
+    low_out = np.stack([bass_mono, bass_mono], axis=1)
+
+    # 2. phase repair in the band just above it
+    phase_corrected = False
+    if phase_band_hz > bass_mono_hz:
+        # A steeper split here than the bass crossover uses. With a 4th-order
+        # split the 300Hz skirt is shallow enough that anti-phase content from
+        # ABOVE the band bleeds down into it: measured, zeroing the side
+        # entirely still left the 130-290Hz band at -0.917 correlation,
+        # because most of what remained was leakage rather than band content.
+        # At 8th order the same test lands at +0.666. The bass crossover keeps
+        # its gentler slope - it is summing to mono, not isolating a band.
+        band, rest = _band_split(high, sr, phase_band_hz, order=8)
+        band_corr = _correlation_of(band)
+        if band_corr < 0.0:
+            # blend mid back in until the band is no longer anti-correlated;
+            # mid/side is the right tool for broadband content (see
+            # fix_phase_issues' own history for why all-pass is not).
+            mid = band.mean(axis=1)
+            side = (band[:, 0] - band[:, 1]) / 2.0
+            # scale side down enough to bring correlation non-negative
+            keep = float(np.clip(1.0 + band_corr, 0.0, 1.0))
+            band = np.stack([mid + side * keep, mid - side * keep], axis=1)
+            phase_corrected = True
+        high = band + rest
+
+    # NO WIDTH STAGE HERE, deliberately.
+    #
+    # An earlier version widened the image above the bass crossover toward a
+    # target correlation. It was removed: this tool is a mono-SAFETY
+    # correction, and widening is the one operation in it that made the
+    # measured track less mono-compatible (0.905 -> 0.832 correlation on a
+    # real master, from a 1.457x side boost that the copy called "gentle").
+    # It was also backwards - a near-mono mix got the largest boost and barely
+    # moved, while an already-healthy mix at 0.6 was pushed to 0.473.
+    #
+    # Width is an image/taste decision, not a safety correction, and it does
+    # not belong entangled with bass-mono. If it returns it should be its own
+    # stage, positioned after multiband (which changes the L/R balance any
+    # width decision would be based on), solving for the boost that actually
+    # reaches a target rather than applying an open-loop gain, and guarding
+    # the OUTCOME rather than just capping the gain.
+    out = (low_out + high).astype(np.float32)
+
+    # never let the recombination clip - the band operations can sum to a
+    # larger peak than the input even when each part is smaller
+    peak = float(np.abs(out).max())
+    peak_rescale = 1.0
+    if peak > 0.999:
+        peak_rescale = 0.999 / peak
+        out = (out * peak_rescale).astype(np.float32)
+
+    return out, {
+        "applied": True,
+        "bass_mono_hz": bass_mono_hz,
+        "phase_band_hz": phase_band_hz,
+        "phase_corrected": phase_corrected,
+        "bass_polarity_inverted": round(invert_weight, 3),
+        "peak_rescaled": round(peak_rescale, 5),
+        "correlation_before": correlation_before,
+        "correlation_after": _correlation_of(out),
+    }
+
+
 def fix_phase_issues(audio, sr, min_correlation=0.0):
     """If stereo correlation is negative enough to risk mono cancellation,
     blend a small amount of mid-channel back in to restore mono safety

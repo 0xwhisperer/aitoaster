@@ -993,7 +993,14 @@ def _tool_status_line(tool, info):
         if corr_after is None:
             return "pass (applied)"
         ok = corr_after >= 0.1
-        return f"{'pass' if ok else 'check'} (correlation: {corr_after:.2f})"
+        parts = [f"correlation: {corr_after:.2f}"]
+        if info.get("bass_mono_hz"):
+            parts.append(f"bass mono below {info['bass_mono_hz']:.0f}Hz")
+        if info.get("phase_corrected"):
+            parts.append("low-band phase corrected")
+        if info.get("width_boost", 0) > 1.0:
+            parts.append(f"width x{info['width_boost']:.2f}")
+        return f"{'pass' if ok else 'check'} ({', '.join(parts)})"
 
     if tool == "normalize_lufs":
         lufs_after = info.get("lufs_after")
@@ -1185,10 +1192,14 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                                        mode=cnn_mode)
                 _record_detector_overlay("cnn", before_fix, audio)
             elif tool == "fix_phase":
-                # Use the same 0.1 safety bar the results table uses, so a
-                # weakly-positive 0.05 correlation is not called "no change
-                # needed" here and then shown as failing in the final table.
-                audio, info = chain.fix_phase_issues(audio, sr, min_correlation=0.1)
+                # stereo_field_correct replaces fix_phase_issues' whole-track
+                # scalar approach: bass-mono below 120Hz, phase repair confined
+                # to 120-300Hz, and gentle width above the bass crossover. It
+                # keeps this slot in TOOL_ORDER deliberately - the position was
+                # already right (before spectral_revive, so correlation is
+                # measured on real recorded content rather than synthesised
+                # high frequencies) and all three operations belong there.
+                audio, info = chain.stereo_field_correct(audio, sr)
             elif tool == "normalize_lufs":
                 audio, info = chain.normalize_lufs(audio, sr, target_lufs=options.get("lufs_target", -14.0))
             elif tool == "multiband_compress":
