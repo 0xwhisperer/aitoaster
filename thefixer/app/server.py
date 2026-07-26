@@ -303,6 +303,60 @@ def encode_final_output(audio, sr, out_format, dest_path_no_ext, mp3_mode="vbr0"
     return final_path
 
 
+def filter_chain_created_transients(hits, processed, original, sr,
+                                     lead_samples_trimmed,
+                                     jump_threshold=0.35, search_sec=0.005):
+    """Keep only the anomalies that LATER CHAIN STAGES actually introduced.
+
+    BUG FIX (direct user report: an audible fast duck on the word "still" at
+    0:58 and 1:58 of a real track, measured at -15.25dB and -14.24dB over
+    ~4ms). The post-chain corrective pass was deleting vocal consonants.
+
+    The primary fix_transients pass correctly skips those consonants:
+    detect_transients' sustained-burst guard rejects anything crossing the
+    jump threshold more than 8 times in 30ms, and in the SOURCE these cross
+    12-18 times. But the chain's own compression and limiting smooth them,
+    so post-chain the same consonants cross only 4-6 times - under the bar.
+    They then read as clicks, and fix_transient repairs a click by DELETING
+    it (interpolating across the region), which is what punches the hole.
+
+    No spectral test separates the two cases here. Measured on the reported
+    file, genuine clicks and these consonants overlap completely on
+    crossings (2-8 vs 4-6), duration (0.2-2.2ms vs 0.6-0.9ms) and HF/LF
+    ratio (0.17-4.67 vs 1.25-2.44).
+
+    Provenance does separate them. Every one of the false positives has a
+    matching large jump in the source (0.43-0.53), meaning the chain did not
+    create it - it is a pre-existing sharp edge the primary pass already
+    judged to be vocal material. This pass exists specifically to clean up
+    what later stages introduce, so restricting it to exactly that is both
+    the fix and the tool's correct scope.
+
+    `lead_samples_trimmed` maps a processed-timeline position back to the
+    original's timeline, since trim_silence removes audio from the head
+    (108ms on the reported file) and the lookup would otherwise probe the
+    wrong moment entirely.
+    """
+    if not hits:
+        return []
+    source_mono = original.mean(axis=1) if original.ndim > 1 else original
+    n_source = len(source_mono)
+    search = max(1, int(search_sec * sr))
+    kept = []
+    for hit in hits:
+        centre = int(hit["time_sec"] * sr) + int(lead_samples_trimmed)
+        lo = max(0, centre - search)
+        hi = min(n_source, centre + search)
+        if hi - lo < 2:
+            # cannot look it up (outside the source) - leave it alone rather
+            # than delete audio on the strength of a failed check
+            continue
+        source_jump = float(np.abs(np.diff(source_mono[lo:hi])).max())
+        if source_jump < jump_threshold:
+            kept.append(hit)
+    return kept
+
+
 def job_log(job_id, msg):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
@@ -1566,6 +1620,19 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         transients_after = chain.detect_transients(audio, sr)
         late_transients_fixed = []
         if "fix_transients" in tools:
+            # Only correct what the chain actually INTRODUCED. Anything with a
+            # matching edge in the source is pre-existing material the primary
+            # pass already judged (and, for vocal consonants, deliberately
+            # skipped) - deleting it here produced an audible duck mid-word.
+            n_detected = len(transients_after)
+            transients_after = filter_chain_created_transients(
+                transients_after, audio, original_audio, sr, lead_samples_trimmed
+            )
+            n_skipped = n_detected - len(transients_after)
+            if n_skipped:
+                job_log(job_id, f"  skipped {n_skipped} pre-existing anomal"
+                                 f"{'y' if n_skipped == 1 else 'ies'} already present in the "
+                                 f"source (not introduced by this chain)")
             if transients_after:
                 check_cancelled(job_id)
                 job_log(job_id, f"  found {len(transients_after)} new anomal{'y' if len(transients_after) == 1 else 'ies'} "
