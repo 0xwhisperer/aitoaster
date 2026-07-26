@@ -262,12 +262,41 @@
     lufsTarget: -14,
   };
 
+
+  // Keeps the output filename's extension in step with the format switch.
+  // Mirrors the server's resolve_output_format(), INCLUDING its rule that a
+  // lossy format is forced to .flac when a detector fix is selected - so the
+  // field never promises an extension the app will not actually deliver.
+  const LOSSY_FORMATS = ["mp3", "m4a", "aac", "ogg", "opus"];
+  function effectiveOutputExt() {
+    let fmt = state.outputFormat;
+    if (fmt === "same") {
+      const srcExt = (state.filename || "").split(".").pop().toLowerCase();
+      fmt = srcExt || "wav";
+    }
+    const wantsDetectorFix = state.selected.has("linear_fix") || state.selected.has("cnn_fix");
+    if (wantsDetectorFix && LOSSY_FORMATS.includes(fmt)) fmt = "flac";
+    return fmt;
+  }
+
+  function syncOutputNameExtension() {
+    const el = $("outputNameInput");
+    if (!el || !state.filename) return;
+    const ext = effectiveOutputExt();
+    const current = el.value.trim();
+    const stem = current
+      ? current.replace(/\.[^.]+$/, "")
+      : `${state.filename.replace(/\.[^.]+$/, "")}_fixed`;
+    el.value = `${stem}.${ext}`;
+  }
+
   // ---------- output format switch ----------
   document.querySelectorAll("#formatSwitch button").forEach(btn => {
     btn.addEventListener("click", () => {
       state.outputFormat = btn.dataset.format;
       document.querySelectorAll("#formatSwitch button").forEach(b => b.classList.toggle("active", b === btn));
       $("mp3ModeRow").classList.toggle("hidden", btn.dataset.format !== "mp3");
+      syncOutputNameExtension();
     });
   });
 
@@ -402,7 +431,7 @@
       };
 
       const stem = data.filename.replace(/\.[^.]+$/, "");
-      $("outputNameInput").value = `${stem}_fixed.wav`;
+      $("outputNameInput").value = `${stem}_fixed.${effectiveOutputExt()}`;
 
       $("workspace").classList.add("active");
       $("results").classList.remove("active");
@@ -1039,6 +1068,9 @@
         const id = row.dataset.tool;
         if (state.selected.has(id)) state.selected.delete(id);
         else state.selected.add(id);
+        // selecting or clearing a detector fix changes the delivered format
+        // (lossy is forced to .flac), so the filename must follow
+        syncOutputNameExtension();
         renderToolChain();
       });
     });
