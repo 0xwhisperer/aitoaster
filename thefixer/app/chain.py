@@ -2115,20 +2115,58 @@ def read_source_format(path):
     }
 
 
+def _read_id3_frame_tags(path):
+    """Enumerate every raw ID3v2 (and legacy ID3v1) frame via mutagen.
+
+    ffprobe's -show_format/-show_streams JSON only maps a handful of
+    well-known frames (TIT2->title, TPE1->artist, COMM->comment, etc) into
+    its tags dict - it silently drops frame types it doesn't have a mapping
+    for, including WXXX/WOAS/WOAR (URL frames), TXXX (arbitrary
+    user-defined text - where AI platforms often stuff generation IDs,
+    prompts, model names), PRIV (private binary frames), UFID (unique file
+    identifiers), and USLT (lyrics). Confirmed on a real Suno export: a
+    WOAS frame carrying a direct link to the source song page
+    (https://suno.com/song/<uuid>) was completely invisible to ffprobe's
+    JSON output while mutagen read it straight off the frame table.
+
+    Returns a flat {frame_id_or_desc: str(value)} dict, or {} if the file
+    has no ID3 tag or isn't ID3-taggable (e.g. FLAC/Vorbis comments, which
+    ffprobe already maps completely). Frames ffprobe already surfaces under
+    a friendlier key (TIT2/TPE1/COMM -> title/artist/comment) are skipped
+    here to avoid reporting the same value twice under two different keys."""
+    try:
+        from mutagen.id3 import ID3
+    except ImportError:
+        return {}
+    try:
+        tags = ID3(str(path))
+    except Exception:
+        return {}
+    skip_prefixes = ("APIC", "TIT2", "TPE1", "COMM")
+    frames = {}
+    for key, frame in tags.items():
+        if key.startswith(skip_prefixes):
+            continue
+        frames[key] = str(frame)
+    return frames
+
+
 def read_metadata_tags(path):
     """Read every container/ID3 metadata tag from the source file - both
     format-level (title/artist/comment/encoder/etc.) AND per-stream tags,
     plus a report of any non-audio streams (embedded cover art, attached
     images) since those can themselves carry their own metadata (e.g. EXIF
     in a JPEG) and most users don't expect a cover-art image riding along
-    inside an audio file at all.
+    inside an audio file at all. Also merges in raw ID3v2 frames ffprobe's
+    JSON output doesn't map (see _read_id3_frame_tags) so e.g. a WOAS
+    source-URL frame is surfaced even though ffprobe drops it silently.
 
     Many AI-generation platforms embed identifying tags (comment fields
     naming the platform, generation UUIDs, timestamps, platform-style
-    artist handles) directly in the uploaded file's metadata, independent
-    of anything detectable in the audio itself. This never modifies the
-    file - it's a read-only report used by /api/analyze so a user can see
-    everything the original upload was carrying.
+    artist handles, source-page URLs) directly in the uploaded file's
+    metadata, independent of anything detectable in the audio itself. This
+    never modifies the file - it's a read-only report used by /api/analyze
+    so a user can see everything the original upload was carrying.
 
     Returns {"format": {...}, "streams": [{"index", "codec_type",
     "codec_name", "tags": {...}}, ...]}."""
@@ -2144,7 +2182,8 @@ def read_metadata_tags(path):
     except _json.JSONDecodeError:
         return {"format": {}, "streams": []}
 
-    format_tags = data.get("format", {}).get("tags", {}) or {}
+    format_tags = dict(data.get("format", {}).get("tags", {}) or {})
+    format_tags.update(_read_id3_frame_tags(path))
     streams = []
     for s in data.get("streams", []):
         streams.append({

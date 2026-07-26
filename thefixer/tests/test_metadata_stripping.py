@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
+from app import chain
 from app.server import encode_final_output, load_stereo
 
 
@@ -62,6 +63,7 @@ FORBIDDEN = [
     b"created=",
     b"Lavc60",             # the SOURCE file's encoder tag
     b"JFIF", b"Exif",      # embedded cover-art image headers
+    b"suno.com/song",      # the WOAS source-URL ID3 frame - see below
 ]
 
 
@@ -156,6 +158,46 @@ class MetadataStrippingTests(unittest.TestCase):
                     break
                 off += 8 + size + (size & 1)
             self.assertEqual(chunks, [b"fmt ", b"data"], f"unexpected chunks: {chunks}")
+
+
+class MetadataReportingTests(unittest.TestCase):
+    """read_metadata_tags() is the /api/analyze report of what a source
+    file is carrying (used to populate the strip_metadata job log). ffprobe's
+    -show_format/-show_streams JSON only maps a handful of well-known ID3
+    frames and silently drops others - including WOAS, the URL frame this
+    fixture actually carries pointing at the source Suno song page. These
+    tests pin that the report includes what ffprobe alone would miss."""
+
+    @classmethod
+    def setUpClass(cls):
+        if ARCHIVE is None:
+            raise unittest.SkipTest("audio_archive/crazy2.mp3 not found")
+
+    def test_report_includes_frames_ffprobe_drops(self):
+        report = chain.read_metadata_tags(str(ARCHIVE))
+        all_tags = dict(report["format"])
+        found_url = [v for v in all_tags.values() if "suno.com/song" in str(v)]
+        self.assertTrue(
+            found_url,
+            f"expected the WOAS source-URL frame in the report, got tags: {all_tags}",
+        )
+
+    def test_report_still_includes_ffprobe_mapped_tags(self):
+        report = chain.read_metadata_tags(str(ARCHIVE))
+        self.assertEqual(report["format"].get("title"), "Velvet Harmony")
+        self.assertEqual(report["format"].get("artist"), "dvmusiclab")
+        self.assertIn("made with suno", report["format"].get("comment", ""))
+
+    def test_report_on_stripped_file_is_empty(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "stripped.mp3"
+            chain.strip_metadata_tags(str(ARCHIVE), str(out))
+            report = chain.read_metadata_tags(str(out))
+            self.assertEqual(report["format"], {})
+            self.assertEqual(
+                [s for s in report["streams"] if s["is_attached_image"]], []
+            )
 
 
 if __name__ == "__main__":
