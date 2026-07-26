@@ -248,7 +248,19 @@ def high_pass_filter(audio, sr, cutoff_hz=30, order=4):
     # never triggers it in the first place.
     meaningful = (sub_cutoff_rms / overall_rms) > 10 ** (-40 / 20)
 
-    return out, {"applied": bool(meaningful), "cutoff_hz": cutoff_hz, "order": order}
+    # BUG FIX (external chain audit, reproduced): this returned the FILTERED
+    # audio unconditionally while reporting applied=False when there was no
+    # meaningful rumble. So on a clean track it changed 100% of samples - at
+    # 31.0dB SNR, attenuating 30Hz by 6.02dB and 40Hz by 0.83dB - and told
+    # the user it had done nothing. Both the log line and the results table
+    # were wrong, and "doesn't touch anything audible" was false.
+    #
+    # applied=False must mean the audio is untouched. Return the input.
+    if not meaningful:
+        return audio, {"applied": False, "cutoff_hz": cutoff_hz,
+                       "order": order,
+                       "reason": "no meaningful sub-cutoff content"}
+    return out, {"applied": True, "cutoff_hz": cutoff_hz, "order": order}
 
 
 def detect_transients(audio, sr, jump_threshold=0.35, envelope_ratio_threshold=8.0, min_gap_sec=0.01,

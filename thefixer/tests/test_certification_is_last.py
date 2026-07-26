@@ -125,13 +125,36 @@ class ExecutionOrderIsSingleSourced(unittest.TestCase):
             rendered += [t for t in run if card_group.get(t) == group]
 
         expected = list(server.TOOL_ORDER) + [server.FADE_TOOL]
+
+        # DELIBERATE EXCEPTION, by product decision: temporal_normalize is
+        # grouped with the AI-detector fixes because that is what it is FOR -
+        # it displaces the low-frequency spectral peaks that fingerprint
+        # matching uses as anchors. It EXECUTES 5th, with the other timeline
+        # stages and well before certification, which is what actually
+        # matters; only its card placement differs. Every other tool must
+        # still render in execution order, so the comparison drops this one
+        # tool from both sides rather than being relaxed.
+        CARD_ORDER_EXCEPTIONS = {"temporal_normalize"}
+        rendered_checked = [t for t in rendered if t not in CARD_ORDER_EXCEPTIONS]
+        expected_checked = [t for t in expected if t not in CARD_ORDER_EXCEPTIONS]
+
         self.assertEqual(
-            rendered, expected,
+            rendered_checked, expected_checked,
             "the cards RENDER in a different order than the chain executes. "
             "Check the group assignments in app.js TOOLS and the group order "
             "in index.html - sorting alone cannot fix a card in the wrong "
             "group.",
         )
+        # the exception is a card-placement choice, NOT permission to execute
+        # out of order: it must still run before the detector fixes
+        order = list(server.TOOL_ORDER)
+        for tool in CARD_ORDER_EXCEPTIONS:
+            if tool in order and "cnn_fix" in order:
+                self.assertLess(
+                    order.index(tool), order.index("cnn_fix"),
+                    f"{tool} is a card-order exception, but it must still "
+                    "EXECUTE before certification",
+                )
 
 
 if __name__ == "__main__":

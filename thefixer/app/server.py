@@ -19,6 +19,32 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
+
+# BUG FIX (external chain audit): FIXER_WATERMARK_SEED was set in .env, but
+# nothing ever read the file, so every run fell back to the insecure built-in
+# default seed and logged a warning nobody could act on - the setting existed
+# and did nothing. Loaded here, before any module reads the environment.
+# No dependency: .env is a handful of KEY=value lines.
+def _load_dotenv(path=Path(__file__).resolve().parent.parent / ".env"):
+    try:
+        if not path.is_file():
+            return
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            # never clobber a value already exported in the real environment
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception:
+        # a malformed .env must not stop the app from starting
+        pass
+
+
+_load_dotenv()
 from flask import Flask, request, jsonify, send_from_directory, Response
 
 from . import chain
@@ -319,6 +345,14 @@ SAME_AS_SOURCE_SUPPORTED = {"mp3": "mp3", "flac": "flac", "m4a": "m4a", "aac": "
 # than headroom; its error in that band is larger still.
 LOSSY_OUTPUT_FORMATS = {"mp3", "m4a"}
 DETECTOR_FIX_TOOLS = {"linear_fix", "cnn_fix"}
+
+# How large a high-frequency deficit must be before spectral_revive is worth
+# recommending. Measured on a real track: an untouched file showed 24.32dB,
+# one revive pass brought it to 13.31dB and a second to 8.19dB - each pass
+# helping but never clearing the raw has_rolloff flag, so the stage
+# re-recommended itself indefinitely. 15dB sits above what one pass leaves
+# behind and well below a genuine lossy-codec cliff, which runs to tens of dB.
+SPECTRAL_REVIVE_RECOMMEND_DEFICIT_DB = 15.0
 
 
 def resolve_output_format(requested_format, original_upload_path, tools=()):
@@ -721,7 +755,19 @@ def analyze(file_id):
     recommendations = []
     if metadata["format"] or any(s["tags"] for s in metadata["streams"]) or has_embedded_images:
         recommendations.append("strip_metadata")
-    if has_rolloff:
+    # BUG FIX (external chain audit, reproduced): spectral_revive is not
+    # idempotent against its own detector. On a real track the deficit went
+    # 24.32dB -> 13.31dB after one pass -> 8.19dB after two, shrinking each
+    # time but never clearing the has_rolloff bar - so a file this app had
+    # already revived kept re-recommending the stage forever, and each extra
+    # pass synthesises more HF on top of HF it synthesised itself.
+    #
+    # A deficit this small is no longer the hard artificial cliff the stage
+    # exists to repair (a lossy/low-bitrate cutoff is tens of dB); it is the
+    # residue of the stage's own extrapolation, which cannot reach the
+    # detector's bar because the fitted slope only asymptotically approaches
+    # it. Recommend only a deficit large enough to be a genuine cliff.
+    if has_rolloff and rolloff_deficit_db >= SPECTRAL_REVIVE_RECOMMEND_DEFICIT_DB:
         recommendations.append("spectral_revive")
     if scores["linear"]["probability"] >= 0.01:
         recommendations.append("linear_fix")
@@ -947,13 +993,26 @@ LUFS_GOOD_HIGH = -13.0
 
 TOOL_ORDER = [
     # --- cleanup: get the signal honest before anything MEASURES it ---
-    "strip_metadata", "trim_silence", "dc_offset",
+    "strip_metadata",
+    # dc_offset and high_pass run BEFORE trim_silence. Measured: a file with
+    # a 0.02 DC offset trimmed 0ms of lead and 0ms of trail, because the
+    # offset lifts otherwise-silent samples above trim_silence's -66dBFS
+    # threshold so the silence is invisible to it. After DC correction the
+    # same file trims 995ms lead / 1000ms trail. High-pass runs before it for
+    # the same reason - sub-30Hz rumble also holds the "silence" up.
+    #
+    # This does not conflict with the timeline rule: all three are still well
+    # before the detector fixes. trim_silence remains the ONLY stage that
+    # changes the sample count, and it now measures a signal that has been
+    # centred and de-rumbled first, so it measures the right thing.
+    "dc_offset",
     # high_pass moved up (was step 6, after transient repair and HF synthesis).
     # Rumble removal must precede every level-dependent stage: sub-30Hz energy
     # inflates the envelope that drives the multiband detector and eats limiter
     # headroom, so anything that measures level while it is still present is
     # measuring the wrong signal. DC offset and high-pass are the cleanup pair.
     "high_pass",
+    "trim_silence",
     # temporal_normalize MOVED UP (was after multiband, just before the
     # detector fixes). It warps the time axis, so it is a TIMELINE stage even
     # though it preserves sample count - and applied to a certified signal it

@@ -43,7 +43,7 @@
              <p>This step smooths that timing very slightly and unevenly across the track - never more than a few milliseconds of drift at any single moment, varying slowly and smoothly rather than as one flat speed change (a flat change would be trivial to detect and undo; this instead nudges the internal timing map itself).</p>
              <p><strong>Why 4ms:</strong> fingerprint matching anchors on strong, sparse, low-frequency spectral peaks — measured on a real track, 94% sit below 500Hz and none above 4kHz. Landmark timing is quantized by the analysis hop (~11.6ms), so once the drift moves a landmark past one hop it cannot move further. Displacement saturates at 4ms; 8ms and 15ms produce identical landmark movement.</p>
              <p><strong>What higher values cost:</strong> resampling through a drifting time axis smears fast high-frequency content, which is where sibilants live — the "s" and "t" sounds in a vocal. At 4ms a measured sibilant lost 1.8% of its energy; at 15ms it lost 13.3%, concentrated in the 1-4kHz band while bass was untouched. Since that band contributes nothing to fingerprint matching, the extra drift is damage without benefit.</p>
-             <p>This tool has no access to any commercial fingerprinting service, so its effect is measured against a local landmark-matching proxy built on the same constellation principle. Each run uses a fresh random warp. Off by default.</p>`,
+             <p>This tool has no access to any commercial fingerprinting service, so its effect is measured against a local landmark-matching proxy built on the same constellation principle. The warp is derived from the audio itself, so the same file always produces the same result \u2014 identical bits, not a fresh random warp each time. Off by default.</p>`,
     },
     snr: {
       title: "Signal-to-noise ratio (SNR)",
@@ -145,6 +145,13 @@
              <p><strong>Where it runs:</strong> after multiband compression, before the AI-detector fixes. That order matters \u2014 saturating after those fixes partially undoes the correction they just computed, measured by actually running it that way, the delivered file scored 99.997% on the CNN detector instead of about 0.2% \u2014 it destroys the correction rather than merely denting it.</p>
              <p><strong>Skipped</strong> on tracks under 2 seconds or quieter than -60dBFS, where the level measurement it depends on is not reliable.</p>`,
     },
+    tool_fade: {
+      title: "Fade in / fade out",
+      body: `<p>A smooth raised-cosine fade at the start and end of the track. Defaults are 10ms in and 3000ms out.</p>
+             <p><strong>It runs last, after the limiter.</strong> Anything that changed gain afterwards would partly undo it, so it is the final shaping stage.</p>
+             <p><strong>Its tail is not silence to be trimmed.</strong> A 3-second fade-out ends below the level the silence detector treats as quiet, so an earlier version of this app recommended cutting roughly 280ms off the fade it had just applied \u2014 and acting on that shifted the timeline and broke the AI-detector certification. The analyzer now recognises a decaying tail as a fade and leaves it alone.</p>
+             <p>Two stages still run after this one: the product watermark and, if the limiter finds anything left to catch, a final ceiling check. Both are measured not to affect the detector scores.</p>`,
+    },
     tool_tonal_cleanup: {
       title: "Tonal cleanup (boxiness / harshness)",
       body: `<p>Looks at exactly two places where mixes commonly go wrong regardless of genre: <strong>boxiness around 250Hz</strong> and <strong>harshness around 3.15kHz</strong>. If either is ringing, it gets a gentle cut of at most 1.5dB. Otherwise nothing happens \u2014 and on a finished master, nothing happening is the normal outcome. Both test tracks used to develop this get no correction at all.</p>
@@ -210,8 +217,8 @@
     { id: "spectral_revive", group: "chainGroupMaster", name: "High-frequency fill-in (17kHz+)", desc: "Detects an artificial cutoff (common in lossy encoding or low-quality AI generation) and fills content above it using only this track's own rolloff slope, harmonics, and dynamics - no external reference.", info: "tool_spectral_revive" },
     { id: "high_pass", group: "chainGroupCleanup", name: "High-pass filter", desc: "Removes inaudible sub-30Hz rumble that eats into headroom. Runs early, before anything measures level, so rumble can't inflate the readings the later stages act on.", info: "tool_high_pass" },
     { id: "linear_fix", group: "chainGroupAI", name: "Linear model fix", desc: "Gradient-optimized correction targeting the fakeprint logistic-regression detector.", info: "linear_passes" },
-    { id: "cnn_fix", group: "chainGroupAI", name: "CNN model fix", desc: "Shift-robust optimization targeting the CQT-cepstrum CNN detector. Slower.", info: "cnn_passes" },
-    { id: "temporal_normalize", group: "chainGroupCleanup", name: "Temporal pattern denormalization", desc: "Applies a small, smooth, non-uniform timing drift, displacing the low-frequency spectral peaks that fingerprint matching uses as anchors. Off by default.", info: "temporal_normalize" },
+    { id: "cnn_fix", group: "chainGroupAI", name: "CNN model fix", desc: "Gradient optimization targeting the CQT-cepstrum CNN detector, verified against the real model. Three modes; the default is Thorough, which optimizes the detector\u2019s own evaluation windows across the whole track. Slower.", info: "cnn_passes" },
+    { id: "temporal_normalize", group: "chainGroupAI", name: "Temporal pattern denormalization", desc: "Applies a small, smooth, non-uniform timing drift, displacing the low-frequency spectral peaks that fingerprint matching uses as anchors. Grouped here because that is what it targets, but it runs early in the chain with the other stages that affect timing \u2014 every timing change has to happen before the detector fixes certify the result. Off by default.", info: "temporal_normalize" },
     { id: "fix_phase", group: "chainGroupMaster", name: "Stereo field: bass mono & phase", desc: "Sums bass below 120Hz to mono and repairs phase in the 120-300Hz band, leaving your stereo image above that completely untouched. Measured before any high-frequency fill-in, so it reads your real recording.", info: "tool_fix_phase" },
     { id: "normalize_lufs", group: "chainGroupDelivery", name: "LUFS loudness normalization", desc: "Sets integrated loudness. Runs second-to-last, immediately before the limiter, so nothing after it moves the delivered level off target.", info: "lufs" },
     { id: "tonal_cleanup", group: "chainGroupMaster", name: "Tonal cleanup (boxiness / harshness)", desc: "Checks two spots \u2014 250Hz boxiness and 3.15kHz harshness \u2014 and cuts only if one rings persistently, meaning it is above the surrounding spectrum even in its quietest moments. That is what separates a room resonance from a bass note: a note is only there while it plays. Cut only, 1.5dB maximum, never boosts. Most finished masters get nothing.", info: "tool_tonal_cleanup" },
@@ -955,8 +962,12 @@
   // the real signal path - so the page implied one chain while the audio got
   // another. Sorting the display by this list keeps the two honest; a tool
   // missing from it sorts last rather than disappearing.
+  // dc_offset and high_pass run BEFORE trim_silence: a DC offset or deep
+  // rumble holds otherwise-silent samples above the trim threshold, so the
+  // trim measures the wrong thing. Measured: a DC-offset file trimmed 0ms
+  // before correction and 995ms after.
   const CHAIN_RUN_ORDER = [
-    "strip_metadata", "trim_silence", "dc_offset", "high_pass",
+    "strip_metadata", "dc_offset", "high_pass", "trim_silence",
     "temporal_normalize",
     "fix_transients", "fix_phase", "spectral_revive",
     "tonal_cleanup", "multiband_compress", "saturate",
