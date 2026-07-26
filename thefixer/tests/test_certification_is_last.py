@@ -94,18 +94,43 @@ class TheInvariantIsEnforcedAtRuntime(unittest.TestCase):
 class ExecutionOrderIsSingleSourced(unittest.TestCase):
     """The page's chain cards must show the order that actually runs."""
 
-    def test_ui_order_matches_server_order(self):
+    def test_rendered_card_order_matches_execution_order(self):
+        """The cards as they actually RENDER, not the sort array.
+
+        An earlier version of this test compared CHAIN_RUN_ORDER against
+        TOOL_ORDER and passed while the page was visibly wrong. The cards
+        render inside fixed visual groups and the sort only orders cards
+        WITHIN a group, so group assignment overrides it entirely:
+        temporal_normalize sat in the "AI" group next to linear_fix/cnn_fix
+        while executing 5th, and fix_phase sat in "Mastering" while executing
+        7th. Checking the sort array could never catch that.
+
+        This reconstructs the real render order: group order from the HTML,
+        then cards within each group by the sort array.
+        """
         import pathlib
+        import re
         repo = pathlib.Path(__file__).resolve().parent.parent
         app_js = (repo / "static" / "app.js").read_text()
-        start = app_js.index("CHAIN_RUN_ORDER")
-        block = app_js[start:app_js.index("]", start)]
-        ui = [t.strip().strip('"') for t in block.split("[")[1].split(",")
-              if t.strip().strip('"')]
-        ui_chain = [t for t in ui if t in server.TOOL_ORDER]
+        index_html = (repo / "static" / "index.html").read_text()
+
+        run = [t.strip().strip('"') for t in
+               re.search(r"CHAIN_RUN_ORDER = \[(.*?)\]", app_js, re.S).group(1).split(",")
+               if t.strip().strip('"')]
+        card_group = dict(re.findall(r'id: "([a-z_]+)", group: "(chainGroup[A-Za-z]+)"', app_js))
+        group_order = re.findall(r'data-target="(chainGroup[A-Za-z]+)"', index_html)
+
+        rendered = []
+        for group in group_order:
+            rendered += [t for t in run if card_group.get(t) == group]
+
+        expected = list(server.TOOL_ORDER) + [server.FADE_TOOL]
         self.assertEqual(
-            ui_chain, list(server.TOOL_ORDER),
-            "the page shows a different signal chain than the server runs",
+            rendered, expected,
+            "the cards RENDER in a different order than the chain executes. "
+            "Check the group assignments in app.js TOOLS and the group order "
+            "in index.html - sorting alone cannot fix a card in the wrong "
+            "group.",
         )
 
 

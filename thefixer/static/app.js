@@ -197,18 +197,18 @@
     { id: "strip_metadata", group: "chainGroupCleanup", name: "Strip metadata & embedded images", desc: "Reports and removes ID3/container tags (title, artist, comments, generation-platform provenance) and embedded cover art. The delivered file never carries these regardless, since every output is freshly encoded from raw audio - this step surfaces exactly what was found.", info: "tool_strip_metadata" },
     { id: "trim_silence", group: "chainGroupCleanup", name: "Trim silence", desc: "Removes leading/trailing true silence at the very start and end.", info: "tool_trim_silence" },
     { id: "dc_offset", group: "chainGroupCleanup", name: "DC offset correction", desc: "Centers the waveform on zero if it's biased up or down.", info: "dc_offset" },
-    { id: "fix_transients", group: "chainGroupCleanup", name: "Surgical transient/pop fix", desc: "Finds genuine clicks and pops and bridges across just that moment. Skips sustained bursts like vocal consonants, and its post-chain re-check only corrects anomalies this chain introduced — never sharp edges that were already in your source.", info: "tool_fix_transients" },
-    { id: "spectral_revive", group: "chainGroupCleanup", name: "High-frequency fill-in (17kHz+)", desc: "Detects an artificial cutoff (common in lossy encoding or low-quality AI generation) and fills content above it using only this track's own rolloff slope, harmonics, and dynamics - no external reference.", info: "tool_spectral_revive" },
+    { id: "fix_transients", group: "chainGroupMaster", name: "Surgical transient/pop fix", desc: "Finds genuine clicks and pops and bridges across just that moment. Skips sustained bursts like vocal consonants, and its post-chain re-check only corrects anomalies this chain introduced — never sharp edges that were already in your source.", info: "tool_fix_transients" },
+    { id: "spectral_revive", group: "chainGroupMaster", name: "High-frequency fill-in (17kHz+)", desc: "Detects an artificial cutoff (common in lossy encoding or low-quality AI generation) and fills content above it using only this track's own rolloff slope, harmonics, and dynamics - no external reference.", info: "tool_spectral_revive" },
     { id: "high_pass", group: "chainGroupCleanup", name: "High-pass filter", desc: "Removes inaudible sub-30Hz rumble that eats into headroom. Runs early, before anything measures level, so rumble can't inflate the readings the later stages act on.", info: "tool_high_pass" },
     { id: "linear_fix", group: "chainGroupAI", name: "Linear model fix", desc: "Gradient-optimized correction targeting the fakeprint logistic-regression detector.", info: "linear_passes" },
     { id: "cnn_fix", group: "chainGroupAI", name: "CNN model fix", desc: "Shift-robust optimization targeting the CQT-cepstrum CNN detector. Slower.", info: "cnn_passes" },
-    { id: "temporal_normalize", group: "chainGroupAI", name: "Temporal pattern denormalization", desc: "Applies a small, smooth, non-uniform timing drift, displacing the low-frequency spectral peaks that fingerprint matching uses as anchors. Off by default.", info: "temporal_normalize" },
+    { id: "temporal_normalize", group: "chainGroupCleanup", name: "Temporal pattern denormalization", desc: "Applies a small, smooth, non-uniform timing drift, displacing the low-frequency spectral peaks that fingerprint matching uses as anchors. Off by default.", info: "temporal_normalize" },
     { id: "fix_phase", group: "chainGroupMaster", name: "Stereo field: bass mono & phase", desc: "Sums bass below 120Hz to mono and repairs phase in the 120-300Hz band, leaving your stereo image above that completely untouched. Measured before any high-frequency fill-in, so it reads your real recording.", info: "tool_fix_phase" },
-    { id: "normalize_lufs", group: "chainGroupMaster", name: "LUFS loudness normalization", desc: "Sets integrated loudness. Runs second-to-last, immediately before the limiter, so nothing after it moves the delivered level off target.", info: "lufs" },
+    { id: "normalize_lufs", group: "chainGroupDelivery", name: "LUFS loudness normalization", desc: "Sets integrated loudness. Runs second-to-last, immediately before the limiter, so nothing after it moves the delivered level off target.", info: "lufs" },
     { id: "multiband_compress", group: "chainGroupMaster", name: "Multiband compression (4-band)", desc: "Gentle 4-band dynamics smoothing for tonal balance, with vocal presence on its own control so it never gets ducked by cymbals. One pass, a couple of dB at most.", info: "tool_multiband_compress" },
     { id: "saturate", group: "chainGroupMaster", name: "Saturation (harmonic colour)", desc: "Adds odd-order harmonic distortion with a tanh curve, 4x oversampled so the harmonics don't fold back as aliasing. Output level is matched to input, so it changes peak density rather than loudness. Off by default.", info: "tool_saturate" },
-    { id: "true_peak_limit", group: "chainGroupMaster", name: "True-peak limiter", desc: "Brick-wall safety ceiling at -1dBTP, accounting for inter-sample peaks. Looks 1.5ms ahead so the gain is already in place when a peak arrives, instead of reacting after it.", info: "tool_true_peak_limit" },
-    { id: "fade", group: "chainGroupMaster", name: "Fade in / fade out", desc: "Smooth S-curve fade at the start and end of the track. Runs last, after the limiter, so no later gain stage undoes it.", info: "tool_fade" },
+    { id: "true_peak_limit", group: "chainGroupDelivery", name: "True-peak limiter", desc: "Brick-wall safety ceiling at -1dBTP, accounting for inter-sample peaks. Looks 1.5ms ahead so the gain is already in place when a peak arrives, instead of reacting after it.", info: "tool_true_peak_limit" },
+    { id: "fade", group: "chainGroupDelivery", name: "Fade in / fade out", desc: "Smooth S-curve fade at the start and end of the track. Runs last, after the limiter, so no later gain stage undoes it.", info: "tool_fade" },
   ];
 
   // BUG FIX (second adversarial audit round): the analysis-response race
@@ -955,7 +955,7 @@
   ];
 
   function renderToolChain() {
-    const groups = { chainGroupCleanup: [], chainGroupAI: [], chainGroupMaster: [] };
+    const groups = { chainGroupCleanup: [], chainGroupMaster: [], chainGroupAI: [], chainGroupDelivery: [] };
     const runIndex = (id) => {
       const i = CHAIN_RUN_ORDER.indexOf(id);
       return i === -1 ? CHAIN_RUN_ORDER.length : i;
@@ -1137,7 +1137,7 @@
       lufsSliderEl.addEventListener("click", (e) => e.stopPropagation());
     }
 
-    const countIds = { chainGroupCleanup: "countCleanup", chainGroupAI: "countAI", chainGroupMaster: "countMaster" };
+    const countIds = { chainGroupCleanup: "countCleanup", chainGroupMaster: "countMaster", chainGroupAI: "countAI", chainGroupDelivery: "countDelivery" };
     for (const [groupId, tools] of Object.entries(groups)) {
       const checkedCount = tools.filter(t => state.selected.has(t.id)).length;
       $(countIds[groupId]).textContent = `${checkedCount}/${tools.length}`;
