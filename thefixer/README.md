@@ -68,12 +68,13 @@ The processing order is deliberate — see [Why this order](#why-this-order).
 8. **LUFS loudness normalization** — default -14 LUFS, adjustable -16 to -9 (general
    streaming-platform standard; Apple Music specifically targets -16, most
    others including Spotify/YouTube are closer to -14).
-9. **Multiband compression** — gentle 3-band (low/mid/high) downward
-   compression, conservative settings (ratio 1.3:1, threshold -12dB), ONE
-   pass. It briefly iterated until each band measured flat; that compounds
-   (nine passes of 1.3:1 behaves like 10.6:1) and turned gentle levelling
-   into hard limiting on the body of the track. Runs before loudness is set.
-   See [Multiband compressor: how it compares to a real one](#multiband-compressor-how-it-compares-to-a-real-one)
+9. **Multiband compression** — gentle 4-band downward compression with
+   complementary crossovers at 100Hz / 800Hz / 5kHz, ratio 1.3:1, threshold
+   -12dB, ONE pass, and per-band attack/release (30ms/200ms on the low band
+   down to 3ms/60ms on the top). The crossovers put vocal presence in its own
+   band rather than sharing one gain control with cymbals, and the bands
+   sum back to exactly the input. Runs before loudness is set. See
+   [Multiband compressor: how it compares to a real one](#multiband-compressor-how-it-compares-to-a-real-one)
    for what's simplified here.
 10. **CNN-model AI-detector fix** — shift-robust gradient optimization
     targeting the CQT-cepstrum CNN detector. The recommended mode trains
@@ -241,24 +242,23 @@ Waves C6, or FabFilter Pro-MB do exactly this. The implementation here is a
 simplified, conservative version, not a full-featured multiband compressor:
 
 **What's missing or simplified compared to a real mastering-grade multiband:**
-- **No attack/release time constants.** Real compressors have separate
-  attack and release envelopes controlling how fast gain reduction engages
-  vs. releases. This implementation uses a single 20ms median-filter
-  smoothing window as a stand-in for both, which is a crude approximation.
-  A proper compressor would offer attack around 5-30ms and release around
-  50-500ms independently per band.
+- **Fixed attack/release, not program-dependent.** Each band has its own
+  attack and release (30ms/200ms low through 3ms/60ms top), but they are
+  constants; real compressors vary release with program material.
+
 - **No knee.** Real compressors have a soft knee — gain reduction ramps in
   gradually around the threshold rather than switching on hard. This
   implementation has a hard knee, which can sound more abrupt.
 - **No makeup gain.** After compressing, real multibands typically add
   gain back to compensate for the loudness that was removed. This doesn't
   happen automatically here.
-- **No lookahead.** Cannot anticipate a transient before it hits.
-- **Filter crossover isn't phase-aligned/Linkwitz-Riley.** Splitting into
-  bands with plain Butterworth low/high/bandpass filters (rather than a
-  proper Linkwitz-Riley crossover) can introduce small phase-cancellation
-  artifacts when the bands are summed back together — professional
-  multiband tools use LR crossovers specifically to avoid this.
+- **No lookahead in the compressor.** Its envelope is strictly causal.
+  (The true-peak limiter separately looks ahead 1.5ms.)
+- **Crossovers are zero-phase complementary, not Linkwitz-Riley.** Bands are
+  peeled off with zero-phase Butterworth lowpasses and the remainder carried
+  by subtraction, so they sum to exactly the input. Measured -48dB/octave;
+  the split points are nominal, not -6dB crossover points.
+
 
 Bottom line: reasonable and safe for light tonal-balance smoothing as one
 step in an automated chain, but not a substitute for a dedicated multiband
@@ -301,7 +301,7 @@ compressor plugin where finer dynamics control is needed.
   true-peak metering displayed before the limiter runs, beyond the basic
   correlation check.
 - [ ] **Multiband compressor improvements** — attack/release, soft knee,
-  makeup gain, lookahead, Linkwitz-Riley crossovers (see above).
+  makeup gain, program-dependent release (see above).
 
 ### App/UX gaps
 

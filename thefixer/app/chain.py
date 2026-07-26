@@ -572,13 +572,12 @@ PHASE_BAND_HZ = 300.0
 
 
 def _band_split(audio, sr, cutoff_hz, order=4):
-    """Split into (below, above) with Linkwitz-Riley-style complementary parts.
+    """Split into (below, above) complementary parts that sum back exactly.
 
-    Cascading two Butterworth sections gives a Linkwitz-Riley response, whose
-    halves sum back to the original signal without the level bump plain
-    Butterworth bands produce at the crossover. The high band is derived by
-    SUBTRACTION rather than a second filter, which makes the reconstruction
-    exact by construction: low + high == input, always.
+    The high band is derived by SUBTRACTION rather than a second filter, which
+    is what makes reconstruction exact by construction: low + high == input,
+    always, for any lowpass. (Not Linkwitz-Riley - see
+    split_bands_complementary for why that label was wrong here.)
     """
     nyq = sr / 2.0
     cutoff = min(max(cutoff_hz, 1.0), nyq - 1.0)
@@ -907,7 +906,9 @@ def detect_band_peakiness(audio, sr, bands=None,
     # at any sample rate - not just the 44.1kHz case this bug happened to
     # be found on.
     if bands is None:
-        bands = ((0, 200), (200, 2000), (2000, nyq))
+        # SAME bands the compressor uses - these two must never disagree, or
+        # the detector reports a band the compressor cannot act on.
+        bands = default_bands(sr)
     # BUG FIX (adversarial audit, verified directly): this guard band
     # (0.5dB) and multiband_compress's own "applied" bar (0.3dB of actual
     # gain reduction) were two independently-chosen numbers with no
@@ -944,7 +945,7 @@ def detect_band_peakiness(audio, sr, bands=None,
 
 def multiband_compress(audio, sr, bands=None, ratio=1.3, threshold_db=-12.0,
                         max_passes=1, target_over_db=0.5):
-    """Gentle 3-band tonal-balance smoothing. ONE pass by default.
+    """Gentle 4-band tonal-balance smoothing. ONE pass by default.
 
     CRITICAL FIX (adversarial mastering audit): this briefly defaulted to
     iterating up to 12 passes, to stop the UI telling users to re-run the
@@ -966,10 +967,9 @@ def multiband_compress(audio, sr, bands=None, ratio=1.3, threshold_db=-12.0,
     sits well over -12dB in the 200-2000Hz band) always drove it to the
     ceiling: the more normal the source, the harder it was crushed.
 
-    Note also that _multiband_compress_pass has NO attack or release - it is
-    zero-phase sosfiltfilt with per-sample gain from a 20ms median envelope.
-    That is tolerable applied once as gentle spectral levelling; applied nine
-    times deep it is exactly how a master ends up flat and squeezed.
+    _multiband_compress_pass now has real per-band attack and release (see
+    _envelope_follower), so it is a compressor rather than spectral gain-
+    riding. That makes the gentleness still matter: one pass, a couple of dB.
 
     max_passes stays a parameter (a caller can still ask for more) but the
     DEFAULT is 1. Target <=2dB total gain reduction for pop.
@@ -1029,7 +1029,7 @@ def multiband_compress(audio, sr, bands=None, ratio=1.3, threshold_db=-12.0,
         # worst single pass was 1.3dB and the total far more, which read as
         # the tool having barely done anything.
         "bands": [
-            {"range_hz": band["range_hz"],
+            {**band,
              "max_reduction_db": min(
                  (info["bands"][i]["max_reduction_db"] for info in pass_infos),
                  default=band["max_reduction_db"])}
@@ -1041,30 +1041,181 @@ def multiband_compress(audio, sr, bands=None, ratio=1.3, threshold_db=-12.0,
     }
 
 
+# 4-band split points chosen for pop. The old 200/2000 split put vocal presence
+# (2-5kHz, the range that makes a lead vocal intelligible), snare crack and
+# guitar bite in the SAME band as cymbals and air - so a loud cymbal ducked
+# the vocal along with it. 100/800/5000 gives presence its own band.
+DEFAULT_CROSSOVERS_HZ = (100.0, 800.0, 5000.0)
+
+# Per-band time constants. Low frequencies need slow attack (a 60Hz cycle is
+# 16ms long - reacting faster than that tracks the WAVEFORM rather than the
+# envelope, which is distortion) and slow release. Highs can be much quicker.
+BAND_ATTACK_MS = (30.0, 15.0, 8.0, 3.0)
+BAND_RELEASE_MS = (200.0, 150.0, 100.0, 60.0)
+
+
+def default_bands(sr, crossovers=DEFAULT_CROSSOVERS_HZ):
+    """Band edges as (lo, hi) pairs, top edge derived from the real Nyquist."""
+    nyq = sr / 2.0
+    edges = [0.0] + [float(c) for c in crossovers] + [nyq]
+    return tuple((edges[i], edges[i + 1]) for i in range(len(edges) - 1))
+
+
+def split_bands_complementary(audio, sr, bands=None):
+    """Split into complementary bands that sum back to the input exactly.
+
+    Each successive band is peeled off with a zero-phase Butterworth lowpass
+    and the remainder carried forward by SUBTRACTION. The subtraction is what
+    makes reconstruction exact - it holds for ANY lowpass, so the bands always
+    sum to the original signal (measured error 3e-08, i.e. float32 epsilon).
+    That replaces independent Butterworth BANDPASSES, which do not sum flat.
+
+    NOT Linkwitz-Riley, despite an earlier version of this docstring saying
+    so. Measured, this is 8th-order-magnitude (-48dB/octave) and zero-phase,
+    and at a nominal 100Hz crossover the two bands read -11.9dB and -2.5dB.
+    LR's defining property is -6.02/-6.02 summing to unity, so the label was
+    simply wrong. Being zero-phase there is also no phase response for an LR
+    design to align. The flat summing here comes from the subtraction, not
+    from any LR property.
+
+    One consequence worth knowing: because the -6dB point sits well below the
+    nominal frequency (~71Hz for a nominal 100Hz), the `range_hz` values
+    reported downstream are nominal split points, not -6dB crossover points.
+    """
+    if bands is None:
+        bands = default_bands(sr)
+    nyq = sr / 2.0
+    remaining = np.asarray(audio, dtype=np.float32)
+    out = []
+    for lo, hi in bands[:-1]:
+        cutoff = min(max(float(hi), 1.0), nyq - 1.0)
+        sos = signal.butter(2, cutoff / nyq, btype="lowpass", output="sos")
+        low = remaining
+        for _ in range(2):
+            low = np.stack(
+                [signal.sosfiltfilt(sos, low[:, ch]) for ch in range(low.shape[1])],
+                axis=1,
+            )
+        out.append(low.astype(np.float32))
+        remaining = (remaining - low).astype(np.float32)
+    out.append(remaining)
+    return out
+
+
+def _envelope_follower(level, sr, attack_ms, release_ms):
+    """Classic asymmetric one-pole envelope: fast to rise, slow to fall.
+
+    Implemented with two lfilter passes rather than a Python loop - a full
+    track at 44.1kHz is millions of samples and a per-sample recurrence is far
+    too slow to run once per band per pass. Taking the MAXIMUM of an
+    attack-smoothed and a release-smoothed version reproduces the asymmetry:
+    the attack pass governs how quickly the envelope can rise, the release
+    pass how slowly it decays.
+    """
+    attack_samples = max(1, int(attack_ms * 0.001 * sr))
+    release_coeff = float(np.exp(-1.0 / max(release_ms * 0.001 * sr, 1.0)))
+
+    # CAUSAL peak dilation over the attack window. `origin` shifts the window
+    # so it looks only BACKWARD - a centred window (the default) reads into
+    # the future, so the low band would begin ducking up to 15ms BEFORE a
+    # transient exists. Measured with the centred version: -2.39dB of gain
+    # reduction 2ms ahead of a kick, which is textbook pre-echo.
+    peak = ndimage.maximum_filter1d(
+        level, size=attack_samples, mode="nearest",
+        origin=(attack_samples - 1) // 2,
+    )
+
+    # Peak-hold with exponential DECAY, not a lowpass of the peak.
+    #
+    # The previous version fed a one-pole with the max-filtered signal. On a
+    # short transient the pole only charges for the attack window, so it never
+    # reaches the peak value, and once the peak leaves the window the envelope
+    # collapses to whatever little the pole accumulated. Measured on a
+    # 10-sample transient with a 100ms release: the envelope fell 22.1dB in
+    # TWO samples and read 0.074 at +10ms, where a true 100ms release gives
+    # ~0.905. That is a step discontinuity in the gain applied to audio -
+    # audible as a click on every percussive hit, on exactly the material a
+    # compressor exists to handle.
+    #
+    # The correct recurrence is env[n] = max(peak[n], env[n-1] * release).
+    # Expressed as a decaying running maximum it vectorises: divide out the
+    # decay, take a cumulative maximum, multiply it back. The exponent is
+    # clamped so the scaling cannot overflow on a long track.
+    # ATTACK RAMP. The peak dilation above makes the envelope AWARE of a peak
+    # within the attack window, but on its own it jumps to full value on the
+    # transient's first sample - so gain reduction arrives instantly and no
+    # part of the transient passes through. A real compressor ramps in over
+    # the attack time. Smoothing the dilated peak with a one-pole at the
+    # attack constant gives that ramp; because the dilation already raised
+    # the target, the ramp still ARRIVES by the end of the attack window
+    # rather than lagging behind it.
+    if attack_samples > 1:
+        # 3 time constants inside the window -> ~95% arrival by its end,
+        # so the ramp completes within the stated attack time rather than
+        # only reaching 63% of the way there.
+        attack_coeff = float(np.exp(-3.0 / attack_samples))
+        zi = signal.lfilter_zi([1 - attack_coeff], [1, -attack_coeff]) * peak[0]
+        peak, _ = signal.lfilter(
+            [1 - attack_coeff], [1, -attack_coeff], peak, zi=zi)
+        peak = peak.astype(np.float64)
+
+    n = len(peak)
+    if n == 0:
+        return peak
+    log_release = np.log(max(release_coeff, 1e-12))
+    # process in blocks so exp(-log_release * n) stays finite for any length
+    block = max(1, int(-700.0 / log_release)) if log_release < 0 else n
+    env = np.empty_like(peak)
+    carry = peak[0]
+    for start in range(0, n, block):
+        stop = min(start + block, n)
+        idx = np.arange(stop - start, dtype=np.float64)
+        decay = np.exp(log_release * idx)
+        seeded = peak[start:stop].astype(np.float64).copy()
+        seeded[0] = max(seeded[0], carry)
+        running = np.maximum.accumulate(seeded / decay) * decay
+        env[start:stop] = running
+        carry = running[-1] * release_coeff
+    return env
+
+
 def _multiband_compress_pass(audio, sr, bands=None,
                               ratio=1.3, threshold_db=-12.0):
-    """ONE pass of gentle 3-band downward compression -
+    """ONE pass of gentle 4-band downward compression -
     reduces peaky dynamic imbalance between low/mid/high without touching
     overall spectral tilt aggressively. Conservative defaults (low ratio,
     higher threshold) by design: this should only be shaping the loudest
     peaks in each band, not continuously riding gain on the whole track -
     least change necessary to smooth genuine imbalance."""
     nyq = sr / 2
-    # default bands derive their top edge from the actual sample rate's
-    # Nyquist frequency, matching detect_band_peakiness's own default (see
-    # that function's comment for the real bug this fixes - a hardcoded
-    # 20000Hz edge left a real gap versus this tool's actual filter reach).
     if bands is None:
-        bands = ((0, 200), (200, 2000), (2000, nyq))
+        bands = default_bands(sr)
+    split = split_bands_complementary(audio, sr, bands)
     out = np.zeros_like(audio)
     info_bands = []
-    for lo, hi in bands:
-        band_audio, env_db = _band_envelope_db(audio, sr, lo, hi, nyq)
+    for index, ((lo, hi), band_audio) in enumerate(zip(bands, split)):
+        # Envelope with REAL attack and release, per band. The previous
+        # version computed gain per-sample from a 20ms median with no time
+        # constants at all - that is spectral gain-riding, not compression:
+        # it cannot let a transient through, so drums lose their punch.
+        # Low bands get slow constants (a 60Hz cycle is 16ms long; reacting
+        # faster tracks the waveform rather than the envelope), highs fast.
+        attack_ms = BAND_ATTACK_MS[min(index, len(BAND_ATTACK_MS) - 1)]
+        release_ms = BAND_RELEASE_MS[min(index, len(BAND_RELEASE_MS) - 1)]
+        level = np.abs(band_audio).max(axis=1)
+        env = _envelope_follower(level, sr, attack_ms, release_ms)
+        env_db = 20 * np.log10(np.maximum(env, 1e-8))
+
         over = np.maximum(env_db - threshold_db, 0)
         gain_db = -over * (1 - 1 / ratio)
         gain = 10 ** (gain_db / 20)
         out += band_audio * gain[:, None]
-        info_bands.append({"range_hz": [lo, round(min(hi, nyq - 1))], "max_reduction_db": float(gain_db.min())})
+        info_bands.append({
+            "range_hz": [round(lo), round(min(hi, nyq - 1))],
+            "max_reduction_db": float(gain_db.min()),
+            "attack_ms": attack_ms,
+            "release_ms": release_ms,
+        })
 
     # BUG FIX (adversarial audit, verified directly): splitting into bands,
     # applying independent per-band gain reduction, and summing back

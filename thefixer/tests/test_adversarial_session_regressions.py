@@ -217,13 +217,18 @@ class MultibandCompressionRegressionTests(unittest.TestCase):
         audio = self._stereo_sine(1_000, 0.5)
         peakiness_before = chain.detect_band_peakiness(audio, self.SR)
         self.assertTrue(any(b["frac_time_over"] > 0.02 for b in peakiness_before))
-        mid_before = next(b for b in peakiness_before if b["range_hz"] == [200, 2000])
+        # band-agnostic: pick whichever band contains 1kHz, so this test does not
+        # break every time the crossover points change (they moved from
+        # 200/2000 to 100/800/5000 for pop presence separation)
+        mid_before = next(b for b in peakiness_before
+                          if b["range_hz"][0] <= 1000 < b["range_hz"][1])
 
         processed, info = chain.multiband_compress(audio, self.SR)
         self.assertTrue(info["applied"])
 
         peakiness_after = chain.detect_band_peakiness(processed, self.SR)
-        mid_after = next(b for b in peakiness_after if b["range_hz"] == [200, 2000])
+        mid_after = next(b for b in peakiness_after
+                         if b["range_hz"][0] <= 1000 < b["range_hz"][1])
         self.assertLess(
             mid_after["peak_over_db"],
             mid_before["peak_over_db"],
@@ -1298,13 +1303,18 @@ class EntireAppReauditRegressionTests(unittest.TestCase):
         audio = np.column_stack([mono, mono]).astype(np.float32)
         peakiness_before = chain.detect_band_peakiness(audio, sr)
         self.assertTrue(any(b["frac_time_over"] > 0.02 for b in peakiness_before))
-        mid_before = next(b for b in peakiness_before if b["range_hz"] == [200, 2000])
+        # band-agnostic: pick whichever band contains 1kHz, so this test does not
+        # break every time the crossover points change (they moved from
+        # 200/2000 to 100/800/5000 for pop presence separation)
+        mid_before = next(b for b in peakiness_before
+                          if b["range_hz"][0] <= 1000 < b["range_hz"][1])
 
         processed, info = chain.multiband_compress(audio, sr)
         self.assertTrue(info["applied"])
 
         peakiness_after = chain.detect_band_peakiness(processed, sr)
-        mid_after = next(b for b in peakiness_after if b["range_hz"] == [200, 2000])
+        mid_after = next(b for b in peakiness_after
+                         if b["range_hz"][0] <= 1000 < b["range_hz"][1])
         self.assertLess(
             mid_after["peak_over_db"],
             mid_before["peak_over_db"],
