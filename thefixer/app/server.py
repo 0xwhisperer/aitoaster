@@ -1862,6 +1862,55 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 job_log(job_id, f"trim_silence: final {trim_status} "
                                  f"({final_silence_check.get('lead_ms', 0):.1f}ms lead / "
                                  f"{final_silence_check.get('trail_ms', 0):.1f}ms trail after full chain)")
+
+                # BUG FIX (direct user report, reproduced from their log): this
+                # corrective trim SHIFTS THE TIMELINE, and cnn_fix's correction
+                # is position-sensitive - it is optimised against specific
+                # analysis window positions. Cutting samples off the head and
+                # tail moves every one of those windows, which invalidates the
+                # certification wholesale.
+                #
+                # Measured on a real user run with all tools selected: cnn_fix
+                # certified the file at 0.003% post-chain, this trim then cut
+                # 1.4ms lead / 311.5ms trail, and the DELIVERED file scored
+                # 78.8% - flagged. The post-chain CNN recheck above could not
+                # catch it because that recheck runs BEFORE this trim: the
+                # guard sat upstream of the very mutation it needed to guard.
+                #
+                # Same "certify then mutate with no re-check" class the comment
+                # above already names, one layer further out again. Re-score
+                # here and re-run cnn_fix if the shift broke it, using the same
+                # threshold and margin as the earlier recheck.
+                if "cnn_fix" in tools:
+                    check_cancelled(job_id)
+                    _pt_path = OUTPUT_DIR / f"_cnn_posttrim_{uuid.uuid4().hex[:8]}.wav"
+                    try:
+                        save_stereo(_pt_path, audio, sr)
+                        _pt_score = scorer.cnn.predict(str(_pt_path))["probability"]
+                        job_log(job_id, f"  post-trim cnn score: {_pt_score * 100:.3f}%")
+                        if _pt_score >= 0.08 + CNN_RECHECK_MARGIN:
+                            job_log(job_id, "  the corrective trim shifted the timeline and "
+                                            "invalidated the CNN fix - re-running it on the "
+                                            "trimmed signal")
+                            job_set_step(job_id, None, None, "CNN re-verification after trim")
+                            from .cnn_fix import fix_cnn
+                            _t0 = time.time()
+                            _before = audio.copy()
+                            _mode = options.get("cnn_mode", "thorough")
+                            if _mode not in ("simple", "eot", "thorough"):
+                                _mode = "thorough"
+                            audio, _ = fix_cnn(
+                                audio, sr,
+                                max_steps=options.get("cnn_max_steps", 300),
+                                min_steps=options.get("cnn_min_steps", 100),
+                                hop_sec=options.get("cnn_hop_sec", 0.5),
+                                progress_cb=_cancel_aware_log,
+                                mode=_mode,
+                            )
+                            _record_detector_overlay("cnn", _before, audio)
+                            job_log(job_id, f"  done ({time.time() - _t0:.2f}s)")
+                    finally:
+                        _pt_path.unlink(missing_ok=True)
             else:
                 job_log(job_id, f"trim_silence: final pass ({late_lead_ms:.1f}ms lead / {late_trail_ms:.1f}ms trail after full chain)")
 

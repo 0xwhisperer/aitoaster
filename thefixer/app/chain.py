@@ -1835,6 +1835,177 @@ def detect_spectral_rolloff(audio, sr, cutoff_hz=17000.0):
     return has_rolloff, (cutoff_hz if has_rolloff else None), float(max(0, deficit_db))
 
 
+# --------------------------------------------------------------- tonal cleanup
+TONAL_REGIONS = ((250.0, "boxiness"), (3150.0, "harshness"))
+TONAL_Q = 1.4
+TONAL_TRIGGER_DB = 3.0        # excess over the local spectral trend
+TONAL_OCCUPANCY = 0.80        # fraction of active frames that must show it
+TONAL_MAX_CUT_DB = 1.5
+TONAL_MIN_DURATION_SEC = 30.0
+TONAL_FRAME_SEC = 0.20
+
+
+def _peaking_sos(freq_hz, q, gain_db, sr):
+    """RBJ peaking-EQ biquad. Minimum-phase, causal, no pre-ringing.
+
+    Verified by an earlier audit as textbook-correct: measured gain matches
+    the request to under 0.001dB at every frequency/Q/gain, measured Q is
+    1.401 against 1.4 requested, and all poles and zeros sit strictly inside
+    the unit circle from 8k to 192kHz.
+    """
+    a_ = 10 ** (gain_db / 40.0)
+    w0 = 2 * np.pi * freq_hz / sr
+    alpha = np.sin(w0) / (2 * q)
+    cos_w0 = np.cos(w0)
+    b = np.array([1 + alpha * a_, -2 * cos_w0, 1 - alpha * a_])
+    a = np.array([1 + alpha / a_, -2 * cos_w0, 1 - alpha / a_])
+    return (b / a[0]).tolist() + (a / a[0]).tolist()
+
+
+def _frame_excess_db(audio, sr, freq_hz, q, frame_sec=TONAL_FRAME_SEC):
+    """Per-frame excess of a narrow region over its own local spectral trend.
+
+    THIS IS THE WHOLE DESIGN. A previous version measured the excess ONCE,
+    over the whole track, and it did not work - it fired on sustained musical
+    notes and ignored the resonances it was built to find. Measured on that
+    version: a bass note 26dB BELOW the noise bed drew the full cut (+3.08dB
+    excess) while a genuine +7dB Q=1.4 resonance drew nothing (+2.80dB), and
+    a plain 4th-order lowpass with no resonance at all drew the full cut
+    (+7.18dB).
+
+    The reason is structural: any excess-over-neighbours statistic on a
+    full-track average is really a narrowband-energy detector, and in music
+    the dominant narrowband energy IS NOTES. No threshold change fixes that,
+    because the two are indistinguishable in a time-averaged spectrum.
+
+    The discriminator has to be TEMPORAL. A resonance is excited by whatever
+    content passes through it, so it is present in nearly every frame that
+    has energy at all. A note is present only while it is played - typically
+    a few percent to a third of a track, and intermittently. So: measure the
+    excess frame by frame, and later require it in a high FRACTION of active
+    frames (see tonal_cleanup). A tonic note occupies too few frames to
+    qualify no matter how loud it is.
+
+    Returns (excess_per_frame, frame_is_active).
+    """
+    from scipy import signal as _sig
+
+    mono = audio.mean(axis=1) if audio.ndim > 1 else audio
+    nper = int(frame_sec * sr)
+    if nper < 256 or len(mono) < nper * 4:
+        return None, None
+    hop = nper // 2
+    n_frames = 1 + (len(mono) - nper) // hop
+    if n_frames < 8:
+        return None, None
+
+    half_bw = freq_hz / (2.0 * q)
+    lo_edge, hi_edge = freq_hz - half_bw, freq_hz + half_bw
+    # probe bands a quarter-octave clear of the region, both sides
+    probes = []
+    for mult in (2 ** 0.25, 2 ** 0.5, 2 ** 0.75):
+        for centre in (lo_edge / mult, hi_edge * mult):
+            if 0 < centre < sr / 2:
+                probes.append(centre)
+    if len(probes) < 3:
+        return None, None
+
+    window = np.hanning(nper)
+    freqs = np.fft.rfftfreq(nper, 1 / sr)
+    region_sel = (freqs >= lo_edge) & (freqs < min(hi_edge, sr / 2))
+    probe_sels = [((freqs >= c / 1.06) & (freqs < min(c * 1.06, sr / 2)), np.log2(c))
+                  for c in probes]
+    probe_sels = [(s, lf) for s, lf in probe_sels if s.any()]
+    if not region_sel.any() or len(probe_sels) < 3:
+        return None, None
+
+    idx = np.arange(n_frames) * hop
+    frames = np.lib.stride_tricks.sliding_window_view(mono, nper)[idx] * window
+    psd = np.abs(np.fft.rfft(frames, axis=1)) ** 2
+
+    total = psd.mean(axis=1)
+    active = total > (np.percentile(total, 95) * 1e-3)
+
+    here = 10 * np.log10(psd[:, region_sel].mean(axis=1) + 1e-20)
+    x = np.array([lf for _, lf in probe_sels])
+    y = np.stack([10 * np.log10(psd[:, s].mean(axis=1) + 1e-20)
+                  for s, _ in probe_sels], axis=1)
+    # quadratic baseline per frame: stiff enough not to bend around a Q=1.4
+    # bell, flexible enough to follow real spectral tilt and its curvature
+    coeffs = np.polyfit(x, y.T, 2)
+    baseline = np.polyval(coeffs, np.log2(freq_hz))
+    return here - baseline, active
+
+
+def tonal_cleanup(audio, sr, regions=TONAL_REGIONS, q=TONAL_Q,
+                  trigger_db=TONAL_TRIGGER_DB, occupancy=TONAL_OCCUPANCY,
+                  max_cut_db=TONAL_MAX_CUT_DB,
+                  min_duration_sec=TONAL_MIN_DURATION_SEC):
+    """Cut-only correction of two problem regions, gated on TIME not average.
+
+    Corrects boxiness (250Hz) and harshness (3.15kHz) only where the excess
+    is PERSISTENT - present in at least `occupancy` of the frames that have
+    any energy. That is what separates a resonance from the music: a room
+    mode or a mic resonance rings whenever anything excites it; a bass note
+    or a vocal formant is only there while it is being played.
+
+    Deliberately NOT a target-matching EQ, and not a full-track average.
+    Both were built and measured, and both failed - see _frame_excess_db for
+    the average's failure, and for the target-matching version: it homogenised
+    two unrelated finished masters (spectral distance 4.10dB -> 2.06dB), its
+    own +/-2dB ceiling saturated in 20 of 25 bands, and the "deviations" it
+    wanted to correct sat within 2 cents of equal temperament - the songs'
+    own tonics.
+
+    Only the excess beyond the trigger is corrected, capped, so a region 3.4dB
+    over gets 0.4dB of cut rather than being dragged flat. There are no boosts
+    anywhere: every headroom and homogenisation problem measured during the
+    design came from boosting.
+    """
+    from scipy import signal as _sig
+
+    duration = len(audio) / float(sr)
+    if duration < min_duration_sec:
+        return audio, {"applied": False, "bands": [],
+                       "reason": f"track is {duration:.0f}s; needs "
+                                 f"{min_duration_sec:.0f}s"}
+
+    bands, sos_list = [], []
+    for freq_hz, label in regions:
+        if freq_hz >= sr / 2:
+            continue
+        excess, active = _frame_excess_db(audio, sr, freq_hz, q)
+        if excess is None or active is None or not active.any():
+            continue
+        over = excess[active] > trigger_db
+        occ = float(over.mean())
+        # the level to correct: how far over it sits when it IS over, taken
+        # as a low percentile so one loud frame cannot set the cut
+        persistent_excess = (float(np.percentile(excess[active][over], 25))
+                             if over.any() else float(excess[active].max()))
+        cut_db = 0.0
+        if occ >= occupancy:
+            cut_db = -min(max(persistent_excess - trigger_db, 0.0), max_cut_db)
+            if cut_db < 0:
+                sos_list.append(_peaking_sos(freq_hz, q, cut_db, sr))
+        bands.append({
+            "freq_hz": freq_hz, "label": label,
+            "occupancy": round(occ, 3),
+            "excess_db": round(persistent_excess, 2),
+            "cut_db": round(cut_db, 2),
+        })
+
+    if not sos_list:
+        return audio, {"applied": False, "bands": bands,
+                       "reason": "no region is persistently over the bar",
+                       "trigger_db": trigger_db, "occupancy_required": occupancy}
+    out = _sig.sosfilt(np.asarray(sos_list, dtype=np.float64),
+                       audio, axis=0).astype(np.float32)
+    return out, {"applied": True, "bands": bands, "q": q,
+                 "trigger_db": trigger_db, "occupancy_required": occupancy,
+                 "max_cut_db": max_cut_db}
+
+
 def spectral_revive(audio, sr, cutoff_hz=None, seed=42):
     """Fill in high-frequency content above a hard rolloff (commonly left by
     lossy encoding, low-quality AI generation, or resampling from a lower
