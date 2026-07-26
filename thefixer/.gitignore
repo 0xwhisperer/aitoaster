@@ -10,3 +10,4 @@ electron/dist
 
 server_*.log
 .playwright-mcp/
+.claude/worktrees/
