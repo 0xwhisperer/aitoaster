@@ -942,12 +942,14 @@
         let settingsRow = "";
         if (t.id === "saturate" && checked) {
           settingsRow = `
+          <div class="tool-settings-row">
             <div class="chain-group-label">Drive<button class="info-btn" data-info="tool_saturate" title="What's this?" type="button">i</button></div>
             <div class="format-switch cols-3" id="saturationSwitch">
               <button data-satamount="light" class="${state.saturationAmount === "light" ? "active" : ""}">Light</button>
               <button data-satamount="medium" class="${state.saturationAmount === "medium" ? "active" : ""}">Medium</button>
               <button data-satamount="strong" class="${state.saturationAmount === "strong" ? "active" : ""}">Strong</button>
-            </div>`;
+            </div>
+          </div>`;
         }
         if (t.id === "cnn_fix" && checked) {
           settingsRow = `
@@ -1048,7 +1050,11 @@
     const satSwitchEl = document.getElementById("saturationSwitch");
     if (satSwitchEl) {
       satSwitchEl.querySelectorAll("button").forEach(btn => {
-        btn.addEventListener("click", () => {
+        btn.addEventListener("click", (e) => {
+          // stopPropagation, or the click bubbles up to the tool row and
+          // toggles the tool OFF - picking a drive setting deselected the
+          // very tool you were configuring.
+          e.stopPropagation();
           state.saturationAmount = btn.dataset.satamount;
           satSwitchEl.querySelectorAll("button").forEach(b => b.classList.toggle("active", b === btn));
         });
