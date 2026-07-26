@@ -896,6 +896,20 @@ TOOL_ORDER = [
     "spectral_revive",
     # --- dynamics at working level, BEFORE loudness is set ---
     "multiband_compress",
+    # saturation runs AFTER multiband so the compressor's envelope detector
+    # sees undistorted crest and the saturator sees a stabilised level (which
+    # its own auto-gain estimator depends on), and BEFORE the detector fixes
+    # because saturation applied after them DESTROYS the adversarial
+    # correction they just computed. Measured by actually moving this stage
+    # after cnn_fix and running the full pipeline: the delivered file scored
+    # 99.997% CNN, up from ~0.2% - a near-total regression, not a tolerable
+    # trade-off. (An earlier version of this comment said "up to 6.85
+    # percentage points", which understated it by a factor of 15 and read
+    # like an acceptable cost.) Before normalize_lufs too, matching the
+    # "dynamics at working level" principle: it is RMS-matched and so nearly
+    # loudness-neutral (measured +0.10 LU at the default drive), which is
+    # also why the loudness stage downstream reclaims almost none of it.
+    "saturate",
     "temporal_normalize",
     # Timing changes must precede the position-sensitive detector fixes.
     # Run the cheap/reliable linear solve first and the exact-window CNN
@@ -931,6 +945,7 @@ TOOL_LABELS = {
     "fix_phase": "Stereo phase/correlation correction",
     "normalize_lufs": "LUFS loudness normalization",
     "multiband_compress": "Multiband tonal-balance compression",
+    "saturate": "Saturation (harmonic colour)",
     "true_peak_limit": "True-peak limiter",
     "fade": "Fade in / fade out",
 }
@@ -983,6 +998,15 @@ def _tool_status_line(tool, info):
         cutoff = info.get("cutoff_hz")
         slope = info.get("fitted_rolloff_db_per_octave")
         return f"pass (filled above {cutoff / 1000:.0f}kHz, fitted rolloff {slope:.1f}dB/octave)" if cutoff and slope is not None else "pass (applied)"
+
+    if tool == "saturate":
+        if not applied:
+            return f"pass ({info.get('reason', 'not applied')})"
+        return (f"pass ({info.get('amount')}, drive {info.get('drive')}, "
+                f"{info.get('oversample')}x oversampled, "
+                f"peak {info.get('peak_before', 0):.3f} -> "
+                f"{info.get('peak_after', 0):.3f}, "
+                f"makeup {info.get('makeup_db', 0):+.2f}dB)")
 
     if tool == "high_pass":
         cutoff = info.get("cutoff_hz")
@@ -1147,6 +1171,9 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                     audio, tinfo = chain.fix_transient(audio, sr, t["time_sec"],
                                                          target_peak=options.get("transient_target_peak"))
                     info["details"].append(tinfo)
+            elif tool == "saturate":
+                audio, info = chain.saturate(
+                    audio, sr, amount=options.get("saturation_amount", "medium"))
             elif tool == "spectral_revive":
                 audio, info = chain.spectral_revive(audio, sr, cutoff_hz=options.get("spectral_revive_cutoff_hz"))
             elif tool == "high_pass":

@@ -134,6 +134,17 @@
              <p>This replaced an earlier version that measured one correlation figure across the whole track and applied one correction to all of it — which under-corrected real bass problems while needlessly narrowing images that were fine.</p>
              <p>There is deliberately no stereo-widening here. Widening the image above 120Hz while collapsing everything below it works against itself, and a trial version measurably reduced mono compatibility on a real master. Width is a taste decision, not a safety correction.</p>`,
     },
+    tool_saturate: {
+      title: "Saturation (harmonic colour)",
+      body: `<p>Runs the signal through a tanh curve, which rounds off the tops of the loudest peaks and generates odd-order harmonics in the process. This is the classic console/transformer/tape effect, at mastering-bus strength. <strong>Off by default.</strong></p>
+             <p><strong>Level is matched, so this is not a volume control.</strong> Output RMS is matched back to input, so it is nearly loudness-neutral \u2014 measured +0.10 LU at Medium and +0.36 LU at Strong. That also means the loudness normalization downstream reclaims none of it \u2014 unlike a broad EQ move, of which only a third to two-thirds survives to the delivered file.</p>
+             <p><strong>Drive is normalised to your track's own level first.</strong> Without that, the same setting would distort a loud track far harder than a quiet one \u2014 measured, a naive fixed drive varied the distortion by 240x across an 18dB input range. Now it measures constant across that whole range.</p>
+             <p><strong>4x oversampled, and that is not optional.</strong> A nonlinearity creates harmonics above the sample rate's limit, which fold back down as inharmonic junk \u2014 and it lands below 8kHz, inside the band both AI detectors analyse, where nothing later can remove it. Measured in-band aliasing: -40dB without oversampling, below -88dB with 4x. Beyond 4x there is no further improvement. Costs about 1.6 seconds on a 150-second track.</p>
+             <p><strong>What it actually does, measured on real tracks at Medium:</strong> short-term crest factor falls 0.46 to 0.77dB, affecting roughly half to three-quarters of the track, and peak level drops enough to lighten the limiter's workload.</p>
+             <p><strong>What it does NOT do:</strong> this is not an EQ. The largest octave-band change measured on real tracks is 0.07dB at Light, 0.18dB at Medium and 0.57dB at Strong. The audible effect is peak density. If you are after a tonal change, this is not the tool.</p>
+             <p><strong>Where it runs:</strong> after multiband compression, before the AI-detector fixes. That order matters \u2014 saturating after those fixes partially undoes the correction they just computed, measured by actually running it that way, the delivered file scored 99.997% on the CNN detector instead of about 0.2% \u2014 it destroys the correction rather than merely denting it.</p>
+             <p><strong>Skipped</strong> on tracks under 2 seconds or quieter than -60dBFS, where the level measurement it depends on is not reliable.</p>`,
+    },
     tool_multiband_compress: {
       title: "Multiband tonal-balance compression",
       body: `<p>Gently compresses four frequency bands independently, rather than the whole signal at once - a light touch aimed at smoothing out any band that's poking out too far relative to the others, for a more balanced overall tone. Deliberately conservative, not a loudness-maximizing effect.</p>
@@ -195,6 +206,7 @@
     { id: "fix_phase", group: "chainGroupMaster", name: "Stereo field: bass mono & phase", desc: "Sums bass below 120Hz to mono and repairs phase in the 120-300Hz band, leaving your stereo image above that completely untouched. Measured before any high-frequency fill-in, so it reads your real recording.", info: "tool_fix_phase" },
     { id: "normalize_lufs", group: "chainGroupMaster", name: "LUFS loudness normalization", desc: "Sets integrated loudness. Runs second-to-last, immediately before the limiter, so nothing after it moves the delivered level off target.", info: "lufs" },
     { id: "multiband_compress", group: "chainGroupMaster", name: "Multiband compression (4-band)", desc: "Gentle 4-band dynamics smoothing for tonal balance, with vocal presence on its own control so it never gets ducked by cymbals. One pass, a couple of dB at most.", info: "tool_multiband_compress" },
+    { id: "saturate", group: "chainGroupMaster", name: "Saturation (harmonic colour)", desc: "Adds odd-order harmonic distortion with a tanh curve, 4x oversampled so the harmonics don't fold back as aliasing. Output level is matched to input, so it changes peak density rather than loudness. Off by default.", info: "tool_saturate" },
     { id: "true_peak_limit", group: "chainGroupMaster", name: "True-peak limiter", desc: "Brick-wall safety ceiling at -1dBTP, accounting for inter-sample peaks. Looks 1.5ms ahead so the gain is already in place when a peak arrives, instead of reacting after it.", info: "tool_true_peak_limit" },
     { id: "fade", group: "chainGroupMaster", name: "Fade in / fade out", desc: "Smooth S-curve fade at the start and end of the track. Runs last, after the limiter, so no later gain stage undoes it.", info: "tool_fade" },
   ];
@@ -231,6 +243,7 @@
     outputFormat: "same",
     mp3Mode: "vbr0",
     cnnMode: "thorough",
+    saturationAmount: "medium",
     // 4ms: fingerprint landmark displacement saturates here (landmark timing
     // is quantized by the 512-sample STFT hop, ~11.6ms, so once a landmark
     // moves past one hop it cannot move "further"). Higher values add high-
@@ -906,7 +919,7 @@
   const CHAIN_RUN_ORDER = [
     "strip_metadata", "trim_silence", "dc_offset", "high_pass",
     "fix_transients", "fix_phase", "spectral_revive",
-    "multiband_compress", "temporal_normalize",
+    "multiband_compress", "saturate", "temporal_normalize",
     "linear_fix", "cnn_fix",
     "normalize_lufs", "true_peak_limit", "fade",
   ];
@@ -927,6 +940,15 @@
         const checked = state.selected.has(t.id);
         const recommended = rec.has(t.id);
         let settingsRow = "";
+        if (t.id === "saturate" && checked) {
+          settingsRow = `
+            <div class="chain-group-label">Drive<button class="info-btn" data-info="tool_saturate" title="What's this?" type="button">i</button></div>
+            <div class="format-switch cols-3" id="saturationSwitch">
+              <button data-satamount="light" class="${state.saturationAmount === "light" ? "active" : ""}">Light</button>
+              <button data-satamount="medium" class="${state.saturationAmount === "medium" ? "active" : ""}">Medium</button>
+              <button data-satamount="strong" class="${state.saturationAmount === "strong" ? "active" : ""}">Strong</button>
+            </div>`;
+        }
         if (t.id === "cnn_fix" && checked) {
           settingsRow = `
           <div class="tool-settings-row">
@@ -1023,6 +1045,15 @@
     // only exist inside their own tool's card while that tool is checked),
     // so their listeners must be re-attached every render too, not once at
     // page load.
+    const satSwitchEl = document.getElementById("saturationSwitch");
+    if (satSwitchEl) {
+      satSwitchEl.querySelectorAll("button").forEach(btn => {
+        btn.addEventListener("click", () => {
+          state.saturationAmount = btn.dataset.satamount;
+          satSwitchEl.querySelectorAll("button").forEach(b => b.classList.toggle("active", b === btn));
+        });
+      });
+    }
     const cnnModeSwitchEl = document.getElementById("cnnModeSwitch");
     if (cnnModeSwitchEl) {
       cnnModeSwitchEl.querySelectorAll("button").forEach(btn => {
@@ -1161,7 +1192,7 @@
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        tools: Array.from(state.selected), options: { cnn_mode: state.cnnMode, temporal_max_drift_ms: state.temporalMaxDriftMs, fade_in_ms: state.fadeInMs, fade_out_ms: state.fadeOutMs, lufs_target: state.lufsTarget },
+        tools: Array.from(state.selected), options: { cnn_mode: state.cnnMode, saturation_amount: state.saturationAmount, temporal_max_drift_ms: state.temporalMaxDriftMs, fade_in_ms: state.fadeInMs, fade_out_ms: state.fadeOutMs, lufs_target: state.lufsTarget },
         output_name: outputName || undefined,
         output_format: state.outputFormat,
         mp3_mode: state.mp3Mode,

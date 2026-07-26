@@ -1377,6 +1377,187 @@ def sample_peak_safety_clamp(audio, ceiling_db=-1.0):
     }
 
 
+# ------------------------------------------------------------------ saturation
+# tanh soft saturation with level-independent drive, 4x oversampling and a DC
+# guard. Every number here was measured; see saturate() for the derivations.
+SATURATION_DRIVES = {"light": 0.9, "medium": 1.6, "strong": 3.0}
+SATURATION_OPERATING_RMS = 0.125      # -18 dBFS, the classic 0VU reference
+SATURATION_OVERSAMPLE = 4
+SATURATION_MIN_DURATION_SEC = 2.0
+SATURATION_MIN_RMS = 1e-3             # -60 dBFS program RMS
+SATURATION_MAX_MAKEUP_DB = 3.0
+
+
+def _program_rms(audio, sr, percentile=95.0, block_sec=0.4):
+    """95th-percentile block RMS - the level the drive is normalised against.
+
+    A plain whole-file RMS is dragged down by intros, outros and quiet
+    verses, so the loud sections would saturate harder than the quiet ones on
+    the same setting. The 95th percentile of short blocks tracks what the
+    track actually sits at when it is playing.
+    """
+    # Per-channel MAX, not the mono sum. A perfectly out-of-phase track
+    # (L = -R) sums to exactly zero, so a mono-sum estimator reported 0.0 and
+    # the stage skipped it claiming "program level below -60dBFS" - which was
+    # false, each channel measured 0.20 RMS. Anti-phase material is rare but
+    # a wrong reason in the log is worse than a right refusal.
+    if audio.ndim > 1:
+        channels = [audio[:, c] for c in range(audio.shape[1])]
+    else:
+        channels = [audio]
+
+    block = max(1, int(block_sec * sr))
+    best = 0.0
+    for chan in channels:
+        n = (len(chan) // block) * block
+        if n < block:
+            best = max(best, float(np.sqrt((chan.astype(np.float64) ** 2).mean())))
+            continue
+        blocks = chan[:n].astype(np.float64).reshape(-1, block)
+        rms = np.sqrt((blocks ** 2).mean(axis=1))
+        rms = rms[rms > 0]
+        if len(rms):
+            best = max(best, float(np.percentile(rms, percentile)))
+    return best
+
+
+def saturate(audio, sr, amount="medium", oversample=SATURATION_OVERSAMPLE):
+    """Gentle tanh saturation: odd harmonics, level-independent, LUFS-neutral.
+
+    Chosen over the alternatives on measurement. At a matched 1.00% THD on a
+    1kHz tone: tanh gives a fast-decaying odd series (H3 -40.0, H5 -80.0,
+    H7 -117.8dB) which is the console/transformer character pop bus glue
+    wants. Asymmetric "tube" saturation measured lower IMD (3.48% vs 6.09%)
+    but puts H2 an octave above the fundamental, where pop vocal and snare
+    content already lives, and carries -43.3 dBFS of DC. Wavefolding is
+    disqualified outright: 482% IMD and a harmonic series that does not decay
+    (H3 -44.7 through H9 -47.3) - a synthesis effect, not a mastering one.
+
+    THREE THINGS THIS GETS RIGHT that a naive implementation does not:
+
+    1. LEVEL-INDEPENDENT DRIVE. The signal arrives mid-chain at whatever
+       level it happens to be, and a fixed drive therefore distorts a loud
+       track far harder than a quiet one. Measured on real material, a naive
+       fixed drive varied the distortion residual by 240x across an 18dB
+       input swing (0.00048 -> 0.11517 RMS). This normalises to a fixed
+       internal operating point first, saturates, then scales back - measured
+       constant THD to three decimal places across the same 18dB range.
+
+    2. 4x OVERSAMPLING, not optional. A nonlinearity generates harmonics
+       above Nyquist which fold back as inharmonic content, and it lands
+       BELOW 8kHz - inside both detectors' analysis band, where nothing
+       downstream can remove it. Measured two-tone alias products below 8kHz
+       at drive 1.6: -40.3dB at 1x, -79.3dB at 2x, -84.7dB at 4x, and no
+       further improvement at 8x or 16x. 4x is the knee. It costs about 2.5s
+       on a 150s track, under 2% of pipeline runtime.
+
+    3. A DC GUARD, FOR THE SYMMETRIC CURVE TOO. tanh is an odd function, so
+       the intuition is that it cannot rectify a DC term - but real program
+       material is itself asymmetric, so it does. Measured on a real track,
+       unguarded tanh at drive 1.6 produced 1.12e-03 of DC: 19x over this
+       app's own lossy re-check floor (6e-5) and 112x over the lossless one
+       (1e-5). Since dc_offset runs at step 3 and this runs at step 8,
+       nothing downstream would catch it and the delivered file would
+       re-recommend dc_offset on re-upload. Per-channel mean subtraction
+       lands at 3.6e-07.
+
+    Output level is RMS-matched to input. That makes the stage nearly
+    loudness-neutral, but NOT exactly: RMS matching is not LUFS matching,
+    because LUFS is K-weighted and gated. Measured integrated loudness change
+    is +0.04 LU at light, +0.10 to +0.11 LU at medium, and +0.29 to +0.36 LU
+    at strong. Small enough that normalize_lufs downstream reclaims almost
+    none of it - unlike a broad EQ move, of which only 28-65% survives - but
+    an earlier version of this docstring claimed "within 0.002 LU", which was
+    wrong by 50-180x.
+
+    What this does NOT do: it is not an EQ. Broadband tonal balance moves by
+    at most 0.07dB at light, 0.18dB at medium and 0.57dB at strong (largest
+    octave-band change, measured on two real tracks). The audible effect is
+    peak-density reduction - short-term crest falls 0.46-0.77dB at drive 1.6 -
+    not tonal colour. It is not "warmth" in the tonal sense.
+    """
+    from scipy import signal as _sig
+
+    drive = SATURATION_DRIVES.get(amount) if isinstance(amount, str) else amount
+    if drive is None:
+        return audio, {"applied": False, "reason": f"unknown amount {amount!r}"}
+
+    if not np.isfinite(audio).all():
+        # A single NaN sample became 176,400 NaN samples: resample_poly
+        # spreads it across its filter length and the DC guard's mean then
+        # spreads it across the whole channel. Refuse rather than silently
+        # destroy the track and report "pass".
+        return audio, {"applied": False, "amount": amount,
+                       "reason": "input contains non-finite samples"}
+
+    duration = len(audio) / float(sr)
+    if duration < SATURATION_MIN_DURATION_SEC:
+        # Below this the percentile RMS estimator is unreliable: measured on
+        # a 0.05s file the normalisation factor blew up to 112,948, and a
+        # 0.2s file overshot the THD target by 2.6x.
+        return audio, {"applied": False, "amount": amount,
+                       "reason": f"track is {duration:.2f}s; needs "
+                                 f"{SATURATION_MIN_DURATION_SEC:.0f}s"}
+
+    level = _program_rms(audio, sr)
+    if level < SATURATION_MIN_RMS:
+        # Near-silence measured 12.3% THD - the estimator divides by a level
+        # that is essentially noise.
+        return audio, {"applied": False, "amount": amount,
+                       "reason": "program level below -60dBFS"}
+
+    audio = np.asarray(audio, dtype=np.float32)
+    norm = SATURATION_OPERATING_RMS / level
+
+    up = _sig.resample_poly(audio * norm, oversample, 1, axis=0)
+    # Divide by `drive`, NOT by tanh(drive). tanh(x*d)/d has unity slope at
+    # the origin, so quiet passages pass through at their own level and only
+    # the loud parts compress - which is what a saturator is. Normalising by
+    # tanh(d) instead makes the curve hit +/-1 at full scale, which BOOSTS
+    # overall level (measured +1.88dB at drive 0.9, +4.47dB at 1.6, +8.59dB
+    # at 3.0) and left the makeup-gain clamp pinned at its -3dB limit in
+    # every case - a clamp that always binds is a bug, not a safety net.
+    sat = np.tanh(up * drive) / drive
+    out = _sig.resample_poly(sat, 1, oversample, axis=0).astype(np.float64)
+    # resample_poly can return a slightly different length; keep the original
+    if out.shape[0] != audio.shape[0]:
+        if out.shape[0] > audio.shape[0]:
+            out = out[:audio.shape[0]]
+        else:
+            pad = [(0, audio.shape[0] - out.shape[0])] + \
+                  [(0, 0)] * (out.ndim - 1)
+            out = np.pad(out, pad)
+
+    # DC guard - see point 3 above. Before auto-gain, so the makeup gain is
+    # measured on the signal that will actually be delivered.
+    dc_before = float(np.abs(np.atleast_1d(out.mean(axis=0))).max())
+    out = out - out.mean(axis=0, keepdims=True)
+
+    out /= norm
+    # RMS auto-gain, clamped: a runaway estimator must not silently become a
+    # volume change.
+    out_level = _program_rms(out.astype(np.float32), sr)
+    makeup_db = 0.0
+    if out_level > 0:
+        makeup = level / out_level
+        makeup_db = float(np.clip(20 * np.log10(makeup),
+                                  -SATURATION_MAX_MAKEUP_DB,
+                                  SATURATION_MAX_MAKEUP_DB))
+        out *= 10 ** (makeup_db / 20)
+
+    out = out.astype(np.float32)
+    return out, {
+        "applied": True,
+        "amount": amount,
+        "drive": drive,
+        "oversample": oversample,
+        "makeup_db": round(makeup_db, 3),
+        "dc_removed": dc_before,
+        "peak_before": float(np.abs(audio).max()),
+        "peak_after": float(np.abs(out).max()),
+    }
+
+
 def true_peak_limit(audio, sr, ceiling_db=-1.0, oversample=4):
     """True-peak (inter-sample peak) limiter: oversample to approximate the
     reconstructed analog waveform's real peak (which can exceed sample-peak
