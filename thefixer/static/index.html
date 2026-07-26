@@ -689,7 +689,16 @@ canvas#waveCanvas { width: 100%; height: 100%; display: block; }
 }
 .overlay-row:last-child { border-bottom: 0; }
 .overlay-row audio { width: 100%; height: 34px; }
-.overlay-label { font-weight: 650; }
+/* BUG FIX (direct user report): this card's fonts did not match the others.
+   .overlay-label set only font-weight, so the row labels fell back to the
+   browser default 16px instead of the app's own scale, and the intro
+   paragraph used a .muted class that was never defined anywhere in this
+   stylesheet - leaving it fully unstyled at default size and colour. */
+.overlay-label { font-weight: 650; font-size: 12.5px; }
+.overlay-note {
+  font-size: 12.5px; color: var(--text-faint);
+  margin: 0 0 14px; line-height: 1.5;
+}
 .overlay-player-label {
   display: block; color: var(--text-faint); font-size: 10px;
   text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px;

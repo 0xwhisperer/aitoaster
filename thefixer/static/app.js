@@ -1277,6 +1277,13 @@
     [/^\s*WARNING: linear regressed.*$/, () => ({ text: "Heads up: the linear score slipped a bit after a later step", badge: "fail" })],
     [/^\s*WARNING: cnn regressed.*$/, () => ({ text: "Heads up: the CNN score slipped again after the loudness limiter re-ran - the delivered file may still be flagged", badge: "fail" })],
     [/^\s*WARNING: delivered file is ([\-\d.]+) LUFS.*$/, (m) => `Heads up: couldn't fully reach the loudness target (landed at ${m[1]} LUFS) without exceeding the peak safety ceiling`],
+    // Keep the FULL tag list verbatim - it is the actual evidence of what was
+    // found in the file, not a summary. Only a badge is added.
+    [/^\s*found and removing tags: (.+)$/, (m) => ({ text: `found and removing tags: ${m[1]}`, badge: "pass" })],
+    [/^\s*no text tags found on the source file$/, () => ({ text: "no text tags found on the source file", badge: "pass" })],
+    [/^\s*found and removing (\d+) embedded image\(s\)(.*)$/, (m) => ({
+      text: `found and removing ${m[1]} embedded image(s)${m[2]}`, badge: "pass" })],
+    [/^\s*no embedded images found$/, () => ({ text: "no embedded images found", badge: "pass" })],
     [/^linear: trying fast feature-domain solve.*$/, () => "Trying the fast solve before the full optimizer"],
     [/^linear: feature-domain result checked on transferred stereo output: ([\d.]+)% AI, SNR ([\d.]+)dB, peak spectral adjustment ([\d.]+)dB$/, (m) => {
       const pct = Number(m[1]);
