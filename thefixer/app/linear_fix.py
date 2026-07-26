@@ -19,7 +19,8 @@ def _resample_mono(audio_44k_mono, sr_in, sr_out):
         in_path = tf_in.name
     out_path = in_path + "_rs.wav"
     try:
-        sf.write(in_path, audio_44k_mono, sr_in, subtype="PCM_16")
+        # FLOAT: intermediate in the correction path, see cnn_fix._resample_mono
+        sf.write(in_path, audio_44k_mono, sr_in, subtype="FLOAT")
         subprocess.run(["ffmpeg", "-v", "quiet", "-y", "-i", in_path, "-ar", str(sr_out), out_path], check=True)
         data, _ = sf.read(out_path, dtype="float32")
         return data

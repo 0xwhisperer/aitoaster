@@ -221,7 +221,12 @@ def _resample_mono(audio, sr_in, sr_out):
         in_path = tf_in.name
     out_path = in_path + "_rs.wav"
     try:
-        sf.write(in_path, audio, sr_in, subtype="PCM_16")
+        # FLOAT, not PCM_16: this runs inside the correction transfer path,
+        # and the CNN correction is a very small signal (~-66 dBFS). Measured,
+        # a 16-bit intermediate injects quantization error only 29dB below the
+        # correction itself - damaging the very thing being transferred.
+        # FLOAT is bit-exact and costs only temp-file size.
+        sf.write(in_path, audio, sr_in, subtype="FLOAT")
         subprocess.run(["ffmpeg", "-v", "quiet", "-y", "-i", in_path, "-ar", str(sr_out), out_path], check=True)
         data, _ = sf.read(out_path, dtype="float32")
         return data
