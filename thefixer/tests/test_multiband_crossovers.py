@@ -626,10 +626,16 @@ class EnvelopeFollowerTests(unittest.TestCase):
             raise numba_errors.TypingError("simulated lazy compile failure")
 
         chain._follow_fast = boom
+        # The fallback prints a one-time notice by design. Swallow it here so
+        # the deliberate failure does not look like a real one in test output
+        # - a genuine fallback in production must stay loud and unambiguous.
+        prev_flag = chain._FOLLOW_FELL_BACK
+        chain._FOLLOW_FELL_BACK = True
         try:
             got = chain._follow(level, 0.99, 0.999)
         finally:
             chain._follow_fast = real_fast
+            chain._FOLLOW_FELL_BACK = prev_flag
 
         self.assertEqual(
             float(np.abs(got - expected).max()), 0.0,
