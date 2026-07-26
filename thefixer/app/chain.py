@@ -1449,7 +1449,7 @@ def saturate(audio, sr, amount="medium", oversample=SATURATION_OVERSAMPLE):
        downstream can remove it. Measured two-tone alias products below 8kHz
        -30 to -50dB at 1x depending on drive, and -78 to -97dB at 4x, with
        no further improvement at 8x or 16x. 4x is the knee. (At the default
-       drive specifically: -40.3dB at 1x, -87.6dB at 4x.) It costs about 2.5s
+       drive specifically: -40.3dB at 1x, -87.6dB at 4x.) It costs about 1.5s
        on a 150s track, under 2% of pipeline runtime.
 
     3. A DC GUARD, FOR THE SYMMETRIC CURVE TOO. tanh is an odd function, so

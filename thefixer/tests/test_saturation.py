@@ -50,6 +50,37 @@ def _music(seconds=4.0, seed=0, scale=0.2):
     return (mix / np.abs(mix).max() * scale).astype(np.float32)
 
 
+def _realistic_music(seconds=8.0, seed=5, scale=0.3):
+    """Material with a REAL pop-master crest factor (~11-12dB peak/95th-pct).
+
+    _music() above measures 17.26dB because of its isolated amplitude-3.0
+    transients - 5-6dB peakier than either real test track (Poster 11.21dB,
+    North Star 12.13dB). That extra peakiness lets a badly under-driven
+    saturator still register a crest change on the fixture while doing
+    essentially nothing to real audio: with the operating point cut to 0.03,
+    residual distortion on real material collapses from 2.08% to 0.235%,
+    yet the fixture still showed -0.32dB of crest reduction and passed.
+    Shipping a no-op behind a UI toggle is precisely why three sibling
+    features were rejected, so at least one assertion has to run on material
+    whose crest factor resembles the real thing.
+    """
+    rng = np.random.RandomState(seed)
+    n = int(seconds * SR)
+    t = np.arange(n) / SR
+    sig_ = (0.5 * np.sin(2 * np.pi * 55 * t)
+            + 0.4 * np.sin(2 * np.pi * 110 * t)
+            + 0.25 * np.sin(2 * np.pi * 220 * t)
+            + 0.15 * np.sin(2 * np.pi * 440 * t)
+            + 0.1 * np.sin(2 * np.pi * 880 * t))
+    # dense, moderate transients - a kit playing, not isolated spikes
+    for onset in range(0, n, int(0.125 * SR)):
+        L = min(400, n - onset)
+        if L > 0:
+            sig_[onset:onset + L] += 0.55 * np.hanning(2 * L)[:L] * rng.uniform(0.7, 1.3)
+    sig_ += 0.12 * rng.randn(n)
+    return (sig_ / np.abs(sig_).max() * scale).astype(np.float32)
+
+
 def _tone(freq=1000.0, seconds=2.0, amp=0.5):
     t = np.arange(int(seconds * SR)) / SR
     return (amp * np.sin(2 * np.pi * freq * t)).astype(np.float32)
@@ -499,6 +530,49 @@ class ItActuallyDoesSomethingTests(unittest.TestCase):
             delta, -0.2,
             f"median short-term crest moved only {delta:+.3f}dB - this is "
             "close enough to a no-op that the tool is not worth shipping",
+        )
+
+    def test_it_does_real_work_on_realistic_crest_material(self):
+        """The strongest anti-no-op assertion in this suite.
+
+        Runs on material with a real pop-master crest factor rather than the
+        peakier synthetic fixture, and checks the RESIDUAL - how much of the
+        output is actually distortion - not just a crest delta. An
+        under-driven saturator (operating point cut to 0.03, or drives divided
+        by 5) shows a plausible-looking crest change on the peaky fixture
+        while its real residual collapses from 2.08% to 0.24%.
+        """
+        mono = _realistic_music()
+        crest = _median_crest_db(mono)
+        self.assertLess(
+            crest, 14.0,
+            f"test setup: fixture crest is {crest:.2f}dB, too peaky to stand "
+            "in for a real master",
+        )
+        audio = _stereo(mono)
+        out, info = chain.saturate(audio, SR, "medium")
+        self.assertTrue(info["applied"])
+
+        # Assert on PEAK REDUCTION, which scales directly with how hard the
+        # curve is actually driven. Residual distortion is the wrong metric
+        # here: on low-crest material everything saturates heavily, so an
+        # under-driven mutant still measures 4.62% against 4.87% shipped -
+        # indistinguishable. Peak ratio separates cleanly: 0.907 shipped
+        # versus 0.994 with the operating point cut to 0.03 and 0.996 with
+        # the drives divided by five.
+        peak_ratio = float(np.abs(out).max() / np.abs(audio).max())
+        self.assertLess(
+            peak_ratio, 0.96,
+            f"peak fell to only {peak_ratio:.4f} of input on realistic "
+            "material - the drive or the operating point is so low that this "
+            "stage is effectively a no-op, which is exactly what three "
+            "sibling features were rejected for",
+        )
+        crest_delta = _median_crest_db(out[:, 0]) - _median_crest_db(mono)
+        self.assertLess(
+            crest_delta, -0.35,
+            f"median crest moved only {crest_delta:+.3f}dB on realistic "
+            "material (an under-driven build measures about -0.15dB)",
         )
 
     def test_it_reduces_peak_level(self):
