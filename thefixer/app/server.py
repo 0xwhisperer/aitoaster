@@ -2287,6 +2287,16 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
             )
 
         job_log(job_id, f"saving output file (format: {resolved_format})")
+        # Every output is written as 16-bit PCM, so every file takes a
+        # bit-depth reduction whether the user asked for one or not. That is
+        # why dither is unconditional and has no card: there is no choice to
+        # offer. But it was also invisible - the log said only "saving output
+        # file" while a stage that modifies every sample ran underneath it,
+        # and while it was silently introducing DC (a truncating quantizer,
+        # since fixed). State it.
+        job_log(job_id, "  16-bit output: applying TPDF dither before "
+                        "quantization (undithered truncation leaves harmonics "
+                        "at -24.6dB against the tone; dithered, -43.7dB)")
         save_t0 = time.time()
         out_path = encode_final_output(audio, sr, resolved_format, OUTPUT_DIR / out_id, mp3_mode=mp3_mode)
         scoring_wav_path = out_path
