@@ -1999,9 +1999,21 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         # product watermark: applied unconditionally to every delivered
         # file, not a user-selectable tool in TOOL_ORDER - this is
         # intentional (see app/watermark.py's module docstring for the
-        # full design rationale). Runs after all real processing/AI-
-        # detector work, right before final encode, so it's the last thing
-        # to touch the signal and nothing downstream can disturb it.
+        # full design rationale).
+        #
+        # It runs after certification, which is only acceptable because it is
+        # MEASURED INERT rather than assumed to be. On a real certified
+        # output: CNN delta exactly 0.00000000pp (identical to 8 decimal
+        # places), linear delta -0.0000060pp (down, i.e. the safe direction),
+        # and sample count unchanged - so it cannot slide a CNN analysis
+        # window, which is the thing that actually breaks a certificate.
+        #
+        # An earlier version of this comment justified the position by saying
+        # it runs last "so nothing downstream can disturb it". That reasoning
+        # is backwards: being last means it is the last thing to touch a
+        # signal cnn_fix already certified. Do not use it as precedent for
+        # placing anything else here - the bar for running after
+        # certification is a measurement, not a convenience.
         job_log(job_id, "running: wm")
         # This stage runs OUTSIDE the per-tool loop, so it never reaches that
         # loop's centralized "done (Xs)" emission - it had no timing at all
