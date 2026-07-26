@@ -57,7 +57,8 @@
     lufs: {
       title: "LUFS (loudness)",
       body: `<p>Integrated loudness - roughly "how loud does this track feel overall," averaged across its whole length, following the same standard streaming platforms use to normalize playback volume.</p>
-             <p>The tool targets <strong>-14 LUFS</strong>, the common streaming-platform reference (Spotify, YouTube, etc. all normalize toward something in this range) - loud enough to compete, without triggering automatic turn-down on playback.</p>
+             <p>The default target is <strong>-14 LUFS</strong>, the common streaming reference — Spotify, YouTube, Amazon and Tidal all normalize playback toward it and turn down anything louder, so mastering past it costs dynamics without gaining loudness on those platforms. The slider spans <strong>-16</strong> (Apple Music's target) to <strong>-9</strong> (club and DJ stores, where playback isn't normalized the same way).</p>
+             <p>Loudness is set second-to-last, immediately before the limiter. Everything that meaningfully changes level — the dynamics stages and the detector fixes — has already run by then, so the delivered file lands on target rather than drifting off it.</p>
              <div class="good-bad">
                <div class="good"><strong>-16 to -12 LUFS</strong><br>Close to target, translates well across platforms</div>
                <div class="bad"><strong>Below -20 or above -8</strong><br>Notably quiet or aggressively loud/over-compressed</div>
@@ -120,21 +121,26 @@
     },
     tool_high_pass: {
       title: "High-pass filter",
-      body: `<p>Removes inaudible rumble below about 30Hz - content you can't hear but that still eats into your available headroom and can make a mix sound muddier than it needs to. Doesn't touch anything in the audible range.</p>`,
+      body: `<p>Removes inaudible rumble below about 30Hz - content you can't hear but that still eats into your available headroom and can make a mix sound muddier than it needs to. Doesn't touch anything in the audible range.</p>
+             <p>It runs early, before any stage that measures level. Sub-30Hz energy inflates the readings the compressor and limiter act on, so removing it first means those stages respond to the music rather than to rumble you can't hear.</p>`,
     },
     tool_fix_phase: {
       title: "Stereo phase / correlation correction",
-      body: `<p>Checks whether the left and right channels are working together or fighting each other (see the Stereo correlation explanation for the actual measurement). If content is meaningfully out of phase, it can partially cancel out when the track is played back in mono - this step corrects that so the track stays safe on any playback system.</p>`,
+      body: `<p>Checks whether the left and right channels are working together or fighting each other (see the Stereo correlation explanation for the actual measurement). If content is meaningfully out of phase, it can partially cancel out when the track is played back in mono - this step corrects that so the track stays safe on any playback system.</p>
+             <p>It runs before the high-frequency fill-in, so the measurement reads your real recording rather than synthesised content.</p>
+             <p><strong>It is a blunt tool.</strong> One correlation figure is measured across the whole track and one correction applied to all of it. Real phase problems are usually confined to particular frequencies and particular moments — most often the low end — so a whole-track average can under-correct a genuine bass issue while slightly narrowing a stereo image that was fine. Leave it off unless the correlation reading is actually poor.</p>`,
     },
     tool_multiband_compress: {
       title: "Multiband tonal-balance compression",
       body: `<p>Gently compresses three frequency bands (low/mid/high) somewhat independently, rather than the whole signal at once - a light touch aimed at smoothing out any band that's poking out too far relative to the others, for a more balanced overall tone. Deliberately conservative, not a loudness-maximizing effect.</p>
-             <p><strong>It repeats itself as needed.</strong> The gentle ratio only closes about a quarter of the gap each pass, so a strongly peaky track would need several passes to settle. Rather than asking you to run the file through again, it keeps passing until the measured imbalance stops improving (up to a bounded limit), then reports how many passes it took. A track that is already balanced is left completely untouched.</p>`,
+             <p><strong>One pass, deliberately.</strong> This briefly ran repeatedly until each band measured flat, which sounded like a good idea and was not: the reduction compounds, so nine passes of a 1.3:1 ratio behaves like 10.6:1 — hard limiting on the body of the track rather than gentle levelling. It now runs once, typically moving a band by a decibel or two. A track that is already balanced is left completely untouched.</p>
+             <p>If a band still reads as peaky afterwards, that is honest reporting rather than a failure: evening it out completely would cost more dynamics than the imbalance is worth.</p>`,
     },
     tool_true_peak_limit: {
       title: "True-peak limiter",
       body: `<p>A final safety ceiling at -1dBTP (true-peak decibels, accounting for peaks that can appear between samples after digital-to-analog conversion, not just the samples themselves). This is the last line of defense against clipping/distortion on playback systems that are sensitive to true peaks, like streaming platforms and hardware DACs.</p>
-             <p>It uses real dynamics limiting (pulling down only the moments that actually exceed the ceiling), not a flat volume reduction - so it doesn't quietly undo a loudness target that was already correctly set elsewhere in the chain.</p>`,
+             <p>It uses real dynamics limiting (pulling down only the moments that actually exceed the ceiling), not a flat volume reduction - so it doesn't quietly undo a loudness target that was already correctly set elsewhere in the chain.</p>
+             <p><strong>It looks ahead.</strong> The limiter reads 1.5ms into the future, so the gain is already lowered by the time a peak arrives rather than being yanked down once the peak has started. Reacting late is itself a form of distortion — measured on a clean test tone, adding lookahead cut the limiter's own distortion by 23dB. The lookahead is centred, so nothing is delayed or shifted in time.</p>`,
     },
     cnn_mode: {
       title: "CNN fix mode: Simple vs. Shift-robust vs. Thorough",
@@ -175,14 +181,14 @@
     { id: "dc_offset", group: "chainGroupCleanup", name: "DC offset correction", desc: "Centers the waveform on zero if it's biased up or down.", info: "dc_offset" },
     { id: "fix_transients", group: "chainGroupCleanup", name: "Surgical transient/pop fix", desc: "Finds genuine clicks and pops and bridges across just that moment. Skips sustained bursts like vocal consonants, and its post-chain re-check only corrects anomalies this chain introduced — never sharp edges that were already in your source.", info: "tool_fix_transients" },
     { id: "spectral_revive", group: "chainGroupCleanup", name: "High-frequency fill-in (17kHz+)", desc: "Detects an artificial cutoff (common in lossy encoding or low-quality AI generation) and fills content above it using only this track's own rolloff slope, harmonics, and dynamics - no external reference.", info: "tool_spectral_revive" },
-    { id: "high_pass", group: "chainGroupCleanup", name: "High-pass filter", desc: "Removes inaudible sub-30Hz rumble that eats into headroom.", info: "tool_high_pass" },
+    { id: "high_pass", group: "chainGroupCleanup", name: "High-pass filter", desc: "Removes inaudible sub-30Hz rumble that eats into headroom. Runs early, before anything measures level, so rumble can't inflate the readings the later stages act on.", info: "tool_high_pass" },
     { id: "linear_fix", group: "chainGroupAI", name: "Linear model fix", desc: "Gradient-optimized correction targeting the fakeprint logistic-regression detector.", info: "linear_passes" },
     { id: "cnn_fix", group: "chainGroupAI", name: "CNN model fix", desc: "Shift-robust optimization targeting the CQT-cepstrum CNN detector. Slower.", info: "cnn_passes" },
     { id: "temporal_normalize", group: "chainGroupAI", name: "Temporal pattern denormalization", desc: "Applies a small, smooth, non-uniform timing drift, displacing the low-frequency spectral peaks that fingerprint matching uses as anchors. Off by default.", info: "temporal_normalize" },
-    { id: "fix_phase", group: "chainGroupMaster", name: "Stereo phase correction", desc: "Corrects out-of-phase content that would cancel out in mono playback.", info: "tool_fix_phase" },
+    { id: "fix_phase", group: "chainGroupMaster", name: "Stereo phase correction", desc: "Corrects out-of-phase content that would cancel out in mono playback. Measured before any high-frequency fill-in, so it reads your real recording rather than synthesised content.", info: "tool_fix_phase" },
     { id: "normalize_lufs", group: "chainGroupMaster", name: "LUFS loudness normalization", desc: "Sets integrated loudness. Runs second-to-last, immediately before the limiter, so nothing after it moves the delivered level off target.", info: "lufs" },
-    { id: "multiband_compress", group: "chainGroupMaster", name: "Multiband compression", desc: "Gentle 3-band dynamics smoothing for tonal balance. Repeats itself until the imbalance settles, so a peaky track is handled in one run.", info: "tool_multiband_compress" },
-    { id: "true_peak_limit", group: "chainGroupMaster", name: "True-peak limiter", desc: "Brick-wall safety ceiling at -1dBTP, accounting for inter-sample peaks.", info: "tool_true_peak_limit" },
+    { id: "multiband_compress", group: "chainGroupMaster", name: "Multiband compression", desc: "Gentle 3-band dynamics smoothing for tonal balance. One pass, aiming for a couple of dB at most — enough to even out a band that pokes out, not to squeeze the track.", info: "tool_multiband_compress" },
+    { id: "true_peak_limit", group: "chainGroupMaster", name: "True-peak limiter", desc: "Brick-wall safety ceiling at -1dBTP, accounting for inter-sample peaks. Looks 1.5ms ahead so the gain is already in place when a peak arrives, instead of reacting after it.", info: "tool_true_peak_limit" },
     { id: "fade", group: "chainGroupMaster", name: "Fade in / fade out", desc: "Smooth S-curve fade at the start and end of the track. Runs last, after the limiter, so no later gain stage undoes it.", info: "tool_fade" },
   ];
 

@@ -65,16 +65,15 @@ The processing order is deliberate — see [Why this order](#why-this-order).
 7. **Stereo phase/correlation correction** — checks L/R correlation; if
    negative enough to risk mono-cancellation, blends mid/side to restore
    safety.
-8. **LUFS loudness normalization** — targets -14 LUFS (general
+8. **LUFS loudness normalization** — default -14 LUFS, adjustable -16 to -9 (general
    streaming-platform standard; Apple Music specifically targets -16, most
    others including Spotify/YouTube are closer to -14).
 9. **Multiband compression** — gentle 3-band (low/mid/high) downward
-   compression, conservative settings (ratio 1.3:1, threshold -12dB). That
-   ratio only closes ~23% of the excess per pass, so it repeats until the
-   file's own measured band peakiness stops improving (bounded, and it
-   reports the pass count) rather than asking for a manual re-run. Audio
-   that is already balanced is returned untouched. See
-   [Multiband compressor: how it compares to a real one](#multiband-compressor-how-it-compares-to-a-real-one)
+   compression, conservative settings (ratio 1.3:1, threshold -12dB), ONE
+   pass. It briefly iterated until each band measured flat; that compounds
+   (nine passes of 1.3:1 behaves like 10.6:1) and turned gentle levelling
+   into hard limiting on the body of the track. Runs before loudness is set.
+   See [Multiband compressor: how it compares to a real one](#multiband-compressor-how-it-compares-to-a-real-one)
    for what's simplified here.
 10. **CNN-model AI-detector fix** — shift-robust gradient optimization
     targeting the CQT-cepstrum CNN detector. The recommended mode trains
@@ -102,11 +101,12 @@ The processing order is deliberate — see [Why this order](#why-this-order).
     if later processing erased its safety margin. See [Why this order](#why-this-order).
 15. **Post-chain LUFS drift correction** (automatic, not a separate
     selectable tool) — if `normalize_lufs` was selected, the truly final
-    LUFS is measured after every later stage (multiband compression, both
-    AI-detector fixes, the limiter) and corrected with one direct gain
-    pass if it has drifted more than 0.5dB from target. Re-runs the
-    limiter afterward if it was selected, since a late gain change can push
-    a peak back over ceiling.
+    LUFS is measured after every later stage and corrected if it has
+    drifted more than 0.1dB from target. This is now a safety net rather
+    than the main mechanism: loudness is set second-to-last, so almost
+    nothing remains after it to cause drift. The correction iterates
+    (bounded), because an upward correction forces a re-limit and that
+    re-limiting pulls loudness back down again.
 
 ## Output format
 
