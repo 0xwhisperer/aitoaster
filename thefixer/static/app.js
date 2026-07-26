@@ -947,8 +947,9 @@
   // missing from it sorts last rather than disappearing.
   const CHAIN_RUN_ORDER = [
     "strip_metadata", "trim_silence", "dc_offset", "high_pass",
+    "temporal_normalize",
     "fix_transients", "fix_phase", "spectral_revive",
-    "multiband_compress", "saturate", "temporal_normalize",
+    "multiband_compress", "saturate",
     "linear_fix", "cnn_fix",
     "normalize_lufs", "true_peak_limit", "fade",
   ];

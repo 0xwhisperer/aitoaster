@@ -888,6 +888,12 @@ TOOL_ORDER = [
     # headroom, so anything that measures level while it is still present is
     # measuring the wrong signal. DC offset and high-pass are the cleanup pair.
     "high_pass",
+    # temporal_normalize MOVED UP (was after multiband, just before the
+    # detector fixes). It warps the time axis, so it is a TIMELINE stage even
+    # though it preserves sample count - and applied to a certified signal it
+    # measured +4.87pp (Poster) and +97.05pp (North Star). Every timeline
+    # change must happen before certification; this is the last one.
+    "temporal_normalize",
     "fix_transients",
     # --- tonal/spatial shaping ---
     # fix_phase moved BEFORE spectral_revive: correlation must be measured on
@@ -910,7 +916,6 @@ TOOL_ORDER = [
     # loudness-neutral (measured +0.10 LU at the default drive), which is
     # also why the loudness stage downstream reclaims almost none of it.
     "saturate",
-    "temporal_normalize",
     # Timing changes must precede the position-sensitive detector fixes.
     # Run the cheap/reliable linear solve first and the exact-window CNN
     # solve on that final spectral signal, so Thorough CNN no longer pays
@@ -931,6 +936,70 @@ TOOL_ORDER = [
 # stage after the whole chain (including the post-chain LUFS drift
 # correction), not inside the per-tool loop. See _apply_fade_stage.
 FADE_TOOL = "fade"
+
+
+# ---------------------------------------------------------------------------
+# THE TIMELINE INVARIANT
+#
+# A CNN certification is bound to the exact TIMELINE it was made on. Confirmed
+# in the model itself: CNNDetector.extract_segments derives every analysis
+# window position from len(audio) (`end_offset = len(audio) - skip`, positions
+# spread across `usable`). Change the sample count and every window slides;
+# the correction is still in the file but no longer where the detector looks.
+#
+# Measured, on a CERTIFIED signal:
+#   trail trim 311.5ms      Poster +87.03pp   NorthStar +31.11pp
+#   lead trim 1.4ms         Poster  +0.85pp   NorthStar +99.52pp
+#   pad +10ms at the end    Poster  92.10%
+#   temporal_normalize      Poster  +4.87pp   NorthStar +97.05pp
+#     (^ mutates NO length, but displaces content within the timeline)
+#   zeroing head+tail       EXACTLY 0.0000pp - amplitude only, inert
+#   normalize_lufs          -0.0002 / -0.0029pp
+#   true_peak_limit         -0.0000 / +0.0000pp
+#   fade, watermark         +0.0000 / +0.0000pp - bit-exactly inert
+#   gain +/-3dB             +/-0.0006 / +/-0.013pp
+#
+# So the rule is NOT "certification last" and NOT "nothing may touch the audio
+# afterwards". An earlier draft of this comment said exactly that, and it was
+# wrong in both directions: it would have guarded normalize_lufs and
+# true_peak_limit, which are the two SAFEST stages in the chain, while missing
+# temporal_normalize, which preserves sample count and is one of the most
+# destructive. The real rule is:
+#
+#   FREEZE THE TIMELINE BEFORE CERTIFYING. After that point, amplitude-domain
+#   work is free; anything that changes the sample count or displaces content
+#   within the timeline is forbidden.
+#
+# This is why the corrective trim broke a file certified at 0.003% and
+# delivered it at 78.8%: it cut 1.4ms of lead and 311.5ms of trail. With the
+# timeline frozen it cannot fire at all - measured, trim_silence on certified
+# audio finds only 1.8-12.8ms, which is the fade's own tail.
+#
+# Note the fragility is CHAOTIC, not monotonic (Poster: a 10ms lead trim gives
+# 18.41%, but 100ms gives 0.03%), so a near-miss is not a safe margin. The
+# guard must be structural - assert the length - not a threshold re-score.
+# ---------------------------------------------------------------------------
+
+# Everything that may change the sample count or displace content in time.
+# All of these MUST run before linear_fix/cnn_fix.
+TIMELINE_STAGES = frozenset({
+    "trim_silence",        # cuts lead/trail
+    "temporal_normalize",  # length-preserving, but warps the time axis
+    FADE_TOOL,             # amplitude-only, but its tail creates trimmable silence
+})
+
+# Stages permitted after certification, each measured inert on a certified
+# signal. These are amplitude-domain only - they cannot move a window.
+# The margin the optimizer itself targets (cnn_wholetrack_optimizer_v2's
+# real_target). The model's raw pass/fail bar is 0.5; anything delivered
+# between this and that bar has passed but without the headroom the fix was
+# aiming for, and is reported as such rather than silently called a pass.
+CNN_DELIVERED_MARGIN = 0.08
+
+POST_CERTIFICATION_ALLOWED = frozenset({
+    "normalize_lufs",    # -0.0002 / -0.0029pp
+    "true_peak_limit",   # -0.0000 / +0.0000pp
+})
 
 TOOL_LABELS = {
     "strip_metadata": "Strip metadata & embedded images",
@@ -1072,6 +1141,7 @@ def _tool_status_line(tool, info):
 
 def run_pipeline(job_id, file_id, tools, options, output_name=None, output_format="same", mp3_mode="vbr0"):
     job_started_at = time.time()
+    _certified_length = None
     try:
         path = _find_upload_path(file_id)
         if path is None:
@@ -1431,6 +1501,12 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         # recheck here).
         if "cnn_fix" in tools:
             check_cancelled(job_id)
+            # THE TIMELINE INVARIANT. Every CNN analysis window position
+            # derives from len(audio), so this length IS the certificate.
+            # Asserted again at the encode below. A threshold re-score is not
+            # sufficient: the fragility is chaotic, not monotonic - a 10ms
+            # lead trim measured 18.41% where 100ms measured 0.03%.
+            _certified_length = len(audio)
             cnn_recheck_path = OUTPUT_DIR / f"_cnn_recheck_{uuid.uuid4().hex[:8]}.wav"
             try:
                 save_stereo(cnn_recheck_path, audio, sr)
@@ -1837,82 +1913,28 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         # several times already this session (CNN silence guard, the
         # linear/cnn post-chain rechecks), just one layer further out:
         # right at the final write, not inside an earlier stage.
-        SILENCE_RECHECK_FLOOR_MS = 100
-        if "trim_silence" in tools:
-            _, late_silence_info = chain.trim_silence(audio, sr)
-            late_lead_ms = late_silence_info.get("lead_ms", 0)
-            late_trail_ms = late_silence_info.get("trail_ms", 0)
-            if late_lead_ms > SILENCE_RECHECK_FLOOR_MS or late_trail_ms > SILENCE_RECHECK_FLOOR_MS:
-                check_cancelled(job_id)
-                job_log(job_id, f"  found {late_lead_ms:.1f}ms lead / {late_trail_ms:.1f}ms trail "
-                                 f"silence introduced by later chain stages - running one corrective trim")
-                audio, late_trim_info = chain.trim_silence(audio, sr)
-                job_log(job_id, f"  done (trimmed {late_trim_info.get('lead_ms', 0):.1f}ms lead / "
-                                 f"{late_trim_info.get('trail_ms', 0):.1f}ms trail)")
-                # this late trim can remove MORE leading samples than the
-                # main loop's original trim_silence pass already accounted
-                # for in lead_samples_trimmed - without adding the extra
-                # here too, aligned_original's offset below would drift
-                # out of sync with the actual delivered audio by however
-                # many additional lead samples this late pass removed.
-                lead_samples_trimmed += late_trim_info.get("lead_samples", 0)
-                _, final_silence_check = chain.trim_silence(audio, sr)
-                trim_status = ("pass" if final_silence_check.get("lead_ms", 0) <= SILENCE_RECHECK_FLOOR_MS
-                                and final_silence_check.get("trail_ms", 0) <= SILENCE_RECHECK_FLOOR_MS else "check")
-                job_log(job_id, f"trim_silence: final {trim_status} "
-                                 f"({final_silence_check.get('lead_ms', 0):.1f}ms lead / "
-                                 f"{final_silence_check.get('trail_ms', 0):.1f}ms trail after full chain)")
-
-                # BUG FIX (direct user report, reproduced from their log): this
-                # corrective trim SHIFTS THE TIMELINE, and cnn_fix's correction
-                # is position-sensitive - it is optimised against specific
-                # analysis window positions. Cutting samples off the head and
-                # tail moves every one of those windows, which invalidates the
-                # certification wholesale.
-                #
-                # Measured on a real user run with all tools selected: cnn_fix
-                # certified the file at 0.003% post-chain, this trim then cut
-                # 1.4ms lead / 311.5ms trail, and the DELIVERED file scored
-                # 78.8% - flagged. The post-chain CNN recheck above could not
-                # catch it because that recheck runs BEFORE this trim: the
-                # guard sat upstream of the very mutation it needed to guard.
-                #
-                # Same "certify then mutate with no re-check" class the comment
-                # above already names, one layer further out again. Re-score
-                # here and re-run cnn_fix if the shift broke it, using the same
-                # threshold and margin as the earlier recheck.
-                if "cnn_fix" in tools:
-                    check_cancelled(job_id)
-                    _pt_path = OUTPUT_DIR / f"_cnn_posttrim_{uuid.uuid4().hex[:8]}.wav"
-                    try:
-                        save_stereo(_pt_path, audio, sr)
-                        _pt_score = scorer.cnn.predict(str(_pt_path))["probability"]
-                        job_log(job_id, f"  post-trim cnn score: {_pt_score * 100:.3f}%")
-                        if _pt_score >= 0.08 + CNN_RECHECK_MARGIN:
-                            job_log(job_id, "  the corrective trim shifted the timeline and "
-                                            "invalidated the CNN fix - re-running it on the "
-                                            "trimmed signal")
-                            job_set_step(job_id, None, None, "CNN re-verification after trim")
-                            from .cnn_fix import fix_cnn
-                            _t0 = time.time()
-                            _before = audio.copy()
-                            _mode = options.get("cnn_mode", "thorough")
-                            if _mode not in ("simple", "eot", "thorough"):
-                                _mode = "thorough"
-                            audio, _ = fix_cnn(
-                                audio, sr,
-                                max_steps=options.get("cnn_max_steps", 300),
-                                min_steps=options.get("cnn_min_steps", 100),
-                                hop_sec=options.get("cnn_hop_sec", 0.5),
-                                progress_cb=_cancel_aware_log,
-                                mode=_mode,
-                            )
-                            _record_detector_overlay("cnn", _before, audio)
-                            job_log(job_id, f"  done ({time.time() - _t0:.2f}s)")
-                    finally:
-                        _pt_path.unlink(missing_ok=True)
-            else:
-                job_log(job_id, f"trim_silence: final pass ({late_lead_ms:.1f}ms lead / {late_trail_ms:.1f}ms trail after full chain)")
+        # THE SECOND TRIM IS GONE, deliberately.
+        #
+        # There used to be a corrective trim_silence here, added on the theory
+        # that later chain stages might introduce new silence worth removing.
+        # It never had a real job. It runs after the fade, and a 3000ms
+        # fade-out ends in silence BY DESIGN - so the only thing it ever found
+        # was the fade's own tail, and it deleted it.
+        #
+        # That is what shipped a file certified at 0.003% as 78.8%: it cut
+        # 1.4ms of lead and 311.5ms of trail, and because every CNN analysis
+        # window position derives from len(audio), sliding the length slid
+        # every window out from under the correction.
+        #
+        # Measured across real runs, the silence this check finds on a
+        # finished file is 1.8-12.8ms, all of it the fade. No stage in this
+        # chain adds meaningful silence: trim_silence runs once, at step 2,
+        # and the length is fixed from that point forward. If a few
+        # milliseconds of fade tail survive to the delivered file, that is
+        # correct - it is the fade the user asked for.
+        #
+        # Do not add this back. If a future stage genuinely introduces
+        # silence, fix that stage; do not trim underneath a certificate.
 
         transients_after = chain.detect_transients(audio, sr)
         late_transients_fixed = []
@@ -1930,7 +1952,26 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                 job_log(job_id, f"  skipped {n_skipped} pre-existing anomal"
                                  f"{'y' if n_skipped == 1 else 'ies'} already present in the "
                                  f"source (not introduced by this chain)")
-            if transients_after:
+            _timeline_is_certified = ("cnn_fix" in tools
+                                      and _certified_length is not None)
+            if transients_after and _timeline_is_certified:
+                # Same reasoning as the corrective trim above. fix_transient
+                # repairs by interpolating ACROSS a discontinuity, which
+                # rewrites a region of samples - and this pass runs after
+                # cnn_fix has certified. It cannot be made safe by re-checking.
+                #
+                # It also has a bad history in its own right: this exact pass
+                # was "deleting vocal consonants" (see the comment at the top
+                # of filter_chain_created_transients), which is what produced
+                # the reported blown-out "t" sounds in a vocal. It now only
+                # ever runs on an uncertified timeline.
+                job_log(job_id, f"fix_transients: final pass skipped - "
+                                f"{len(transients_after)} anomal"
+                                f"{'y' if len(transients_after) == 1 else 'ies'} detected, but "
+                                f"the timeline is certified by the CNN fix and repairing "
+                                f"would rewrite samples underneath it")
+                transients_after = []
+            elif transients_after:
                 check_cancelled(job_id)
                 job_log(job_id, f"  found {len(transients_after)} new anomal{'y' if len(transients_after) == 1 else 'ies'} "
                                  f"introduced by later chain stages - running one corrective pass")
@@ -2069,6 +2110,15 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
             output_format, path, tools)
         if format_fallback_warning:
             job_log(job_id, f"NOTE: {format_fallback_warning}")
+        if "cnn_fix" in tools and _certified_length is not None and len(audio) != _certified_length:
+            raise RuntimeError(
+                f"CERTIFIED TIMELINE CHANGED: certified on {_certified_length} "
+                f"samples, about to write {len(audio)} ({len(audio) - _certified_length:+d}). "
+                f"Every CNN analysis window position derives from the length, so this "
+                f"certificate no longer describes the delivered audio. A stage after "
+                f"cnn_fix changed the timeline; it must run before certification."
+            )
+
         job_log(job_id, f"saving output file (format: {resolved_format})")
         save_t0 = time.time()
         out_path = encode_final_output(audio, sr, resolved_format, OUTPUT_DIR / out_id, mp3_mode=mp3_mode)
@@ -2117,6 +2167,31 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
             if not scores_after["passes_cnn"]:
                 failing.append(f"cnn={scores_after['cnn_pct']:.1f}%")
             job_log(job_id, f"WARNING: final file still flagged by at least one model ({', '.join(failing)})")
+
+        # CERTIFICATION IS THE SCORE ON THE DELIVERED BYTES, AND IT MUST HAVE
+        # A MARGIN. scores_after already reads the real encoded output at
+        # out_path rather than a pre-encode proxy, which is right - but a
+        # score that merely scrapes under the bar is not a certificate.
+        #
+        # The optimizer targets real_target=0.08 while the pass bar is 0.5, so
+        # a delivered file sitting between them has technically "passed" while
+        # having almost none of the headroom the optimizer was aiming for. And
+        # the sensitivity here is chaotic rather than monotonic - measured, a
+        # 10ms trim moved one track to 18.41% while a 100ms trim left it at
+        # 0.03% - so "just under 0.5" carries no guarantee that a trivial
+        # downstream difference (a different decoder, a re-encode) stays under.
+        #
+        # So: warn explicitly whenever the delivered file passes without the
+        # margin the optimizer was targeting. This is a report, not a silent
+        # pass, and it is the difference between "we checked" and "we
+        # certified".
+        elif scores_after["cnn"]["probability"] >= CNN_DELIVERED_MARGIN:
+            job_log(job_id,
+                    f"NOTE: delivered file passes but with little margin "
+                    f"(cnn={scores_after['cnn_pct']:.3f}%, bar is 50%, the "
+                    f"optimizer targets {CNN_DELIVERED_MARGIN * 100:.0f}%) - "
+                    f"it is certified, but a re-encode or a different decoder "
+                    f"could move it")
 
         # BUG FIX (fourth adversarial audit round, verified directly):
         # scores_after was already correctly fixed (earlier this session)
