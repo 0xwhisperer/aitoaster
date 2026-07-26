@@ -159,3 +159,99 @@ class ExecutionOrderIsSingleSourced(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeliveredCertificationIsDenseTests(unittest.TestCase):
+    """The delivered file must be scanned in full, not at five positions.
+
+    scorer.score() samples 5 window positions derived from len(audio). That
+    is the right instrument for "is this track AI-generated?" and the wrong
+    one for "is this delivered file certified?": measured on a real delivered
+    file the fixed-5 median read 0.00112% while a dense scan found 0.12442%
+    at 95.0s - a 111x under-report, because the worst window fell between two
+    sampled positions. On another track the gap reached 19x against the
+    fixed-5 WORST.
+    """
+
+    def test_the_detector_can_scan_densely(self):
+        from app.detector import CNNDetector
+        self.assertTrue(
+            hasattr(CNNDetector, "scan_dense"),
+            "CNNDetector.scan_dense is gone - delivered certification would "
+            "fall back to five fixed positions",
+        )
+
+    def test_the_pipeline_scans_the_delivered_file_densely(self):
+        src = inspect.getsource(server.run_pipeline)
+        self.assertIn(
+            "scan_dense", src,
+            "run_pipeline no longer scans the delivered file densely; a "
+            "worst window between two sampled positions would go unreported",
+        )
+        self.assertIn(
+            "delivered-file dense scan", src,
+            "the dense scan result is not reported to the user",
+        )
+
+
+class FadesAreNotTrimmedTests(unittest.TestCase):
+    """trim_silence must not delete a fade, whoever calls it.
+
+    Its threshold is -66dBFS, not digital zero, so the tail of a fade-out
+    reads as silence: measured, a 3-second fade-out passed straight in lost
+    61ms (2458 samples). Making only the RECOMMENDER fade-aware left the tool
+    itself still doing it.
+    """
+
+    SR = 44100
+
+    def _faded_tone(self, seconds=10.0, fade_sec=3.0):
+        n = int(seconds * self.SR)
+        t = np.arange(n) / self.SR
+        sig = (0.5 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+        env = np.ones(n, dtype=np.float32)
+        f = int(fade_sec * self.SR)
+        env[-f:] = np.cos(np.linspace(0, np.pi / 2, f)) ** 2
+        mono = (sig * env).astype(np.float32)
+        return np.stack([mono, mono], axis=1)
+
+    def test_a_fade_out_is_not_trimmed(self):
+        from app import chain
+        audio = self._faded_tone()
+        out, info = chain.trim_silence(audio, self.SR)
+        self.assertEqual(
+            len(out), len(audio),
+            f"{len(audio) - len(out)} samples were cut off a deliberate "
+            "3-second fade-out",
+        )
+        self.assertTrue(info.get("fade_protected"))
+
+    def test_real_silence_is_still_trimmed(self):
+        """The protection must not disable the tool."""
+        from app import chain
+        n = int(2.0 * self.SR)
+        t = np.arange(n) / self.SR
+        tone = (0.5 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+        pad = np.zeros(self.SR, dtype=np.float32)
+        mono = np.concatenate([pad, tone, pad]).astype(np.float32)
+        audio = np.stack([mono, mono], axis=1)
+        out, info = chain.trim_silence(audio, self.SR)
+        self.assertTrue(info["applied"], "flat digital silence was not trimmed")
+        self.assertLess(len(out), len(audio))
+        self.assertGreater(info["lead_ms"], 900)
+
+    def test_the_helper_separates_a_fade_from_flat_silence(self):
+        from app import chain
+        audio = self._faded_tone()
+        self.assertTrue(
+            chain._tail_is_decaying(audio, int(3.0 * self.SR)),
+            "a real fade was not recognised as decaying",
+        )
+        flat = np.zeros((int(3.0 * self.SR), 2), dtype=np.float32)
+        tone = np.stack([np.full(self.SR, 0.5, dtype=np.float32)] * 2, axis=1)
+        silent_tail = np.concatenate([tone, flat]).astype(np.float32)
+        self.assertFalse(
+            chain._tail_is_decaying(silent_tail, int(3.0 * self.SR)),
+            "flat digital silence was mistaken for a fade - real silence "
+            "would stop being trimmed",
+        )

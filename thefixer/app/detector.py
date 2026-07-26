@@ -207,6 +207,40 @@ class CNNDetector:
         probs = 1 / (1 + np.exp(-output[:, 0]))
         return probs.tolist()
 
+    def scan_dense(self, path, hop_ratio=0.5, batch=16):
+        """Score EVERY window across the track, not five fixed positions.
+
+        predict() samples 5 positions derived from len(audio), which answers
+        "is this track AI-generated?" - the question this detector exists
+        for. It is the wrong instrument for "is this delivered file
+        certified?": measured on a real delivered file, the fixed-5 median
+        read 0.00112% while a dense scan found 0.12442% at 95.0s, a window
+        that falls between two of the five sampled positions. That is a 111x
+        under-report, and on another track the gap reached 19x against the
+        fixed-5 WORST.
+
+        Returns (worst_prob, worst_position_sec, all_probs).
+        """
+        audio = load_audio_mono(path, self.sample_rate)
+        seg = self.segment_samples
+        if len(audio) <= seg:
+            probs = self.predict_cepstrum_batch([self.extract_cqt_cepstrum(
+                np.pad(audio, (0, max(0, seg - len(audio))))[:seg])])
+            return float(max(probs)), 0.0, probs
+        hop = max(1, int(seg * hop_ratio))
+        starts = list(range(0, len(audio) - seg, hop))
+        if not starts:
+            starts = [0]
+        probs = []
+        for i in range(0, len(starts), batch):
+            cepstra = [self.extract_cqt_cepstrum(audio[st:st + seg])
+                       for st in starts[i:i + batch]]
+            probs.extend(self.predict_cepstrum_batch(cepstra))
+        worst_i = int(np.argmax(probs))
+        return (float(probs[worst_i]),
+                starts[worst_i] / float(self.sample_rate),
+                probs)
+
     def predict(self, path, n_segments=5):
         audio = load_audio_mono(path, self.sample_rate)
         segments, positions = self.extract_segments(audio, n_segments)

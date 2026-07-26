@@ -128,9 +128,43 @@ def apply_fade(audio, sr, fade_in_ms=10, fade_out_ms=3000):
     }
 
 
-def trim_silence(audio, sr, threshold=0.0005, pad_ms=5):
+def _tail_is_decaying(audio, trail_samples, drop_db=6.0):
+    """True when the trailing region fades rather than being flat silence.
+
+    A fade-out ends below this function's own -66dBFS threshold, so without
+    this check trim_silence deletes the end of a deliberate fade: measured, a
+    3-second fade-out passed straight in lost 61ms (2458 samples). That is
+    not silence to remove, it is the shape the user asked for - and after the
+    detector fixes have certified a timeline, removing it also invalidates
+    the certification, since every CNN analysis window position derives from
+    len(audio).
+
+    Genuine trailing silence is flat at the noise floor; a fade keeps falling
+    across its whole length. Comparing the first and last thirds of the
+    region separates them.
+    """
+    if trail_samples <= 0:
+        return False
+    mono = audio.mean(axis=1) if audio.ndim > 1 else audio
+    n = int(min(trail_samples, len(mono)))
+    if n < 32:
+        return False
+    tail = mono[-n:].astype(np.float64)
+    third = max(1, n // 3)
+    first = 20 * np.log10(np.sqrt((tail[:third] ** 2).mean()) + 1e-12)
+    last = 20 * np.log10(np.sqrt((tail[-third:] ** 2).mean()) + 1e-12)
+    return (first - last) > drop_db
+
+
+def trim_silence(audio, sr, threshold=0.0005, pad_ms=5, protect_fades=True):
     """Trim leading/trailing near-silence. threshold is linear amplitude;
-    default catches true digital silence plus low-level noise floor dither."""
+    default catches true digital silence plus low-level noise floor dither.
+
+    A DECAYING tail is treated as a fade and left alone (protect_fades). The
+    threshold here is -66dBFS, not digital zero, so the tail of a fade-out
+    reads as silence to it - and cutting it both deletes the fade the user
+    asked for and, post-certification, shifts every CNN analysis window.
+    """
     mono_abs = np.abs(audio).max(axis=1)
     n = len(audio)
     above = mono_abs > threshold
@@ -145,14 +179,26 @@ def trim_silence(audio, sr, threshold=0.0005, pad_ms=5):
     lead_idx = max(0, lead_idx - pad)
     trail_idx = min(n, trail_idx + pad)
 
+    # Do not cut a fade. See _tail_is_decaying: the -66dBFS threshold above
+    # reads the tail of a fade-out as silence, so without this a deliberate
+    # 3-second fade lost 61ms.
+    fade_protected = False
+    if protect_fades and trail_idx < n and _tail_is_decaying(audio, n - trail_idx):
+        trail_idx = n
+        fade_protected = True
+
     if lead_idx == 0 and trail_idx == n:
-        return audio, {"applied": False, "lead_ms": 0, "trail_ms": 0}
+        return audio, {"applied": False, "lead_ms": 0, "trail_ms": 0,
+                       "fade_protected": fade_protected,
+                       **({"reason": "trailing region is a fade, not silence"}
+                          if fade_protected else {})}
 
     trimmed = audio[lead_idx:trail_idx]
     return trimmed, {
         "applied": True,
+        "fade_protected": fade_protected,
         "lead_ms": round(lead_idx / sr * 1000, 1),
-        "trail_ms": round(trail_from_end / sr * 1000, 1),
+        "trail_ms": round((n - trail_idx) / sr * 1000, 1),
         "lead_samples": lead_idx,
         "samples_removed": n - len(trimmed),
     }

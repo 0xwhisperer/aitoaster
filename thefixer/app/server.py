@@ -2352,7 +2352,38 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         # margin the optimizer was targeting. This is a report, not a silent
         # pass, and it is the difference between "we checked" and "we
         # certified".
-        elif not scores_after.get("passes_cnn_worst", True):
+        # DENSE CERTIFICATION OF THE DELIVERED BYTES. scorer.score() samples
+        # five fixed positions derived from len(audio); a dense scan of every
+        # window found 0.12442% at 95.0s on a file the fixed-5 reported as
+        # 0.00112%, a 111x under-report, because the worst window fell
+        # between two sampled positions. Certification has to measure what it
+        # claims to, so the delivered file is scanned in full.
+        if "cnn_fix" in tools:
+            try:
+                dense_worst, dense_at, dense_all = scorer.cnn.scan_dense(
+                    str(scoring_wav_path))
+                scores_after["cnn_dense_worst_pct"] = dense_worst * 100
+                scores_after["cnn_dense_windows"] = len(dense_all)
+                scores_after["passes_cnn_dense"] = dense_worst < 0.5
+                job_log(job_id,
+                        f"  delivered-file dense scan: {len(dense_all)} windows, "
+                        f"worst {dense_worst * 100:.4f}% at {dense_at:.1f}s")
+                if dense_worst >= 0.5:
+                    job_log(job_id,
+                            f"WARNING: the delivered file has a window at "
+                            f"{dense_at:.1f}s scoring {dense_worst * 100:.1f}% - "
+                            f"the five-position score did not sample it")
+                elif dense_worst >= CNN_DELIVERED_MARGIN:
+                    job_log(job_id,
+                            f"NOTE: worst delivered window is "
+                            f"{dense_worst * 100:.3f}% at {dense_at:.1f}s, above "
+                            f"the {CNN_DELIVERED_MARGIN * 100:.0f}% the optimizer "
+                            f"targets - it passes the 50% bar with less margin "
+                            f"than the fix aimed for")
+            except Exception as exc:
+                job_log(job_id, f"  (dense delivered scan unavailable: {exc})")
+
+        if not scores_after.get("passes_cnn_worst", True):
             worst = scores_after.get("cnn_worst_pct", 0.0)
             job_log(job_id,
                     f"WARNING: the delivered file passes on the median window "
