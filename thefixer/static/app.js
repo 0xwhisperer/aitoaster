@@ -145,6 +145,15 @@
              <p><strong>Where it runs:</strong> after multiband compression, before the AI-detector fixes. That order matters \u2014 saturating after those fixes partially undoes the correction they just computed, measured by actually running it that way, the delivered file scored 99.997% on the CNN detector instead of about 0.2% \u2014 it destroys the correction rather than merely denting it.</p>
              <p><strong>Skipped</strong> on tracks under 2 seconds or quieter than -60dBFS, where the level measurement it depends on is not reliable.</p>`,
     },
+    tool_tonal_cleanup: {
+      title: "Tonal cleanup (boxiness / harshness)",
+      body: `<p>Looks at exactly two places where mixes commonly go wrong regardless of genre: <strong>boxiness around 250Hz</strong> and <strong>harshness around 3.15kHz</strong>. If either is ringing, it gets a gentle cut of at most 1.5dB. Otherwise nothing happens \u2014 and on a finished master, nothing happening is the normal outcome. Both test tracks used to develop this get no correction at all.</p>
+             <p><strong>How it tells a resonance from the music.</strong> This is the hard part, and five different approaches failed before this one. A resonance rings whenever <em>anything</em> excites it, so it sits above the surrounding spectrum even in its quietest moments. A bass note is loud while it plays and gone the rest of the time. So the track is measured frame by frame, and the tool looks at the <em>quietest tenth</em> of those frames: high there means it is always ringing; low means it was just the music.</p>
+             <p>The earlier version that measured a whole-track average could not tell the difference at all \u2014 it cut a bass note sitting 26dB below the noise floor while ignoring a real 7dB resonance. On a time-averaged spectrum a bass line and a room mode look identical.</p>
+             <p><strong>It also refuses to cut a slope.</strong> A steep filter rolloff can look like a peak to a curve-fit. Any region where the spectrum is simply falling steeply through it is skipped, and if too much of the track looks that way, the whole region is left alone rather than guessed at.</p>
+             <p><strong>Only the excess is corrected</strong>, capped at 1.5dB. A mild resonance gets a mild cut. It never boosts, and it never applies a fixed tonal curve.</p>
+             <p><strong>Needs at least 30 seconds</strong> of audio to measure reliably; shorter files are skipped and the log says so.</p>`,
+    },
     tool_multiband_compress: {
       title: "Multiband tonal-balance compression",
       body: `<p>Gently compresses four frequency bands independently, rather than the whole signal at once - a light touch aimed at smoothing out any band that's poking out too far relative to the others, for a more balanced overall tone. Deliberately conservative, not a loudness-maximizing effect.</p>
@@ -205,6 +214,7 @@
     { id: "temporal_normalize", group: "chainGroupCleanup", name: "Temporal pattern denormalization", desc: "Applies a small, smooth, non-uniform timing drift, displacing the low-frequency spectral peaks that fingerprint matching uses as anchors. Off by default.", info: "temporal_normalize" },
     { id: "fix_phase", group: "chainGroupMaster", name: "Stereo field: bass mono & phase", desc: "Sums bass below 120Hz to mono and repairs phase in the 120-300Hz band, leaving your stereo image above that completely untouched. Measured before any high-frequency fill-in, so it reads your real recording.", info: "tool_fix_phase" },
     { id: "normalize_lufs", group: "chainGroupDelivery", name: "LUFS loudness normalization", desc: "Sets integrated loudness. Runs second-to-last, immediately before the limiter, so nothing after it moves the delivered level off target.", info: "lufs" },
+    { id: "tonal_cleanup", group: "chainGroupMaster", name: "Tonal cleanup (boxiness / harshness)", desc: "Checks two spots \u2014 250Hz boxiness and 3.15kHz harshness \u2014 and cuts only if one rings persistently, meaning it is above the surrounding spectrum even in its quietest moments. That is what separates a room resonance from a bass note: a note is only there while it plays. Cut only, 1.5dB maximum, never boosts. Most finished masters get nothing.", info: "tool_tonal_cleanup" },
     { id: "multiband_compress", group: "chainGroupMaster", name: "Multiband compression (4-band)", desc: "Gentle 4-band dynamics smoothing for tonal balance, with vocal presence on its own control so it never gets ducked by cymbals. One pass, a couple of dB at most.", info: "tool_multiband_compress" },
     { id: "saturate", group: "chainGroupMaster", name: "Saturation (harmonic colour)", desc: "Adds odd-order harmonic distortion with a tanh curve, 4x oversampled so the harmonics don't fold back as aliasing. Output level is matched to input, so it changes peak density rather than loudness. Off by default.", info: "tool_saturate" },
     { id: "true_peak_limit", group: "chainGroupDelivery", name: "True-peak limiter", desc: "Brick-wall safety ceiling at -1dBTP, accounting for inter-sample peaks. Looks 1.5ms ahead so the gain is already in place when a peak arrives, instead of reacting after it.", info: "tool_true_peak_limit" },
@@ -949,7 +959,7 @@
     "strip_metadata", "trim_silence", "dc_offset", "high_pass",
     "temporal_normalize",
     "fix_transients", "fix_phase", "spectral_revive",
-    "multiband_compress", "saturate",
+    "tonal_cleanup", "multiband_compress", "saturate",
     "linear_fix", "cnn_fix",
     "normalize_lufs", "true_peak_limit", "fade",
   ];

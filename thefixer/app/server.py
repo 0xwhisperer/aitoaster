@@ -900,6 +900,13 @@ TOOL_ORDER = [
     # real recorded content, not on synthesised HF.
     "fix_phase",
     "spectral_revive",
+    # tonal_cleanup sits AFTER spectral_revive (revive fits its own rolloff
+    # slope from 3kHz upward; correcting at 3.15kHz first would corrupt that
+    # fit) and BEFORE the dynamics, so the compressor reacts to a corrected
+    # spectrum rather than to a resonance. Cut-only and never a shelf, so it
+    # cannot re-boost what high_pass removed. Well before the detector fixes,
+    # so the certification covers whatever it did.
+    "tonal_cleanup",
     # --- dynamics at working level, BEFORE loudness is set ---
     "multiband_compress",
     # saturation runs AFTER multiband so the compressor's envelope detector
@@ -1014,6 +1021,7 @@ TOOL_LABELS = {
     "fix_phase": "Stereo phase/correlation correction",
     "normalize_lufs": "LUFS loudness normalization",
     "multiband_compress": "Multiband tonal-balance compression",
+    "tonal_cleanup": "Tonal cleanup (boxiness / harshness)",
     "saturate": "Saturation (harmonic colour)",
     "true_peak_limit": "True-peak limiter",
     "fade": "Fade in / fade out",
@@ -1067,6 +1075,26 @@ def _tool_status_line(tool, info):
         cutoff = info.get("cutoff_hz")
         slope = info.get("fitted_rolloff_db_per_octave")
         return f"pass (filled above {cutoff / 1000:.0f}kHz, fitted rolloff {slope:.1f}dB/octave)" if cutoff and slope is not None else "pass (applied)"
+
+    if tool == "tonal_cleanup":
+        bands = info.get("bands") or []
+        if not applied:
+            skipped = [b for b in bands if b.get("skipped")]
+            if skipped:
+                return ("pass (nothing to correct; "
+                        + ", ".join(f"{b['label']} reads as a spectral slope"
+                                    for b in skipped) + ")")
+            scored = [b for b in bands if b.get("persistent_db") is not None]
+            if scored:
+                w = max(scored, key=lambda b: b["persistent_db"])
+                return (f"pass (nothing rings persistently; closest was "
+                        f"{w['label']} at {w['persistent_db']:+.1f}dB against "
+                        f"a {w['trigger_db']:+.1f}dB bar)")
+            return "pass (nothing to correct)"
+        cuts = [b for b in bands if b.get("cut_db", 0) < 0]
+        return "pass (cut " + ", ".join(
+            f"{b['label']} {b['cut_db']:.2f}dB at {b['freq_hz']:.0f}Hz"
+            for b in cuts) + ")"
 
     if tool == "saturate":
         if not applied:
@@ -1241,6 +1269,8 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                     audio, tinfo = chain.fix_transient(audio, sr, t["time_sec"],
                                                          target_peak=options.get("transient_target_peak"))
                     info["details"].append(tinfo)
+            elif tool == "tonal_cleanup":
+                audio, info = chain.tonal_cleanup(audio, sr)
             elif tool == "saturate":
                 audio, info = chain.saturate(
                     audio, sr, amount=options.get("saturation_amount", "medium"))

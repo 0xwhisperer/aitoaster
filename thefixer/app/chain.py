@@ -1836,12 +1836,41 @@ def detect_spectral_rolloff(audio, sr, cutoff_hz=17000.0):
 
 
 # --------------------------------------------------------------- tonal cleanup
-TONAL_REGIONS = ((250.0, "boxiness"), (3150.0, "harshness"))
+# (centre_hz, label, trigger_db). The trigger is PER BAND because the noise
+# floor of the p10 statistic differs by band: the analysis window holds far
+# more cycles at 3150Hz than at 250Hz, so the frame-to-frame spread is much
+# smaller up there. Measured across 5 noise seeds with NO resonance present:
+#     250Hz   p10 floor -3.43 to -3.83     a real +7dB resonance reads -0.88
+#    3150Hz   p10 floor -0.61 to -0.77     a real +7dB resonance reads +2.03
+# Each trigger sits ~1.3dB above its own floor, which is roughly halfway to
+# the resonance case. A single global trigger cut pure noise by 1.33dB in the
+# harshness band while missing real resonances in the boxiness band.
+TONAL_REGIONS = (
+    (250.0, "boxiness", -2.0),
+    (3150.0, "harshness", 0.6),
+)
 TONAL_Q = 1.4
-TONAL_TRIGGER_DB = 3.0        # excess over the local spectral trend
-TONAL_OCCUPANCY = 0.80        # fraction of active frames that must show it
+# Triggers are per-band, in TONAL_REGIONS above. They are NEGATIVE at 250Hz
+# because p10 is the quietest decile, not the average - even a genuine
+# resonance dips below its own local trend in some frames.
+TONAL_PERSISTENCE_PCT = 10.0  # percentile of per-frame excess: the "even at its
+                              # quietest" floor. A resonance rings in every frame;
+                              # a note only while it plays.
 TONAL_MAX_CUT_DB = 1.5
 TONAL_MIN_DURATION_SEC = 30.0
+# How lopsided the shoulders on either side of a region may be before it is
+# treated as a filter skirt rather than a resonance. Measured on the 3150Hz
+# band: pure noise and a real resonance both sit well under 6dB of shoulder
+# tilt, while a 4th-order lowpass at 2kHz produces far more.
+TONAL_MAX_SHOULDER_TILT_DB = 12.0
+# How many frames must SURVIVE the skirt veto before the p10 statistic is
+# trustworthy. Measured: a real resonance keeps 100% of its frames, a fully
+# vetoed skirt keeps 0% - but the awkward cases in between keep 19% (a
+# 2nd-order lowpass) and 65% (an 8th-order highpass), and on that biased
+# remnant the p10 rises above the trigger and draws a cut on material with
+# no resonance at all. Below this fraction there is no reliable sample left
+# to judge, so the region is skipped rather than guessed at.
+TONAL_MIN_USABLE_FRAMES = 0.85
 TONAL_FRAME_SEC = 0.20
 
 
@@ -1934,32 +1963,79 @@ def _frame_excess_db(audio, sr, freq_hz, q, frame_sec=TONAL_FRAME_SEC):
     # bell, flexible enough to follow real spectral tilt and its curvature
     coeffs = np.polyfit(x, y.T, 2)
     baseline = np.polyval(coeffs, np.log2(freq_hz))
+
+    # MONOTONICITY VETO. A quadratic cannot follow a filter knee: on an
+    # 8th-order lowpass at 2kHz the fit undershoots so badly that the 3150Hz
+    # region reads p10 = 16.73dB - HIGHER than a genuine +7dB resonance
+    # (2.03dB). No threshold on the excess alone can separate them, because
+    # the skirt scores higher than the thing being looked for.
+    #
+    # But a skirt is MONOTONIC: the spectrum falls steadily across the whole
+    # probe span. A resonance is a local peak - the probes below it rise
+    # toward it and the probes above it fall away. So compare the mean of the
+    # lower probes against the mean of the upper probes: if the region sits on
+    # a steep one-way slope rather than on a bump, veto it.
+    n_side = len(probe_sels) // 2
+    lo_probes = np.array([v for _, v in probe_sels[:n_side]])
+    hi_probes = np.array([v for _, v in probe_sels[n_side:]])
+    if len(lo_probes) and len(hi_probes):
+        lo_mean = y[:, :n_side].mean(axis=1)
+        hi_mean = y[:, n_side:].mean(axis=1)
+        # a genuine resonance has roughly balanced shoulders; a skirt has one
+        # shoulder far above the other
+        tilt = np.abs(lo_mean - hi_mean)
+        steep = tilt > TONAL_MAX_SHOULDER_TILT_DB
+        # EXCLUDE the skirt-like frames from the statistic rather than
+        # scoring them hugely negative. An earlier version set them to -99
+        # and then took the p10 across ALL frames, so on real music - where
+        # 15.5% of frames legitimately look skirt-like - those -99s dragged
+        # the percentile to -99 and vetoed the whole band. The right
+        # treatment is "this frame carries no information about a
+        # resonance", i.e. drop it, and judge on the frames that remain.
+        return here - baseline, active & ~steep
     return here - baseline, active
 
 
 def tonal_cleanup(audio, sr, regions=TONAL_REGIONS, q=TONAL_Q,
-                  trigger_db=TONAL_TRIGGER_DB, occupancy=TONAL_OCCUPANCY,
                   max_cut_db=TONAL_MAX_CUT_DB,
                   min_duration_sec=TONAL_MIN_DURATION_SEC):
-    """Cut-only correction of two problem regions, gated on TIME not average.
+    """Cut-only correction of two problem regions, gated on PERSISTENCE.
 
     Corrects boxiness (250Hz) and harshness (3.15kHz) only where the excess
-    is PERSISTENT - present in at least `occupancy` of the frames that have
-    any energy. That is what separates a resonance from the music: a room
-    mode or a mic resonance rings whenever anything excites it; a bass note
-    or a vocal formant is only there while it is being played.
+    over the local spectral trend is present in nearly EVERY frame - measured
+    as the 10th percentile of the per-frame excess. That is the property that
+    separates a resonance from music, and it took four failed detectors to
+    find it:
 
-    Deliberately NOT a target-matching EQ, and not a full-track average.
-    Both were built and measured, and both failed - see _frame_excess_db for
-    the average's failure, and for the target-matching version: it homogenised
-    two unrelated finished masters (spectral distance 4.10dB -> 2.06dB), its
-    own +/-2dB ceiling saturated in 20 of 25 bands, and the "deviations" it
-    wanted to correct sat within 2 cents of equal temperament - the songs'
-    own tonics.
+      1. Whole-track average excess. Fired on sustained notes and missed real
+         resonances - on a full-track average a narrowband detector cannot
+         tell a room mode from a bass line, because both are narrowband
+         energy.
+      2. Per-frame OCCUPANCY above a threshold. Better, but the frame-to-
+         frame measurement noise on plain pink noise has a standard deviation
+         of 3.39dB - as large as the resonance being looked for - so a real
+         +7dB resonance and a sustained note both scored ~0.57 occupancy and
+         were indistinguishable.
+      3/4. Sideband mean and log-linear interpolation for the baseline: both
+         invented resonances on steep filter skirts (a 2kHz lowpass with no
+         resonance at all read +7.18dB and drew a full cut).
 
-    Only the excess beyond the trigger is corrected, capped, so a region 3.4dB
-    over gets 0.4dB of cut rather than being dragged flat. There are no boosts
-    anywhere: every headroom and homogenisation problem measured during the
+    The 10th percentile works because of what each thing IS in time:
+
+        signal                    median    p10     IQR
+        pink noise, no resonance    0.51   -3.83   4.75
+        REAL +7dB resonance         3.42   -0.88   4.73
+        intermittent bass note      1.68   -3.34   6.95
+        4th-order lowpass skirt     0.49   -3.83   4.72
+
+    A resonance rings whenever ANY content excites it, so even its quietest
+    frames sit above the local trend - p10 is high. A note is loud while
+    played and gone otherwise, so its p90 is high but its p10 collapses and
+    its spread is wide. A filter skirt is not a local peak at all, so the
+    quadratic baseline follows it and everything reads near zero.
+
+    Cut-only, and only the excess beyond the trigger, capped. There are no
+    boosts: every headroom and homogenisation problem measured during this
     design came from boosting.
     """
     from scipy import signal as _sig
@@ -1971,38 +2047,54 @@ def tonal_cleanup(audio, sr, regions=TONAL_REGIONS, q=TONAL_Q,
                                  f"{min_duration_sec:.0f}s"}
 
     bands, sos_list = [], []
-    for freq_hz, label in regions:
+    for freq_hz, label, trigger_db in regions:
         if freq_hz >= sr / 2:
             continue
         excess, active = _frame_excess_db(audio, sr, freq_hz, q)
         if excess is None or active is None or not active.any():
             continue
-        over = excess[active] > trigger_db
-        occ = float(over.mean())
-        # the level to correct: how far over it sits when it IS over, taken
-        # as a low percentile so one loud frame cannot set the cut
-        persistent_excess = (float(np.percentile(excess[active][over], 25))
-                             if over.any() else float(excess[active].max()))
+        usable = float(active.mean())
+        if usable < TONAL_MIN_USABLE_FRAMES:
+            # Too much of this region looks like a filter skirt for the
+            # remaining frames to be a fair sample of it.
+            bands.append({
+                "freq_hz": freq_hz, "label": label, "trigger_db": trigger_db,
+                "usable_frames": round(usable, 3),
+                "persistent_db": None, "spread_db": None, "median_db": None,
+                "cut_db": 0.0,
+                "skipped": "region reads as a filter slope, not a resonance",
+            })
+            continue
+        ea = excess[active]
+        # the floor of the distribution: what this region is over the trend
+        # even in its quietest frames
+        persistent = float(np.percentile(ea, TONAL_PERSISTENCE_PCT))
+        spread = float(np.percentile(ea, 75) - np.percentile(ea, 25))
         cut_db = 0.0
-        if occ >= occupancy:
-            cut_db = -min(max(persistent_excess - trigger_db, 0.0), max_cut_db)
-            if cut_db < 0:
+        if persistent > trigger_db:
+            cut_db = -min(persistent - trigger_db, max_cut_db)
+            # a computed cut of 0.00dB is not a correction - do not build a
+            # filter for it, and do not report the stage as applied
+            if cut_db <= -0.01:
                 sos_list.append(_peaking_sos(freq_hz, q, cut_db, sr))
+            else:
+                cut_db = 0.0
         bands.append({
             "freq_hz": freq_hz, "label": label,
-            "occupancy": round(occ, 3),
-            "excess_db": round(persistent_excess, 2),
+            "trigger_db": trigger_db,
+            "usable_frames": round(usable, 3),
+            "persistent_db": round(persistent, 2),
+            "spread_db": round(spread, 2),
+            "median_db": round(float(np.median(ea)), 2),
             "cut_db": round(cut_db, 2),
         })
 
     if not sos_list:
         return audio, {"applied": False, "bands": bands,
-                       "reason": "no region is persistently over the bar",
-                       "trigger_db": trigger_db, "occupancy_required": occupancy}
+                       "reason": "no region rings persistently enough"}
     out = _sig.sosfilt(np.asarray(sos_list, dtype=np.float64),
                        audio, axis=0).astype(np.float32)
     return out, {"applied": True, "bands": bands, "q": q,
-                 "trigger_db": trigger_db, "occupancy_required": occupancy,
                  "max_cut_db": max_cut_db}
 
 
