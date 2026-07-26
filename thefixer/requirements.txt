@@ -12,3 +12,4 @@ onnx2torch
 nnAudio
 pyyaml
 mutagen
+numba

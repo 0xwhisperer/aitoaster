@@ -1018,7 +1018,7 @@ footer {
           <li><strong>No knee.</strong> Real compressors have a soft knee — gain reduction ramps in gradually around the threshold rather than switching on hard. This implementation has a hard knee, which can sound more abrupt.</li>
           <li><strong>No makeup gain.</strong> After compressing, real multibands typically add gain back to compensate for the loudness that was removed. This doesn't happen automatically here.</li>
           <li><strong>No lookahead in the compressor.</strong> Its envelope is strictly causal — it reacts to a transient rather than anticipating one. (The true-peak limiter, separately, does look ahead 1.5ms.)</li>
-          <li><strong>Crossovers are zero-phase, not Linkwitz-Riley.</strong> The bands are peeled off with zero-phase Butterworth lowpasses and the remainder carried by subtraction, so they sum back to exactly the input. That avoids the level bump independent bandpasses produce, but it is not an LR design and the split points are nominal rather than -6dB crossover points.</li>
+          <li><strong>Crossovers are zero-phase, not Linkwitz-Riley.</strong> The bands are peeled off with zero-phase Butterworth lowpasses and the remainder carried by subtraction, so they sum back to exactly the input. That avoids the level bump independent bandpasses produce, but it is not an LR design, and the split points are nominal rather than -6dB crossover points.</li>
         </ul>
       </section>
 

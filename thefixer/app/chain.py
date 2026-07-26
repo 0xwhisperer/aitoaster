@@ -1032,7 +1032,10 @@ def multiband_compress(audio, sr, bands=None, ratio=1.3, threshold_db=-12.0,
             {**band,
              "max_reduction_db": min(
                  (info["bands"][i]["max_reduction_db"] for info in pass_infos),
-                 default=band["max_reduction_db"])}
+                 default=band["max_reduction_db"]),
+             "max_gain_db": max(
+                 (info["bands"][i]["max_gain_db"] for info in pass_infos),
+                 default=band["max_gain_db"])}
             for i, band in enumerate(last_info["bands"])
         ],
         "worst_over_db_after": float(
@@ -1071,7 +1074,9 @@ def split_bands_complementary(audio, sr, bands=None):
     That replaces independent Butterworth BANDPASSES, which do not sum flat.
 
     NOT Linkwitz-Riley, despite an earlier version of this docstring saying
-    so. Measured, this is 8th-order-magnitude (-48dB/octave) and zero-phase,
+    so. Measured, this is a steep zero-phase split (measured ~-30dB/octave across
+    the crossover itself, steepening further out until it meets the numerical
+    floor),
     and at a nominal 100Hz crossover the two bands read -11.9dB and -2.5dB.
     LR's defining property is -6.02/-6.02 summing to unity, so the label was
     simply wrong. Being zero-phase there is also no phase response for an LR
@@ -1079,7 +1084,7 @@ def split_bands_complementary(audio, sr, bands=None):
     from any LR property.
 
     One consequence worth knowing: because the -6dB point sits well below the
-    nominal frequency (~71Hz for a nominal 100Hz), the `range_hz` values
+    nominal frequency (measured 80.3Hz for a nominal 100Hz), the `range_hz` values
     reported downstream are nominal split points, not -6dB crossover points.
     """
     if bands is None:
@@ -1102,81 +1107,134 @@ def split_bands_complementary(audio, sr, bands=None):
     return out
 
 
-def _envelope_follower(level, sr, attack_ms, release_ms):
-    """Classic asymmetric one-pole envelope: fast to rise, slow to fall.
+def _follow_scalar(level, attack_coeff, release_coeff):
+    """The two-branch recurrence, written out literally.
 
-    Implemented with two lfilter passes rather than a Python loop - a full
-    track at 44.1kHz is millions of samples and a per-sample recurrence is far
-    too slow to run once per band per pass. Taking the MAXIMUM of an
-    attack-smoothed and a release-smoothed version reproduces the asymmetry:
-    the attack pass governs how quickly the envelope can rise, the release
-    pass how slowly it decays.
+        rising : env = env + (1 - a_att) * (x - env)
+        falling: env = max(x, env * a_rel)
+
+    JIT-compiled when numba is importable (measured 0.025s per band on a 150s
+    track), otherwise this same loop runs in plain Python (1.13s per band,
+    46x slower - measured, not estimated). Slow but
+    correct; correctness is the constraint here, since three successive
+    attempts to vectorise this were all wrong in a different way.
     """
-    attack_samples = max(1, int(attack_ms * 0.001 * sr))
-    release_coeff = float(np.exp(-1.0 / max(release_ms * 0.001 * sr, 1.0)))
+    n = len(level)
+    out = np.empty(n, dtype=np.float64)
+    prev = level[0]
+    for i in range(n):
+        x = level[i]
+        if x > prev:
+            prev = prev + (1.0 - attack_coeff) * (x - prev)
+        else:
+            decayed = prev * release_coeff
+            prev = x if x > decayed else decayed
+        out[i] = prev
+    return out
 
-    # CAUSAL peak dilation over the attack window. `origin` shifts the window
-    # so it looks only BACKWARD - a centred window (the default) reads into
-    # the future, so the low band would begin ducking up to 15ms BEFORE a
-    # transient exists. Measured with the centred version: -2.39dB of gain
-    # reduction 2ms ahead of a kick, which is textbook pre-echo.
-    peak = ndimage.maximum_filter1d(
-        level, size=attack_samples, mode="nearest",
-        origin=(attack_samples - 1) // 2,
-    )
 
-    # Peak-hold with exponential DECAY, not a lowpass of the peak.
-    #
-    # The previous version fed a one-pole with the max-filtered signal. On a
-    # short transient the pole only charges for the attack window, so it never
-    # reaches the peak value, and once the peak leaves the window the envelope
-    # collapses to whatever little the pole accumulated. Measured on a
-    # 10-sample transient with a 100ms release: the envelope fell 22.1dB in
-    # TWO samples and read 0.074 at +10ms, where a true 100ms release gives
-    # ~0.905. That is a step discontinuity in the gain applied to audio -
-    # audible as a click on every percussive hit, on exactly the material a
-    # compressor exists to handle.
-    #
-    # The correct recurrence is env[n] = max(peak[n], env[n-1] * release).
-    # Expressed as a decaying running maximum it vectorises: divide out the
-    # decay, take a cumulative maximum, multiply it back. The exponent is
-    # clamped so the scaling cannot overflow on a long track.
-    # ATTACK RAMP. The peak dilation above makes the envelope AWARE of a peak
-    # within the attack window, but on its own it jumps to full value on the
-    # transient's first sample - so gain reduction arrives instantly and no
-    # part of the transient passes through. A real compressor ramps in over
-    # the attack time. Smoothing the dilated peak with a one-pole at the
-    # attack constant gives that ramp; because the dilation already raised
-    # the target, the ramp still ARRIVES by the end of the attack window
-    # rather than lagging behind it.
-    if attack_samples > 1:
-        # 3 time constants inside the window -> ~95% arrival by its end,
-        # so the ramp completes within the stated attack time rather than
-        # only reaching 63% of the way there.
-        attack_coeff = float(np.exp(-3.0 / attack_samples))
-        zi = signal.lfilter_zi([1 - attack_coeff], [1, -attack_coeff]) * peak[0]
-        peak, _ = signal.lfilter(
-            [1 - attack_coeff], [1, -attack_coeff], peak, zi=zi)
-        peak = peak.astype(np.float64)
+try:  # optional acceleration; the pure-Python fallback is identical in output
+    from numba import njit as _njit
+    from numba.core import errors as _numba_errors
+    _follow_fast = _njit(_follow_scalar)
+    # Narrow: only numba's own compilation failures fall back. A numerical
+    # bug or MemoryError inside the compiled kernel must still raise.
+    _NUMBA_ERRORS = (_numba_errors.NumbaError, TypeError)
+except Exception:  # pragma: no cover - numba absent
+    _follow_fast = _follow_scalar
+    _NUMBA_ERRORS = ()
 
-    n = len(peak)
-    if n == 0:
-        return peak
-    log_release = np.log(max(release_coeff, 1e-12))
-    # process in blocks so exp(-log_release * n) stays finite for any length
-    block = max(1, int(-700.0 / log_release)) if log_release < 0 else n
-    env = np.empty_like(peak)
-    carry = peak[0]
-    for start in range(0, n, block):
-        stop = min(start + block, n)
-        idx = np.arange(stop - start, dtype=np.float64)
-        decay = np.exp(log_release * idx)
-        seeded = peak[start:stop].astype(np.float64).copy()
-        seeded[0] = max(seeded[0], carry)
-        running = np.maximum.accumulate(seeded / decay) * decay
-        env[start:stop] = running
-        carry = running[-1] * release_coeff
-    return env
+
+_FOLLOW_FELL_BACK = False
+
+
+def _follow(level, attack_coeff, release_coeff):
+    """Run the JIT path, falling back to plain Python if it cannot compile.
+
+    numba's njit is LAZY - it compiles on first CALL, not at decoration. So the
+    try/except around the import above catches only a MISSING numba, never a
+    compilation failure. Without this guard a compile error would propagate
+    out of a render and 500 the request.
+
+    The fallback is the same recurrence in plain Python: bit-identical output,
+    measured 46x slower (1.13s vs 0.025s per band on a 150s track). An earlier
+    version of this function called ITSELF here instead of _follow_fast, so
+    numba never ran at all: ~987 frames of recursion, a RecursionError
+    swallowed by a bare `except Exception`, and the slow path every time. The
+    output was bit-identical, so the entire test suite passed while the
+    compressor ran 46x slower than intended - which is why
+    test_jit_path_is_actually_exercised watches the CALL, not the output.
+
+    It is caught NARROWLY - only numba's own compilation
+    errors - so a genuine numerical bug or MemoryError in the compiled kernel
+    still raises instead of being silently absorbed into a slow path. The
+    fallback also announces itself once, because a silent 40x regression in
+    production with no signal is its own kind of bug.
+    """
+    global _FOLLOW_FELL_BACK
+    if _follow_fast is _follow_scalar:
+        return _follow_scalar(level, attack_coeff, release_coeff)
+    try:
+        return _follow_fast(level, attack_coeff, release_coeff)
+    except _NUMBA_ERRORS:
+        if not _FOLLOW_FELL_BACK:
+            _FOLLOW_FELL_BACK = True
+            print("[chain] numba could not compile the envelope follower; "
+                  "using the plain-Python fallback (same output, ~40x slower)")
+        return _follow_scalar(level, attack_coeff, release_coeff)
+
+
+def _envelope_follower(level, sr, attack_ms, release_ms):
+    """Asymmetric peak-follower: ramps up over the attack, decays over the
+    release. The standard compressor envelope.
+
+        rising : env[n] = env[n-1] + (1 - a_att) * (x[n] - env[n-1])
+        falling: env[n] = max(x[n], env[n-1] * a_rel)
+
+    This is computed by the literal recurrence above, NOT by composing filters.
+    Three vectorised attempts were each blocked by audit, and every one failed
+    in the same place - the moment after a transient ends:
+
+      1. A one-pole fed with a max-dilated peak. On a short transient the pole
+         only charged for the attack window, so once the peak left the window
+         the envelope collapsed 22.1dB in TWO samples - a step discontinuity
+         in the gain, audible as a click on every percussive hit.
+
+      2. Adding an attack ramp on top of that dilation. Dilation raises the
+         TARGET, not the STATE, so the two composed into lag: peak gain
+         reduction landed +40ms AFTER a kick, delivering 9.5% of the intended
+         reduction while the transient was present and the rest onto whatever
+         followed.
+
+      3. Taking min(ramp, decaying-max). The pole was still driven by the
+         decayed target rather than the signal, so the envelope RISED 3.03dB
+         over 21.9ms while the input was exactly zero, peaking 22ms into
+         silence. It also broke the env >= |x| invariant, letting a spike pass
+         25.7dB above the envelope with no gain reduction at all.
+
+    The recurrence has none of those failure modes because the envelope only
+    ever moves in response to the current sample: it cannot rise while the
+    input falls, and it cannot lag behind a peak it has already seen.
+
+    One consequence worth stating plainly: during the attack ramp the envelope
+    is BELOW the input by design, so a very short spike gets little or no gain
+    reduction - a single-sample full-scale spike sees essentially none, with
+    the envelope sitting 33-53dB under it. That is inherent to having an
+    attack time at all, and it is why the recombination clamp in
+    _multiband_compress_pass and the downstream true-peak limiter both matter.
+    """
+    level = np.asarray(level, dtype=np.float64)
+    if len(level) == 0:
+        return level
+
+    attack_samples = max(1.0, attack_ms * 0.001 * sr)
+    release_samples = max(1.0, release_ms * 0.001 * sr)
+    # 3 time constants inside the window -> ~95% arrival by its end, so the
+    # ramp completes within the stated attack time rather than reaching only
+    # 63% of the way there.
+    attack_coeff = float(np.exp(-3.0 / attack_samples))
+    release_coeff = float(np.exp(-1.0 / release_samples))
+    return _follow(level, attack_coeff, release_coeff)
 
 
 def _multiband_compress_pass(audio, sr, bands=None,
@@ -1213,6 +1271,13 @@ def _multiband_compress_pass(audio, sr, bands=None,
         info_bands.append({
             "range_hz": [round(lo), round(min(hi, nyq - 1))],
             "max_reduction_db": float(gain_db.min()),
+            # A compressor may only ever REDUCE. This is the most positive
+            # gain the band saw, and it must never exceed 0dB. Exposed
+            # because two generations of tests tried to catch an expander
+            # bug by measuring a band's RMS and both were blind to it: the
+            # boost multiplies a near-silent band, so its absolute level
+            # barely moves while the gain itself reaches +22dB.
+            "max_gain_db": float(gain_db.max()),
             "attack_ms": attack_ms,
             "release_ms": release_ms,
         })

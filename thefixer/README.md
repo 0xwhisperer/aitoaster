@@ -256,7 +256,7 @@ simplified, conservative version, not a full-featured multiband compressor:
   (The true-peak limiter separately looks ahead 1.5ms.)
 - **Crossovers are zero-phase complementary, not Linkwitz-Riley.** Bands are
   peeled off with zero-phase Butterworth lowpasses and the remainder carried
-  by subtraction, so they sum to exactly the input. Measured -48dB/octave;
+  by subtraction, so they sum to exactly the input. Measured ~-30dB/octave across the crossover;
   the split points are nominal, not -6dB crossover points.
 
 
