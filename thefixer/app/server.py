@@ -888,6 +888,7 @@ def _tool_status_line(tool, info):
 
 
 def run_pipeline(job_id, file_id, tools, options, output_name=None, output_format="same", mp3_mode="vbr0"):
+    job_started_at = time.time()
     try:
         path = _find_upload_path(file_id)
         if path is None:
@@ -1641,7 +1642,13 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                     audio, _ = chain.fix_transient(audio, sr, t["time_sec"],
                                                      target_peak=options.get("transient_target_peak"))
                     late_transients_fixed.append({"time_sec": t["time_sec"]})
-                transients_after = chain.detect_transients(audio, sr)
+                # Re-count against the same provenance rule the correction
+                # used - otherwise the preserved source edges reappear here
+                # and the "final" line reports a clean run as still failing.
+                transients_after = filter_chain_created_transients(
+                    chain.detect_transients(audio, sr), audio, original_audio,
+                    sr, lead_samples_trimmed,
+                )
 
             transient_status = "pass" if len(transients_after) == 0 else "check"
             job_log(
@@ -1869,6 +1876,19 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         # output file) for the same reason correlation_after/dc_after do -
         # see the delivered_audio comment above.
         transients_after = chain.detect_transients(delivered_audio, sr)
+        # BUG FIX (direct user report: "now you're no longer fixing the
+        # transients", results table showing "5 (fixed) / 3 flagged"): this
+        # count must exclude the anomalies the corrective pass DELIBERATELY
+        # preserved. Those are sharp edges that were already in the source -
+        # vocal consonants that compression smoothed until they resembled
+        # clicks - and leaving them intact is the correct behaviour, not a
+        # failure to fix anything. Counting them here reported a successful
+        # run as flagged, which reads as the tool having stopped working.
+        if "fix_transients" in tools:
+            transients_after = filter_chain_created_transients(
+                transients_after, delivered_audio, original_audio, sr,
+                lead_samples_trimmed,
+            )
 
         # surface WHERE each fixed transient/pop was found, for the results
         # panel's waveform chart to mark - fix_transients' own step already
@@ -1934,6 +1954,10 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         except Exception as e:
             job_log(job_id, f"cleanup: skipped ({e})")
 
+        total = time.time() - job_started_at
+        mins, secs = divmod(int(total), 60)
+        job_log(job_id, f"total processing time: "
+                        f"{f'{mins}m {secs}s' if mins else f'{total:.1f}s'}")
         job_log(job_id, "complete")
 
     except JobCancelled:

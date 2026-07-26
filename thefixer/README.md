@@ -40,9 +40,16 @@ The processing order is deliberate — see [Why this order](#why-this-order).
 4. **Surgical transient/pop fix** — detects genuine click/glitch artifacts
    (requires both a large sample-to-sample jump AND a spike far above a
    200ms local RMS envelope, so ordinary kick/snare hits are never flagged)
-   and applies a raised-cosine gain-reduction envelope (3ms attack, 60ms
-   release) just at that moment. Target reduction is derived from the
-   track's own recent loudness context, not a fixed value.
+   and repairs each one by interpolating across it from the clean samples
+   either side, since merely reducing a discontinuity's level leaves the
+   jump itself intact. Sustained broadband bursts are rejected: a click
+   crosses the detection threshold once or twice, a vocal consonant
+   ("s"/"t"/"k") crosses it hundreds of times, and because the repair
+   deletes rather than ducks, a false positive would erase the consonant.
+   The post-chain re-check corrects only anomalies that were NOT present in
+   the source — compression and limiting can smooth a consonant until it
+   resembles a click, and a sharp edge already in the recording is not this
+   tool's to remove.
 5. **High-frequency spectral fill-in (17kHz+)** — detects an artificial
    hard cutoff (common in lossy encoding or low-quality AI generation) by
    comparing the actual energy just above a candidate cutoff against what
@@ -62,7 +69,11 @@ The processing order is deliberate — see [Why this order](#why-this-order).
    streaming-platform standard; Apple Music specifically targets -16, most
    others including Spotify/YouTube are closer to -14).
 9. **Multiband compression** — gentle 3-band (low/mid/high) downward
-   compression, conservative settings (ratio 1.3:1, threshold -12dB). See
+   compression, conservative settings (ratio 1.3:1, threshold -12dB). That
+   ratio only closes ~23% of the excess per pass, so it repeats until the
+   file's own measured band peakiness stops improving (bounded, and it
+   reports the pass count) rather than asking for a manual re-run. Audio
+   that is already balanced is returned untouched. See
    [Multiband compressor: how it compares to a real one](#multiband-compressor-how-it-compares-to-a-real-one)
    for what's simplified here.
 10. **CNN-model AI-detector fix** — shift-robust gradient optimization

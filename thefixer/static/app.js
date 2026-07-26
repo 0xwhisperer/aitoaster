@@ -109,7 +109,9 @@
     tool_fix_transients: {
       title: "Surgical transient/pop fix",
       body: `<p>Scans for sharp, sudden clicks or pops - the kind that come from a bad edit, a glitch, or a digital artifact, not from actual instruments. Real percussive hits (kicks, snares) have a fast but natural attack and are deliberately left alone; this only touches genuine discontinuities.</p>
-             <p>When found, only that exact moment is gently limited - the rest of the track is untouched.</p>`,
+             <p>When one is found, that exact moment is repaired by interpolating across it from the clean samples either side - the discontinuity is removed rather than just turned down, since simply reducing its level leaves the jump itself intact. The rest of the track is untouched.</p>
+             <p><strong>What it will not touch:</strong> a click is near-instantaneous - one or two samples cross the detection threshold. A vocal consonant ("s", "t", "k") is a sustained broadband burst that crosses it hundreds of times, so bursts are rejected. Because the repair works by deleting, a false positive here would erase a consonant rather than merely duck it.</p>
+             <p><strong>The post-chain re-check:</strong> after everything else has run, the track is scanned once more, because later stages can introduce their own artifacts. That second pass only corrects anomalies that were NOT in your source file. Compression and limiting smooth a consonant enough that it can start to look like a click, and deleting a sharp edge that was already in your recording is not this tool's job.</p>`,
     },
     tool_spectral_revive: {
       title: "High-frequency fill-in (17kHz+)",
@@ -126,7 +128,8 @@
     },
     tool_multiband_compress: {
       title: "Multiband tonal-balance compression",
-      body: `<p>Gently compresses three frequency bands (low/mid/high) somewhat independently, rather than the whole signal at once - a light touch aimed at smoothing out any band that's poking out too far relative to the others, for a more balanced overall tone. Deliberately conservative, not a loudness-maximizing effect.</p>`,
+      body: `<p>Gently compresses three frequency bands (low/mid/high) somewhat independently, rather than the whole signal at once - a light touch aimed at smoothing out any band that's poking out too far relative to the others, for a more balanced overall tone. Deliberately conservative, not a loudness-maximizing effect.</p>
+             <p><strong>It repeats itself as needed.</strong> The gentle ratio only closes about a quarter of the gap each pass, so a strongly peaky track would need several passes to settle. Rather than asking you to run the file through again, it keeps passing until the measured imbalance stops improving (up to a bounded limit), then reports how many passes it took. A track that is already balanced is left completely untouched.</p>`,
     },
     tool_true_peak_limit: {
       title: "True-peak limiter",
@@ -170,7 +173,7 @@
     { id: "strip_metadata", group: "chainGroupCleanup", name: "Strip metadata & embedded images", desc: "Reports and removes ID3/container tags (title, artist, comments, generation-platform provenance) and embedded cover art. The delivered file never carries these regardless, since every output is freshly encoded from raw audio - this step surfaces exactly what was found.", info: "tool_strip_metadata" },
     { id: "trim_silence", group: "chainGroupCleanup", name: "Trim silence", desc: "Removes leading/trailing true silence at the very start and end.", info: "tool_trim_silence" },
     { id: "dc_offset", group: "chainGroupCleanup", name: "DC offset correction", desc: "Centers the waveform on zero if it's biased up or down.", info: "dc_offset" },
-    { id: "fix_transients", group: "chainGroupCleanup", name: "Surgical transient/pop fix", desc: "Auto-detects sharp pops/spikes and gently limits just that moment.", info: "tool_fix_transients" },
+    { id: "fix_transients", group: "chainGroupCleanup", name: "Surgical transient/pop fix", desc: "Finds genuine clicks and pops and bridges across just that moment. Skips sustained bursts like vocal consonants, and its post-chain re-check only corrects anomalies this chain introduced — never sharp edges that were already in your source.", info: "tool_fix_transients" },
     { id: "spectral_revive", group: "chainGroupCleanup", name: "High-frequency fill-in (17kHz+)", desc: "Detects an artificial cutoff (common in lossy encoding or low-quality AI generation) and fills content above it using only this track's own rolloff slope, harmonics, and dynamics - no external reference.", info: "tool_spectral_revive" },
     { id: "high_pass", group: "chainGroupCleanup", name: "High-pass filter", desc: "Removes inaudible sub-30Hz rumble that eats into headroom.", info: "tool_high_pass" },
     { id: "linear_fix", group: "chainGroupAI", name: "Linear model fix", desc: "Gradient-optimized correction targeting the fakeprint logistic-regression detector.", info: "linear_passes" },
@@ -178,7 +181,7 @@
     { id: "temporal_normalize", group: "chainGroupAI", name: "Temporal pattern denormalization", desc: "Applies a small, smooth, non-uniform timing drift, displacing the low-frequency spectral peaks that fingerprint matching uses as anchors. Off by default.", info: "temporal_normalize" },
     { id: "fix_phase", group: "chainGroupMaster", name: "Stereo phase correction", desc: "Corrects out-of-phase content that would cancel out in mono playback.", info: "tool_fix_phase" },
     { id: "normalize_lufs", group: "chainGroupMaster", name: "LUFS loudness normalization", desc: "Targets -14 LUFS, the standard streaming-platform loudness reference.", info: "lufs" },
-    { id: "multiband_compress", group: "chainGroupMaster", name: "Multiband compression", desc: "Gentle 3-band dynamics smoothing for tonal balance.", info: "tool_multiband_compress" },
+    { id: "multiband_compress", group: "chainGroupMaster", name: "Multiband compression", desc: "Gentle 3-band dynamics smoothing for tonal balance. Repeats itself until the imbalance settles, so a peaky track is handled in one run.", info: "tool_multiband_compress" },
     { id: "true_peak_limit", group: "chainGroupMaster", name: "True-peak limiter", desc: "Brick-wall safety ceiling at -1dBTP, accounting for inter-sample peaks.", info: "tool_true_peak_limit" },
     { id: "fade", group: "chainGroupMaster", name: "Fade in / fade out", desc: "Smooth S-curve fade at the start and end of the track. Runs last, after the limiter, so no later gain stage undoes it.", info: "tool_fade" },
   ];
@@ -1274,6 +1277,17 @@
     [/^\s*WARNING: linear regressed.*$/, () => ({ text: "Heads up: the linear score slipped a bit after a later step", badge: "fail" })],
     [/^\s*WARNING: cnn regressed.*$/, () => ({ text: "Heads up: the CNN score slipped again after the loudness limiter re-ran - the delivered file may still be flagged", badge: "fail" })],
     [/^\s*WARNING: delivered file is ([\-\d.]+) LUFS.*$/, (m) => `Heads up: couldn't fully reach the loudness target (landed at ${m[1]} LUFS) without exceeding the peak safety ceiling`],
+    [/^linear: trying fast feature-domain solve.*$/, () => "Trying the fast solve before the full optimizer"],
+    [/^linear: feature-domain result checked on transferred stereo output: ([\d.]+)% AI, SNR ([\d.]+)dB, peak spectral adjustment ([\d.]+)dB$/, (m) => {
+      const pct = Number(m[1]);
+      return { text: `Fast solve checked on the real output: ${m[1]}% AI-likely, SNR ${m[2]}dB, peak EQ change ${m[3]}dB`,
+               badge: pct < 1 ? "pass" : "retry" };
+    }],
+    [/^\s*skipped (\d+) pre-existing anomal(?:y|ies) already present in the source.*$/, (m) => ({
+      text: `Transient/pop fix: left ${m[1]} pre-existing anomal${m[1] === "1" ? "y" : "ies"} alone (already in your source, not added by this chain)`,
+      badge: "pass",
+    })],
+    [/^total processing time: (.+)$/, (m) => ({ text: `Total processing time: ${m[1]}`, badge: "pass" })],
     [/^complete$/, () => "All done"],
     [/^cancelled by user$/, () => ({ text: "Job cancelled", badge: "fail" })],
     [/^ERROR: (.+)$/, (m) => `Something went wrong: ${m[1]}`],

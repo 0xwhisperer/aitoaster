@@ -779,6 +779,7 @@ def multiband_compress(audio, sr, bands=None, ratio=1.3, threshold_db=-12.0,
     current = audio
     passes = 0
     last_info = None
+    pass_infos = []
     previous_worst = None
 
     for _ in range(int(max_passes)):
@@ -802,6 +803,7 @@ def multiband_compress(audio, sr, bands=None, ratio=1.3, threshold_db=-12.0,
             break
         current = stepped
         last_info = info
+        pass_infos.append(info)
         passes += 1
 
     if passes == 0:
@@ -820,7 +822,17 @@ def multiband_compress(audio, sr, bands=None, ratio=1.3, threshold_db=-12.0,
         "ratio": ratio,
         "threshold_db": threshold_db,
         "passes": passes,
-        "bands": last_info["bands"],
+        # Report the CUMULATIVE reduction, not the last pass's. Reporting
+        # last_info alone understated a 9-pass run as "up to 0.4dB" when the
+        # worst single pass was 1.3dB and the total far more, which read as
+        # the tool having barely done anything.
+        "bands": [
+            {"range_hz": band["range_hz"],
+             "max_reduction_db": min(
+                 (info["bands"][i]["max_reduction_db"] for info in pass_infos),
+                 default=band["max_reduction_db"])}
+            for i, band in enumerate(last_info["bands"])
+        ],
         "worst_over_db_after": float(
             max((b["peak_over_db"] for b in final_peakiness), default=0.0)
         ),
