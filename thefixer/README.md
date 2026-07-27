@@ -22,92 +22,126 @@ This is a local Python+Flask app - it needs the server running to do
 anything (audio decoding, ONNX inference, PyTorch gradient optimization all
 happen server-side). See [Deployment](#deployment) below.
 
+**Restarting after a code change.** The server does not hot-reload, and the
+browser caches `app.js`, so a change needs both:
+
+```
+pkill -f "app.server"
+./run.sh                     # or: venv/bin/python -m app.server
+```
+
+then a hard reload in the browser (Cmd+Shift+R). Skipping either one means
+running old code while reading new source - a stale server process and a
+stale tab have both caused real confusion during development.
+
+**Watermark seed.** Create a `.env` in this directory with:
+
+```
+FIXER_WATERMARK_SEED=<your seed>
+```
+
+It is gitignored and loaded automatically at startup. Without it the app
+falls back to a built-in default seed and says so in the log; fine for local
+work, not for anything distributed.
+
 ## The signal chain, in order
 
-The processing order is deliberate — see [Why this order](#why-this-order).
+This is the order the app actually runs, and it is enforced by
+`tests/test_certification_is_last.py` - the UI cards, the log and this list
+must all agree with `TOOL_ORDER` in `app/server.py`.
 
-1. **Strip metadata & embedded images** — reports every format- and
-   stream-level tag (title, artist, comment, encoder, generation-platform
-   provenance) plus any embedded cover art, and flags known AI-generation
-   platform keywords explicitly. Metadata is always stripped from the
-   delivered output regardless of selection (every output is freshly
-   encoded from raw audio, so there's no code path where a tag could
-   survive) — this step exists to make that fact visible and specific,
-   not to gate whether stripping happens.
-2. **Trim leading/trailing silence** — true-digital-silence detection
-   (threshold 0.0005 linear amplitude, 5ms safety pad).
-3. **DC offset correction** — subtracts each channel's mean.
-4. **Surgical transient/pop fix** — detects genuine click/glitch artifacts
-   (requires both a large sample-to-sample jump AND a spike far above a
-   200ms local RMS envelope, so ordinary kick/snare hits are never flagged)
-   and repairs each one by interpolating across it from the clean samples
-   either side, since merely reducing a discontinuity's level leaves the
-   jump itself intact. Sustained broadband bursts are rejected: a click
-   crosses the detection threshold once or twice, a vocal consonant
-   ("s"/"t"/"k") crosses it hundreds of times, and because the repair
-   deletes rather than ducks, a false positive would erase the consonant.
-   The post-chain re-check corrects only anomalies that were NOT present in
-   the source — compression and limiting can smooth a consonant until it
-   resembles a click, and a sharp edge already in the recording is not this
-   tool's to remove.
-5. **High-frequency spectral fill-in (17kHz+)** — detects an artificial
-   hard cutoff (common in lossy encoding or low-quality AI generation) by
-   comparing the actual energy just above a candidate cutoff against what
-   the track's own established rolloff slope predicts, and only flags it
-   when the deficit is large. Fills content above the cutoff using
-   *only* this track's own characteristics — its self-fitted rolloff
-   slope extrapolated past the cutoff, harmonic projection from each
-   frame's own detected spectral peaks, and broadband texture modulated
-   by the track's own frame-by-frame dynamics. No external reference file
-   or fixed target curve is used anywhere in the calculation.
-6. **High-pass filter** — 2nd-order Butterworth, zero-phase (`sosfiltfilt`),
-   30Hz cutoff. Removes sub-audible rumble/DC residue.
-7. **Stereo phase/correlation correction** — checks L/R correlation; if
-   negative enough to risk mono-cancellation, blends mid/side to restore
-   safety.
-8. **LUFS loudness normalization** — default -14 LUFS, adjustable -16 to -9 (general
-   streaming-platform standard; Apple Music specifically targets -16, most
-   others including Spotify/YouTube are closer to -14).
-9. **Multiband compression** — gentle 4-band downward compression with
-   complementary crossovers at 100Hz / 800Hz / 5kHz, ratio 1.3:1, threshold
-   -12dB, ONE pass, and per-band attack/release (30ms/200ms on the low band
-   down to 3ms/60ms on the top). The crossovers put vocal presence in its own
-   band rather than sharing one gain control with cymbals, and the bands
-   sum back to exactly the input. Runs before loudness is set. See
-   [Multiband compressor: how it compares to a real one](#multiband-compressor-how-it-compares-to-a-real-one)
-   for what's simplified here.
-10. **CNN-model AI-detector fix** — shift-robust gradient optimization
-    targeting the CQT-cepstrum CNN detector. The recommended mode trains
-    across small timing shifts around the detector's five real evaluation
-    positions; a slower dense whole-track mode is also available.
-11. **Linear-model AI-detector fix** — gradient-based adversarial
-    correction targeting the fakeprint/logistic-regression detector.
-    Reports live progress during optimization: current step, which retry
-    attempt, and the live surrogate score as it converges.
-12. **Temporal pattern normalization** (optional) — applies a small smooth
-    non-uniform timing warp before the final watermark, displacing the
-    low-frequency spectral peaks fingerprint matching anchors on (94% sit
-    below 500Hz, none above 4kHz). Landmark displacement saturates at the
-    4ms default, since landmark timing is quantized by the ~11.6ms analysis
-    hop; higher values only smear sibilants without adding disruption (a
-    measured sibilant retained 98.2% of its energy at 4ms vs 91.3% at 15ms).
-    Measured against a local landmark proxy, not a commercial fingerprint
-    system. Production runs deliberately use a fresh random curve.
-13. **True-peak limiter** — brick-wall ceiling at -1dBTP (industry-standard
-    safe margin for lossy-codec transcoding headroom), oversampled 4x to
-    catch inter-sample peaks, not just sample peaks.
-14. **Post-chain linear/CNN re-verification** (automatic, not a separate
-    selectable tool) — if both AI fixes were selected, re-scores the linear
-    and CNN models on the post-chain audio and can re-run either fix once
-    if later processing erased its safety margin. See [Why this order](#why-this-order).
-15. **Post-chain LUFS drift correction** (automatic, not a separate
-    selectable tool) — if `normalize_lufs` was selected, the truly final
-    LUFS is measured after every later stage and corrected if it has
-    drifted more than 0.1dB from target. This is now a safety net rather
-    than the main mechanism: loudness is set second-to-last, so almost
-    nothing remains after it to cause drift. The correction iterates
-    (bounded), because an upward correction forces a re-limit and that
-    re-limiting pulls loudness back down again.
+**The one rule that governs the order:** a CNN certification is bound to the
+exact timeline it was made on. `CNNDetector.extract_segments` derives every
+analysis-window position from `len(audio)`, so anything that changes the
+sample count or displaces content in time must run BEFORE the detector
+fixes. Measured, a 311ms trim after certification took a file from 0.003% to
+78.8%. Everything after `cnn_fix` is amplitude-domain only and has been
+measured inert.
+
+1. **Strip metadata & embedded images** - reports every format- and
+   stream-level tag found (title, artist, comment, encoder, generation
+   platform) and any embedded cover art. The delivered file never carries
+   these regardless, since every output is freshly encoded from raw audio;
+   this step surfaces exactly what was there.
+
+2. **DC offset correction** - subtracts each channel's mean. Runs before the
+   trim because a DC offset lifts otherwise-silent samples above the trim
+   threshold: measured, a file with a 0.02 offset trimmed 0ms before
+   correction and 995ms after.
+
+3. **High-pass filter** - filters at 30Hz, but only engages when the track
+   has genuine sub-sonic content, measured below about 15Hz. A clean track
+   is left bit-for-bit untouched. Also before the trim, since deep rumble
+   holds the "silence" up the same way DC does.
+
+4. **Trim leading/trailing silence** - the only stage that changes the
+   sample count, so the timeline is fixed from here on. A decaying tail is
+   recognised as a fade and left alone: without that guard a 3-second
+   fade-out lost 61ms of its own tail.
+
+5. **Temporal pattern denormalization** (off by default) - a small, smooth,
+   non-uniform timing drift, default 4ms. Length-preserving but it displaces
+   content in time, which makes it a timeline stage: applied to an already
+   certified signal it measured +97 percentage points. It therefore runs
+   here, with the other timeline work, even though its card is grouped with
+   the AI-detector fixes because that is what it targets.
+
+6. **Surgical transient/pop fix** - finds genuine clicks and pops and
+   bridges across just that moment, with a short taper either side. Skips
+   sustained bursts like vocal consonants, and its post-chain re-check only
+   corrects anomalies this chain introduced.
+
+7. **Stereo field: bass mono & phase** - sums bass below 120Hz to mono and
+   repairs phase in the 120-300Hz band. Does not widen.
+
+8. **High-frequency spectral fill-in (17kHz+)** - detects an artificial
+   cutoff and fills above it using only this track's own rolloff slope,
+   harmonics and dynamics.
+
+9. **Tonal cleanup** (off by default) - checks 250Hz boxiness and 3.15kHz
+   harshness, cutting only where a region rings persistently rather than
+   being a note or a filter slope. Cut only, 1.5dB maximum. Most finished
+   masters get nothing.
+
+10. **Multiband compression** - gentle 4-band downward compression,
+    crossovers at 100/800/5000Hz, ratio 1.3, one pass.
+
+11. **Saturation** (off by default) - tanh soft saturation, 4x oversampled,
+    level-matched. Changes peak density rather than tone.
+
+12. **Linear-model AI-detector fix** - gradient-based adversarial correction
+    against the fakeprint logistic-regression detector.
+
+13. **CNN-model AI-detector fix** - gradient optimization against the
+    CQT-cepstrum CNN, verified against the real model. **This is the
+    certification point; the timeline is locked here.**
+
+14. **LUFS loudness normalization** - default -14 LUFS, adjustable -16 to
+    -9. Second-to-last so nothing after it moves the delivered level off
+    target. Measured inert against a certification (-0.003pp).
+
+15. **True-peak limiter** - brick-wall ceiling at -1dBTP with 4x
+    oversampling and 1.5ms lookahead. Measured inert (0.000pp).
+
+16. **Fade in / out** - raised-cosine, default 10ms in and 3000ms out.
+    Amplitude-only and measured bit-exactly inert.
+
+Then, automatically and without their own cards:
+
+- **Post-chain linear/CNN re-verification** - re-scores after the stages
+  above and re-runs a fix if it lost its margin.
+- **Post-chain LUFS drift correction** - iterates to hold the target.
+- **Product watermark** - unconditional. Measured inert: CNN delta exactly
+  0.00000000pp, linear -0.0000060pp, sample count unchanged.
+- **16-bit TPDF dither** - every output is written as 16-bit PCM, so the
+  bit-depth reduction is unconditional. Undithered truncation leaves
+  harmonics at -24.6dB against the tone; dithered, -43.7dB.
+- **Dense delivered-file certification** - the encoded bytes are scanned
+  across every analysis window, not the five fixed positions
+  `scorer.score()` samples. Measured on a real file, the five-position
+  median read 0.00112% while the worst window was 0.12442% - a 111x
+  under-report, because the worst window fell between two sampled positions.
+
 
 ## Output format
 

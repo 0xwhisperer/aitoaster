@@ -32,6 +32,28 @@ it cannot move further. Displacement therefore SATURATES: averaged over five
 seeds, 4ms, 8ms and 15ms all produced the same 11.61ms p90 landmark shift,
 while 2ms produced none.
 
+MEASURED AGAINST PAIR-HASH MATCHING, THE EFFECT IS SMALL. The landmark
+displacement above is real, but real systems do not match on individual
+landmarks: they hash PAIRS of peaks (two frequencies plus the time gap
+between them) and vote on an offset histogram, which by construction
+absorbs uniform time drift and needs only tens of aligned hashes out of
+thousands. On that metric an external audit measured this stage removing
+about 9% of aligned hashes against a match margin of roughly 100x - the
+track still matches comfortably.
+
+That audit also tested the obvious escalations, and none of them work at any
+magnitude a master survives: a micro-pitch shift still matched at 50 cents
+(evasion needs ~75, three-quarters of a semitone and audibly out of tune,
+and 10 cents alone drifts a 3:30 track by 1.22s, breaking sync with video
+and stems); band-split warping at 80ms still matched; spectral peak dither
+at +/-6dB still matched; and all three stacked still matched. The honest
+conclusion is that constellation matching is not defeatable by perturbation
+subtle enough to preserve a master.
+
+So: this stage displaces landmark timing, which is measurable and real, but
+it should not be described as defeating content-ID matching, because it does
+not.
+
 Higher values are not free. Resampling through a drifting time axis smears
 fast high-frequency content, and sibilants ("s"/"t") are exactly that. On a
 measured vocal the sibilant retained 98.2% of its energy at 4ms but only

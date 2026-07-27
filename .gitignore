@@ -11,3 +11,11 @@
 *.aif
 
 .DS_Store
+
+# Local audio libraries, ignored WHOLESALE. The extension rules above already
+# catch audio files anywhere, but ignoring the folders themselves means
+# anything else dropped in them - artwork, notes, session files, an export in
+# a format not listed above - also stays out of the repo. 661MB combined at
+# the time of writing; none of it is source.
+music/
+audio_archive/

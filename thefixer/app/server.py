@@ -2109,31 +2109,49 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
                                  f"source (not introduced by this chain)")
             _timeline_is_certified = ("cnn_fix" in tools
                                       and _certified_length is not None)
-            if transients_after and _timeline_is_certified:
-                # Same reasoning as the corrective trim above. fix_transient
-                # repairs by interpolating ACROSS a discontinuity, which
-                # rewrites a region of samples - and this pass runs after
-                # cnn_fix has certified. It cannot be made safe by re-checking.
-                #
-                # It also has a bad history in its own right: this exact pass
-                # was "deleting vocal consonants" (see the comment at the top
-                # of filter_chain_created_transients), which is what produced
-                # the reported blown-out "t" sounds in a vocal. It now only
-                # ever runs on an uncertified timeline.
-                job_log(job_id, f"fix_transients: final pass skipped - "
-                                f"{len(transients_after)} anomal"
-                                f"{'y' if len(transients_after) == 1 else 'ies'} detected, but "
-                                f"the timeline is certified by the CNN fix and repairing "
-                                f"would rewrite samples underneath it")
-                transients_after = []
-            elif transients_after:
+            # BUG FIX (direct user report): this pass used to be SKIPPED
+            # outright once cnn_fix had certified, on the reasoning that
+            # repairing a transient rewrites samples underneath a
+            # certification. That guard was too broad and it shipped the very
+            # artifacts the stage exists to catch - a user re-uploaded a
+            # delivered file and the analyzer found three chain-created
+            # transients (38.75s, 73.01s, 83.02s) that were NOT in their
+            # source. Traced: multiband_compress introduced one and
+            # normalize_lufs two more.
+            #
+            # The guard was wrong because fix_transient is AMPLITUDE-domain.
+            # Measured on a real delivered file: 6,487,961 samples in,
+            # 6,487,961 out, 0.0036% of samples changed. It cannot slide a
+            # CNN analysis window, because those positions derive from
+            # len(audio) and the length does not move. The timeline rule
+            # never applied to it.
+            #
+            # So it runs, and the certification is re-verified afterwards
+            # rather than the repair being abandoned. The provenance filter
+            # above still applies: only anomalies this chain INTRODUCED are
+            # corrected, never sharp edges already in the source - that is
+            # what stops it deleting vocal consonants.
+            if transients_after:
                 check_cancelled(job_id)
                 job_log(job_id, f"  found {len(transients_after)} new anomal{'y' if len(transients_after) == 1 else 'ies'} "
                                  f"introduced by later chain stages - running one corrective pass")
+                _len_before_repair = len(audio)
                 for t in transients_after:
                     audio, _ = chain.fix_transient(audio, sr, t["time_sec"],
                                                      target_peak=options.get("transient_target_peak"))
                     late_transients_fixed.append({"time_sec": t["time_sec"]})
+                # fix_transient is amplitude-domain and must stay that way: if
+                # it ever started changing the sample count it would slide
+                # every CNN analysis window underneath a certification. Assert
+                # rather than trust, since this pass now runs post-certification.
+                if len(audio) != _len_before_repair:
+                    raise RuntimeError(
+                        f"transient repair changed the sample count "
+                        f"({_len_before_repair} -> {len(audio)}). It runs after "
+                        f"cnn_fix has certified, and every analysis window "
+                        f"position derives from the length, so it must be "
+                        f"amplitude-domain only."
+                    )
                 # Re-count against the same provenance rule the correction
                 # used - otherwise the preserved source edges reappear here
                 # and the "final" line reports a clean run as still failing.
