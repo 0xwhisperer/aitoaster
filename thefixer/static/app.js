@@ -308,6 +308,44 @@
       ? current.replace(/\.[^.]+$/, "")
       : `${state.filename.replace(/\.[^.]+$/, "")}_fixed`;
     el.value = `${stem}.${ext}`;
+    renderFormatOverrideNotice();
+  }
+
+  // The format switch silently rewriting .mp3 to .flac in the filename field
+  // reads as the app ignoring the selection. It is not - a detector fix
+  // cannot survive a lossy encode - but that reason previously existed only
+  // in the server job log, i.e. after the run. Say it at click time instead,
+  // right under the switch that appears to have been overridden.
+  function renderFormatOverrideNotice() {
+    const el = $("formatOverrideNotice");
+    if (!el) return;
+    const requested = state.outputFormat;
+    const delivered = effectiveOutputExt();
+    const overridden = requested !== "same"
+      && LOSSY_FORMATS.includes(requested)
+      && delivered !== requested;
+    el.classList.toggle("hidden", !overridden);
+    if (!overridden) return;
+    // Built as text nodes rather than innerHTML: `delivered` derives from the
+    // uploaded filename's extension on the "same as source" path, so it is
+    // user-controlled string data even though this branch cannot currently
+    // reach it.
+    const strong = (t) => {
+      const s = document.createElement("strong");
+      s.textContent = t;
+      return s;
+    };
+    el.replaceChildren(
+      document.createTextNode("Delivering "),
+      strong(`.${delivered}`),
+      document.createTextNode(", not "),
+      strong(`.${requested}`),
+      document.createTextNode(
+        ". A detector fix is selected, and lossy encoding overwrites the " +
+        "correction (a file certified at 0.001% scored 99.2% after AAC " +
+        `encoding). Clear the detector fix to get .${requested} directly, ` +
+        `or encode the .${delivered} afterwards.`),
+    );
   }
 
   // ---------- output format switch ----------
@@ -1880,6 +1918,19 @@
 
     $("downloadOrig").onclick = () => { window.location.href = origDownloadUrl; };
     $("downloadFixed").onclick = () => { window.location.href = fixedDownloadUrl; };
+
+    // The server is the authority on what was actually encoded, so restate
+    // any format override next to the download rather than leaving it in the
+    // job log where the reported bug hid it.
+    const resultNotice = $("resultFormatNotice");
+    if (resultNotice) {
+      const warning = result.format_fallback_warning;
+      resultNotice.classList.toggle("hidden", !warning);
+      if (warning) {
+        resultNotice.textContent =
+          `Delivered .${result.output_format} - ${warning}`;
+      }
+    }
 
     function activeEl() { return state.abMode === "orig" ? audioOrig : audioFixed; }
     function inactiveEl() { return state.abMode === "orig" ? audioFixed : audioOrig; }

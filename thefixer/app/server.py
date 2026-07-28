@@ -2526,6 +2526,12 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
             "out_id": out_id,
             "output_name": final_output_name,
             "output_format": resolved_format,
+            # What the user actually asked for, plus why they did not get it.
+            # Previously the override explanation existed ONLY as a job_log
+            # line, so a user who picked MP3 and received FLAC had no visible
+            # reason for the substitution - the reported symptom of this bug.
+            "requested_format": output_format,
+            "format_fallback_warning": format_fallback_warning,
             "mp3_mode": mp3_mode if resolved_format == "mp3" else None,
             "output_ext": out_path.suffix,
             "steps": steps,
