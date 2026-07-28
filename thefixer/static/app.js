@@ -284,9 +284,9 @@
 
 
   // Keeps the output filename's extension in step with the format switch.
-  // Mirrors the server's resolve_output_format(), INCLUDING its rule that a
-  // lossy format is forced to .flac when a detector fix is selected - so the
-  // field never promises an extension the app will not actually deliver.
+  // Mirrors the server's resolve_output_format(): the selected format is
+  // delivered verbatim. Selecting mp3 gives .mp3 - the detector fix no
+  // longer rewrites this to .flac.
   const LOSSY_FORMATS = ["mp3", "m4a", "aac", "ogg", "opus"];
   function effectiveOutputExt() {
     let fmt = state.outputFormat;
@@ -294,8 +294,6 @@
       const srcExt = (state.filename || "").split(".").pop().toLowerCase();
       fmt = srcExt || "wav";
     }
-    const wantsDetectorFix = state.selected.has("linear_fix") || state.selected.has("cnn_fix");
-    if (wantsDetectorFix && LOSSY_FORMATS.includes(fmt)) fmt = "flac";
     return fmt;
   }
 
@@ -311,25 +309,22 @@
     renderFormatOverrideNotice();
   }
 
-  // The format switch silently rewriting .mp3 to .flac in the filename field
-  // reads as the app ignoring the selection. It is not - a detector fix
-  // cannot survive a lossy encode - but that reason previously existed only
-  // in the server job log, i.e. after the run. Say it at click time instead,
-  // right under the switch that appears to have been overridden.
+  // Advisory only. The selected format is ALWAYS what gets delivered - this
+  // never announces a substitution, it just warns that a lossy encode
+  // overwrites a detector correction, so the choice is informed rather than
+  // discovered from a detector later.
   function renderFormatOverrideNotice() {
     const el = $("formatOverrideNotice");
     if (!el) return;
-    const requested = state.outputFormat;
     const delivered = effectiveOutputExt();
-    const overridden = requested !== "same"
-      && LOSSY_FORMATS.includes(requested)
-      && delivered !== requested;
-    el.classList.toggle("hidden", !overridden);
-    if (!overridden) return;
+    const wantsDetectorFix =
+      state.selected.has("linear_fix") || state.selected.has("cnn_fix");
+    const risky = wantsDetectorFix && LOSSY_FORMATS.includes(delivered);
+    el.classList.toggle("hidden", !risky);
+    if (!risky) return;
     // Built as text nodes rather than innerHTML: `delivered` derives from the
     // uploaded filename's extension on the "same as source" path, so it is
-    // user-controlled string data even though this branch cannot currently
-    // reach it.
+    // user-controlled string data.
     const strong = (t) => {
       const s = document.createElement("strong");
       s.textContent = t;
@@ -338,13 +333,11 @@
     el.replaceChildren(
       document.createTextNode("Delivering "),
       strong(`.${delivered}`),
-      document.createTextNode(", not "),
-      strong(`.${requested}`),
       document.createTextNode(
-        ". A detector fix is selected, and lossy encoding overwrites the " +
+        " as selected. Heads up: lossy encoding overwrites the detector " +
         "correction (a file certified at 0.001% scored 99.2% after AAC " +
-        `encoding). Clear the detector fix to get .${requested} directly, ` +
-        `or encode the .${delivered} afterwards.`),
+        "encoding), so the delivered file may still be flagged. Choose " +
+        "FLAC or WAV if the correction needs to survive."),
     );
   }
 

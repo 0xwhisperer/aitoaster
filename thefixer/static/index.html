@@ -465,6 +465,14 @@ canvas#waveformOverviewCanvas {
 .format-switch.cols-3 button {
   font-size: 11px; padding: 8px 8px;
 }
+/* Five output formats on one row rather than leaving a lone button
+   stranded on a second row of the default 2-column grid. */
+.format-switch.cols-5 {
+  grid-template-columns: repeat(5, 1fr);
+}
+.format-switch.cols-5 button {
+  font-size: 11px; padding: 8px 4px;
+}
 .cnn-mode-hint {
   font-size: 11px; color: var(--text-faint); margin-top: 8px; line-height: 1.4;
 }
@@ -874,10 +882,11 @@ footer {
           <input type="text" class="filename-input mono" id="outputNameInput" placeholder="e.g. northstar_fixed.wav" />
 
           <div class="chain-group-label">Output format</div>
-          <div class="format-switch" id="formatSwitch">
-            <button data-format="same" class="active">Same as source</button>
+          <div class="format-switch cols-5" id="formatSwitch">
+            <button data-format="same" class="active" title="Match the uploaded file's format">Same</button>
             <button data-format="wav">WAV</button>
             <button data-format="mp3">MP3</button>
+            <button data-format="m4a">M4A</button>
             <button data-format="flac">FLAC</button>
           </div>
 

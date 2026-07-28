@@ -15,6 +15,7 @@ import threading
 import time
 import traceback
 import uuid
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -356,42 +357,50 @@ SPECTRAL_REVIVE_RECOMMEND_DEFICIT_DB = 15.0
 
 
 def resolve_output_format(requested_format, original_upload_path, tools=()):
-    """"same" means match the original upload's container; anything else is
-    taken literally. Returns (resolved_format, fallback_warning_or_None) -
-    fallback_warning is set only when "same" was requested but this app
-    can't encode to the source's actual format, so the caller can tell the
-    user honestly rather than silently deliver a different format than what
-    "same as source" implied. Confirmed as a real gap: an uploaded .m4a
-    with "same as source" selected was silently delivered as .wav with no
-    indication anything had changed from what was requested."""
-    wants_detector_fix = bool(set(tools) & DETECTOR_FIX_TOOLS)
+    """The selected format IS the delivered format. Pick mp3, get .mp3; pick
+    flac, get .flac; pick wav, get .wav. No substitution, ever.
 
+    "same" means match the original upload's container. Returns
+    (resolved_format, warning_or_None).
+
+    This function used to override a lossy selection to FLAC whenever a
+    detector fix was chosen, because a lossy encode overwrites the
+    correction (measured: the correction sits at -37.5 dB while AAC-256k
+    quantization error is -39.9 dB and MP3 -q:a 0 is -33.1 dB; a file
+    certified at 0.001% scored 99.2% after AAC encoding). Overriding the
+    user's explicit choice was the wrong way to act on that. The format
+    switch is now obeyed literally, and the lossy/detector-fix interaction
+    is surfaced as a warning the user can act on instead - see
+    lossy_detector_fix_warning(), which the UI shows at selection time.
+
+    The only remaining substitution is a hard capability limit: "same as
+    source" for a container this app cannot encode to (ogg, aiff, wma,
+    opus) falls back to wav, and says so."""
     if requested_format != "same":
-        if wants_detector_fix and requested_format in LOSSY_OUTPUT_FORMATS:
-            return "flac", (
-                f"a detector fix was selected, so .{requested_format} cannot be "
-                f"delivered - lossy encoding overwrites the correction (verified: "
-                f"a file certified at 0.001% scored 99.2% after AAC encoding). "
-                f"Delivering lossless .flac instead; encode to "
-                f".{requested_format} afterwards if you need it")
         return requested_format, None
 
     ext = Path(original_upload_path).suffix.lower().lstrip(".")
     resolved = SAME_AS_SOURCE_SUPPORTED.get(ext)
     if resolved:
-        # "same as source" must never silently make the DELIVERED file lossy
-        # just because the UPLOAD was. This is the actual root cause of the
-        # shipped-broken-file bug: an .m4a upload defaulted to an .m4a output,
-        # and the detector correction did not survive the encode.
-        if wants_detector_fix and resolved in LOSSY_OUTPUT_FORMATS:
-            return "flac", (
-                f"the source is .{ext}, but a detector fix was selected and "
-                f"lossy encoding overwrites the correction (verified: a file "
-                f"certified at 0.001% scored 99.2% after AAC encoding). "
-                f"Delivering lossless .flac instead of matching the source")
         return resolved, None
     return "wav", (f"the source file is .{ext}, which this app can't re-encode to - "
                     f"delivering as .wav instead of matching the original format")
+
+
+def lossy_detector_fix_warning(resolved_format, tools=()):
+    """Advisory only - never changes what gets delivered.
+
+    A lossy encode overwrites an adversarial detector correction rather than
+    merely denting it, so a file that measured clean before encoding can
+    score high after. The user still gets exactly the format they asked for;
+    this just makes sure they are told, rather than finding out from a
+    detector later."""
+    if resolved_format in LOSSY_OUTPUT_FORMATS and set(tools) & DETECTOR_FIX_TOOLS:
+        return (f"delivering .{resolved_format} as selected, but lossy encoding "
+                f"overwrites the detector correction (measured: a file certified "
+                f"at 0.001% scored 99.2% after AAC encoding). Choose FLAC or WAV "
+                f"if the correction needs to survive.")
+    return None
 
 
 # Metadata-suppression args applied to EVERY ffmpeg encode of a delivered
@@ -420,6 +429,20 @@ _STRIP_ARGS = [
     "-fflags", "+bitexact",
     "-flags:a", "+bitexact",
 ]
+
+
+@lru_cache(maxsize=8)
+def _has_encoder(name):
+    """Whether this ffmpeg build exposes a given encoder. Cached - the answer
+    cannot change while the process is running, and shelling out per encode
+    would be wasteful."""
+    try:
+        out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                             capture_output=True, text=True, check=True).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+    return any(line.split()[1:2] == [name]
+               for line in out.splitlines() if line.startswith(" "))
 
 
 def encode_final_output(audio, sr, out_format, dest_path_no_ext, mp3_mode="vbr0"):
@@ -474,9 +497,18 @@ def encode_final_output(audio, sr, out_format, dest_path_no_ext, mp3_mode="vbr0"
                    *_STRIP_ARGS, "-codec:a", "flac",
                    str(final_path)]
         elif out_format == "m4a":
+            # Prefer Apple's AudioToolbox AAC when this build has it: at a
+            # given bitrate it is audibly cleaner than ffmpeg's native
+            # encoder, and it is present on essentially every macOS build.
+            # Falls back to the native encoder elsewhere so Linux still works.
+            if _has_encoder("aac_at"):
+                codec_args = ["-codec:a", "aac_at", "-aac_at_mode", "cvbr",
+                              "-b:a", "320k"]
+            else:
+                codec_args = ["-codec:a", "aac", "-b:a", "256k"]
             cmd = ["ffmpeg", "-v", "quiet", "-y", "-i", str(tmp_wav),
-                   *_STRIP_ARGS, "-codec:a", "aac", "-b:a", "256k",
-                   "-f", "mp4", str(final_path)]
+                   *_STRIP_ARGS, *codec_args,
+                   "-movflags", "+faststart", "-f", "mp4", str(final_path)]
         else:
             raise ValueError(f"unknown output format: {out_format}")
         subprocess.run(cmd, check=True)
@@ -2293,6 +2325,9 @@ def run_pipeline(job_id, file_id, tools, options, output_name=None, output_forma
         # file can be scored directly, regardless of format.
         resolved_format, format_fallback_warning = resolve_output_format(
             output_format, path, tools)
+        # advisory only - the selected format is delivered either way
+        format_fallback_warning = format_fallback_warning or \
+            lossy_detector_fix_warning(resolved_format, tools)
         if format_fallback_warning:
             job_log(job_id, f"NOTE: {format_fallback_warning}")
         if "cnn_fix" in tools and _certified_length is not None and len(audio) != _certified_length:
@@ -2601,8 +2636,8 @@ def process(file_id):
     options = body.get("options", {})
     output_name = _safe_download_name(body.get("output_name"), None)
     output_format = body.get("output_format", "same")
-    if output_format not in ("same", "wav", "mp3", "flac"):
-        return jsonify({"error": f"invalid output_format: {output_format!r} (expected same/wav/mp3/flac)"}), 400
+    if output_format not in ("same", "wav", "mp3", "flac", "m4a"):
+        return jsonify({"error": f"invalid output_format: {output_format!r} (expected same/wav/mp3/flac/m4a)"}), 400
     mp3_mode = body.get("mp3_mode", "vbr0")
     if mp3_mode not in ("vbr0", "cbr320"):
         return jsonify({"error": f"invalid mp3_mode: {mp3_mode!r} (expected vbr0/cbr320)"}), 400

@@ -1,16 +1,15 @@
-"""The delivered file must match the format the user picked, and when it
-deliberately does not, the app must SAY SO somewhere the user can see.
+"""The selected output format is ALWAYS the delivered format.
 
-Reported as "if I select mp3, I expect mp3 and not a flac". The encoder was
-never the problem - resolve_output_format() overrides a lossy request to FLAC
-when a detector fix is selected, because a lossy encode overwrites the
-correction (a file certified at 0.001% scored 99.2% after AAC encoding).
+Reported as "if I select mp3, I expect mp3 and not a flac". The app used to
+override a lossy selection to FLAC whenever a detector fix was chosen. The
+measurement behind that override is real - a lossy encode overwrites the
+correction, and a file certified at 0.001% scored 99.2% after AAC encoding -
+but silently substituting the format the user explicitly picked was the wrong
+response to it. The interaction is now surfaced as a warning instead.
 
-That override is correct and must stay. What was missing is that its
-explanation existed ONLY as a job_log line, so the substitution looked
-arbitrary. These tests pin both halves: the override fires exactly when it
-should and never wider, and it always comes with a warning string that the
-result payload can carry back to the UI.
+These tests pin the contract: pick mp3 and get .mp3, pick flac and get .flac,
+pick wav and get .wav, with a detector fix selected or not. The advisory
+warning must still be produced, and must never change the delivered format.
 """
 import subprocess
 import sys
@@ -26,6 +25,7 @@ from app.server import (  # noqa: E402
     DETECTOR_FIX_TOOLS,
     LOSSY_OUTPUT_FORMATS,
     encode_final_output,
+    lossy_detector_fix_warning,
     resolve_output_format,
 )
 
@@ -38,51 +38,71 @@ def _codec_of(path):
         capture_output=True, text=True, check=True).stdout.strip()
 
 
-class TestExplicitFormatIsHonored(unittest.TestCase):
-    """An explicitly chosen format is delivered verbatim unless a detector
-    fix forces the override."""
+class TestExplicitFormatIsAlwaysHonored(unittest.TestCase):
+    """Pick a format, get that format. No exceptions."""
 
-    def test_mp3_without_detector_fix_stays_mp3(self):
-        # the exact reported complaint, in the configuration where the app
-        # has no reason to override anything
-        fmt, warning = resolve_output_format("mp3", "song.wav", ())
-        self.assertEqual(fmt, "mp3")
-        self.assertIsNone(warning)
+    ALL_TOOL_SETS = (
+        (),
+        ("normalize_lufs", "strip_metadata"),
+        ("cnn_fix",),
+        ("linear_fix",),
+        ("cnn_fix", "linear_fix", "normalize_lufs"),
+    )
 
-    def test_mp3_with_unrelated_tools_stays_mp3(self):
-        # only the two detector fixes may trigger the override - ordinary
-        # chain stages must not drag a request to FLAC
-        fmt, warning = resolve_output_format(
-            "mp3", "song.wav", ("normalize_lufs", "strip_metadata", "limiter"))
-        self.assertEqual(fmt, "mp3")
-        self.assertIsNone(warning)
-
-    def test_lossless_requests_are_never_overridden(self):
-        for fmt_in in ("wav", "flac"):
-            for tool in sorted(DETECTOR_FIX_TOOLS):
-                fmt, warning = resolve_output_format(fmt_in, "song.wav", (tool,))
-                self.assertEqual(fmt, fmt_in)
+    def test_every_format_survives_every_tool_combination(self):
+        # the reported complaint, exhaustively: no tool selection may change
+        # the delivered format away from what was picked
+        for fmt_in in ("mp3", "flac", "wav", "m4a"):
+            for tools in self.ALL_TOOL_SETS:
+                fmt, warning = resolve_output_format(fmt_in, "song.wav", tools)
+                self.assertEqual(
+                    fmt, fmt_in,
+                    f"selected {fmt_in} with tools {tools} but got {fmt}")
+                # an explicit choice is never a "fallback"
                 self.assertIsNone(warning)
 
-
-class TestDetectorFixOverride(unittest.TestCase):
-    """The override itself: lossy + detector fix -> FLAC, always explained."""
-
-    def test_each_detector_fix_overrides_each_lossy_format(self):
+    def test_mp3_with_detector_fix_is_still_mp3(self):
+        # the precise case that used to yield FLAC
         for tool in sorted(DETECTOR_FIX_TOOLS):
-            for fmt_in in sorted(LOSSY_OUTPUT_FORMATS):
-                fmt, warning = resolve_output_format(fmt_in, "song.wav", (tool,))
-                self.assertEqual(fmt, "flac")
-                # the substitution must never be silent
-                self.assertTrue(warning)
-                self.assertIn(fmt_in, warning)
+            fmt, _ = resolve_output_format("mp3", "song.wav", (tool,))
+            self.assertEqual(fmt, "mp3")
 
-    def test_same_as_source_lossy_upload_also_overrides(self):
-        # the original shipped-broken-file bug: .m4a in, .m4a out, correction
-        # destroyed by the encode
+
+class TestLossyDetectorFixWarning(unittest.TestCase):
+    """The interaction is now advisory - it warns without substituting."""
+
+    def test_warns_for_each_lossy_format_and_detector_fix(self):
+        for tool in sorted(DETECTOR_FIX_TOOLS):
+            for fmt in sorted(LOSSY_OUTPUT_FORMATS):
+                self.assertTrue(lossy_detector_fix_warning(fmt, (tool,)))
+
+    def test_silent_without_a_detector_fix(self):
+        for fmt in sorted(LOSSY_OUTPUT_FORMATS):
+            self.assertIsNone(lossy_detector_fix_warning(fmt, ()))
+            self.assertIsNone(
+                lossy_detector_fix_warning(fmt, ("normalize_lufs",)))
+
+    def test_silent_for_lossless_formats(self):
+        for fmt in ("wav", "flac"):
+            for tool in sorted(DETECTOR_FIX_TOOLS):
+                self.assertIsNone(lossy_detector_fix_warning(fmt, (tool,)))
+
+    def test_warning_does_not_promise_a_different_format(self):
+        # regression guard: the advisory must not claim FLAC is being
+        # delivered, which is what the old override text said
+        w = lossy_detector_fix_warning("mp3", ("cnn_fix",))
+        self.assertIn("mp3", w)
+        self.assertNotIn("Delivering lossless", w)
+
+
+class TestSameAsSourceLossyUpload(unittest.TestCase):
+    def test_lossy_upload_with_detector_fix_still_matches_source(self):
+        # "same as source" means same as source, even with a detector fix
         fmt, warning = resolve_output_format("same", "song.m4a", ("cnn_fix",))
-        self.assertEqual(fmt, "flac")
-        self.assertTrue(warning)
+        self.assertEqual(fmt, "m4a")
+        self.assertIsNone(warning)
+        # ...but the risk is still reported
+        self.assertTrue(lossy_detector_fix_warning(fmt, ("cnn_fix",)))
 
 
 class TestSameAsSource(unittest.TestCase):
@@ -142,8 +162,35 @@ class TestWarningReachesTheUser(unittest.TestCase):
         js = (Path(__file__).resolve().parent.parent
               / "static" / "app.js").read_text()
         self.assertIn("format_fallback_warning", js)
-        # and explains the override at selection time, before the run
+        # and warns at selection time, before the run
         self.assertIn("renderFormatOverrideNotice", js)
+
+    def test_frontend_never_rewrites_the_chosen_extension(self):
+        # the filename field silently turning .mp3 into .flac was the most
+        # visible symptom of the old override
+        js = (Path(__file__).resolve().parent.parent
+              / "static" / "app.js").read_text()
+        self.assertNotIn('fmt = "flac"', js)
+
+
+class TestM4aIsSelectable(unittest.TestCase):
+    """M4A was encodable all along but had no button - reachable only via
+    "same as source" from an m4a/aac upload."""
+
+    def test_api_accepts_m4a(self):
+        text = (Path(__file__).resolve().parent.parent
+                / "app" / "server.py").read_text()
+        self.assertIn('"m4a"', text)
+
+    def test_ui_offers_an_m4a_button(self):
+        html = (Path(__file__).resolve().parent.parent
+                / "static" / "index.html").read_text()
+        self.assertIn('data-format="m4a"', html)
+
+    def test_m4a_resolves_and_encodes(self):
+        fmt, warning = resolve_output_format("m4a", "song.wav", ())
+        self.assertEqual(fmt, "m4a")
+        self.assertIsNone(warning)
 
 
 if __name__ == "__main__":
